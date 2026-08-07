@@ -10,13 +10,24 @@ keywords = ["zfs", "backup", "forensics", "filesystem"]
 categories = ["command-line-utilities", "filesystem"]
 
 [dependencies]
+aes = "0.8"
+aes-gcm = "0.10"
 anyhow = "1.0"
+ccm = "0.5"
 clap = { version = "4.5", features = ["derive"] }
+hmac = "0.12"
+hkdf = "0.12"
+lz4_flex = "0.11"
+pbkdf2 = "0.12"
+rpassword = "7.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha1 = "0.10"
 sha2 = "0.10"
+subtle = "2.6"
 tempfile = "3.20"
 thiserror = "2.0"
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
 zfs-forensic-core = "0.1.1"
 
 [profile.release]

@@ -1,9 +1,12 @@
-use crate::filesystem::{DirectoryEntry, ObjectIndex, ResolvedPath};
-use crate::stream::{BeginRecord, RecordKind, StreamReader};
+use crate::encrypted::{DatasetKey, EncryptionParams, decompress_block, is_encrypted_object_type};
+use crate::filesystem::{
+    DirectoryEntry, ObjectIndex, ResolvedPath, SnapshotPlan, plan_snapshot, snapshot_headers,
+};
+use crate::stream::{BeginRecord, DMU_SUBSTREAM, FEATURE_RAW, RecordKind, StreamReader};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -16,8 +19,15 @@ const ZERO_CHUNK_SIZE: usize = 64 * 1024;
 #[derive(Debug, Serialize)]
 pub struct Inspection {
     pub begin: BeginRecord,
+    pub snapshots: Vec<BeginRecord>,
     pub stream_bytes: u64,
     pub records: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EncryptionRequirement {
+    pub dataset_name: String,
+    pub key_format: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,21 +46,28 @@ pub struct Sidecar {
 pub fn inspect_stream(path: &Path) -> Result<Inspection> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut reader = StreamReader::new(file);
-    let mut begin = None;
+    let mut snapshots = Vec::new();
     let mut records = BTreeMap::new();
     let mut stream_bytes = 0;
     while let Some(record) = reader.next_record()? {
         *records.entry(record.kind.name().to_owned()).or_insert(0) += 1;
         stream_bytes = record.stream_offset + 312 + record.payload.len() as u64;
-        if let RecordKind::Begin(header) = record.kind {
-            begin = Some(header);
+        if let RecordKind::Begin(header) = record.kind
+            && header.header_type == DMU_SUBSTREAM
+        {
+            snapshots.push(header);
         }
     }
     if !reader.saw_end() {
         bail!("stream has no END record");
     }
+    let begin = snapshots
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow!("stream has no snapshot substream"))?;
     Ok(Inspection {
-        begin: begin.ok_or_else(|| anyhow!("stream has no BEGIN record"))?,
+        begin,
+        snapshots,
         stream_bytes,
         records,
     })
@@ -60,8 +77,48 @@ pub fn list_directory(stream: &Path, path: &str) -> Result<Vec<DirectoryEntry>> 
     ObjectIndex::build(stream)?.list_directory(path)
 }
 
+pub fn list_directory_snapshot(
+    stream: &Path,
+    path: &str,
+    snapshot: Option<&str>,
+) -> Result<Vec<DirectoryEntry>> {
+    list_directory_snapshot_with_key(stream, path, snapshot, None)
+}
+
+pub fn list_directory_snapshot_with_key(
+    stream: &Path,
+    path: &str,
+    snapshot: Option<&str>,
+    key_material: Option<&[u8]>,
+) -> Result<Vec<DirectoryEntry>> {
+    let plan = plan_snapshot(stream, snapshot)?;
+    ObjectIndex::build_plan_with_key(stream, &plan, key_material)?.list_directory(path)
+}
+
 pub fn extract(stream: &Path, path: &str, output: &Path, force: bool) -> Result<Sidecar> {
-    let index = ObjectIndex::build(stream)?;
+    extract_snapshot(stream, path, output, force, None)
+}
+
+pub fn extract_snapshot(
+    stream: &Path,
+    path: &str,
+    output: &Path,
+    force: bool,
+    snapshot: Option<&str>,
+) -> Result<Sidecar> {
+    extract_snapshot_with_key(stream, path, output, force, snapshot, None)
+}
+
+pub fn extract_snapshot_with_key(
+    stream: &Path,
+    path: &str,
+    output: &Path,
+    force: bool,
+    snapshot: Option<&str>,
+    key_material: Option<&[u8]>,
+) -> Result<Sidecar> {
+    let plan = plan_snapshot(stream, snapshot)?;
+    let index = ObjectIndex::build_plan_with_key(stream, &plan, key_material)?;
     let resolved = index.resolve_path(path)?;
     if resolved.dirent_type != 8 {
         bail!("{} is not a regular file", resolved.normalized_path);
@@ -74,8 +131,13 @@ pub fn extract(stream: &Path, path: &str, output: &Path, force: bool) -> Result<
     }
 
     let mut temporary = temporary_for(output)?;
-    temporary.as_file_mut().set_len(resolved.logical_size)?;
-    replay_object(stream, &index.begin, &resolved, temporary.as_file_mut())?;
+    replay_object(
+        stream,
+        &plan,
+        &resolved,
+        temporary.as_file_mut(),
+        key_material,
+    )?;
     temporary.as_file_mut().set_len(resolved.logical_size)?;
     temporary.as_file_mut().sync_all()?;
     persist_replace(temporary, output, force)?;
@@ -93,6 +155,40 @@ pub fn extract(stream: &Path, path: &str, output: &Path, force: bool) -> Result<
     };
     save_sidecar(output, &sidecar)?;
     Ok(sidecar)
+}
+
+pub fn encryption_requirement(
+    stream: &Path,
+    snapshot: Option<&str>,
+) -> Result<Option<EncryptionRequirement>> {
+    let plan = plan_snapshot(stream, snapshot)?;
+    if plan.target.features & FEATURE_RAW == 0 {
+        return Ok(None);
+    }
+    if plan.chain.len() != 1 || plan.target.from_guid != 0 {
+        bail!(
+            "raw encrypted incremental snapshot chains are not supported yet; select a full raw snapshot"
+        );
+    }
+    let file = File::open(stream).with_context(|| format!("opening {}", stream.display()))?;
+    let mut reader = StreamReader::new(file);
+    while let Some(record) = reader.next_record()? {
+        if let RecordKind::Begin(header) = record.kind
+            && header.header_type == DMU_SUBSTREAM
+            && header.to_guid == plan.target.to_guid
+        {
+            let params = EncryptionParams::from_begin_payload(&record.payload)?;
+            return Ok(Some(EncryptionRequirement {
+                dataset_name: header.dataset_name,
+                key_format: params.key_format_name()?.to_owned(),
+            }));
+        }
+    }
+    bail!("selected encrypted snapshot disappeared while reading its key metadata")
+}
+
+pub fn snapshots(stream: &Path) -> Result<Vec<BeginRecord>> {
+    snapshot_headers(stream)
 }
 
 pub fn apply_incremental(stream: &Path, target: &Path) -> Result<Sidecar> {
@@ -139,7 +235,11 @@ pub fn apply_incremental(stream: &Path, target: &Path) -> Result<Sidecar> {
 
     while let Some(record) = reader.next_record()? {
         match record.kind {
+            RecordKind::Begin(header) if header.header_type != DMU_SUBSTREAM => {}
             RecordKind::Begin(header) => {
+                if begin.is_some() {
+                    bail!("apply accepts exactly one incremental snapshot substream");
+                }
                 let expected = parse_guid(&sidecar.snapshot_guid)?;
                 if header.from_guid != expected {
                     bail!(
@@ -198,7 +298,7 @@ pub fn apply_incremental(stream: &Path, target: &Path) -> Result<Sidecar> {
                     target_deleted = true;
                 }
             }
-            RecordKind::ObjectRange => bail!("raw OBJECT_RANGE streams are unsupported"),
+            RecordKind::ObjectRange(_) => bail!("raw OBJECT_RANGE streams are unsupported"),
             RecordKind::Redact => bail!("redacted streams are unsupported"),
             _ => {}
         }
@@ -229,16 +329,45 @@ pub fn apply_incremental(stream: &Path, target: &Path) -> Result<Sidecar> {
 
 fn replay_object(
     stream: &Path,
-    expected_begin: &BeginRecord,
+    plan: &SnapshotPlan,
     resolved: &ResolvedPath,
     output: &mut File,
+    key_material: Option<&[u8]>,
 ) -> Result<()> {
+    if plan.target.features & FEATURE_RAW != 0 {
+        return replay_raw_object(stream, plan, resolved, output, key_material);
+    }
     let file = File::open(stream)?;
     let mut reader = StreamReader::new(file);
+    let selected = plan.chain.iter().copied().collect::<BTreeSet<_>>();
+    let mut active_snapshot = None;
+    let mut seen = BTreeSet::new();
+    let mut object_exists = false;
     while let Some(record) = reader.next_record()? {
+        match &record.kind {
+            RecordKind::Begin(header) => {
+                active_snapshot = (header.header_type == DMU_SUBSTREAM)
+                    .then_some(header.to_guid)
+                    .filter(|guid| selected.contains(guid));
+                if let Some(guid) = active_snapshot {
+                    seen.insert(guid);
+                }
+                continue;
+            }
+            RecordKind::End => {
+                active_snapshot = None;
+                continue;
+            }
+            _ if active_snapshot.is_none() => continue,
+            _ => {}
+        }
+
         match record.kind {
-            RecordKind::Begin(header) if header.to_guid != expected_begin.to_guid => {
-                bail!("stream changed between indexing and extraction");
+            RecordKind::Object(object) if object.object == resolved.object_id => {
+                if !object_exists {
+                    output.set_len(0)?;
+                }
+                object_exists = true;
             }
             RecordKind::Write(write) if write.object == resolved.object_id => {
                 if write.compression_type != 0 {
@@ -253,11 +382,110 @@ fn replay_object(
                 );
             }
             RecordKind::WriteByRef => bail!("deduplicated WRITE_BYREF streams are unsupported"),
+            RecordKind::Free(free) if free.object == resolved.object_id => {
+                zero_range(output, free.offset, free.length)?;
+            }
+            RecordKind::FreeObjects(range) => {
+                let end = range.first_object.saturating_add(range.object_count);
+                if resolved.object_id >= range.first_object && resolved.object_id < end {
+                    output.set_len(0)?;
+                    object_exists = false;
+                }
+            }
+            RecordKind::ObjectRange(_) => bail!("raw OBJECT_RANGE streams are unsupported"),
+            RecordKind::Redact => bail!("redacted streams are unsupported"),
             _ => {}
         }
     }
     if !reader.saw_end() {
         bail!("stream has no END record");
+    }
+    if seen.len() != plan.chain.len() {
+        bail!("stream changed between indexing and extraction");
+    }
+    Ok(())
+}
+
+fn replay_raw_object(
+    stream: &Path,
+    plan: &SnapshotPlan,
+    resolved: &ResolvedPath,
+    output: &mut File,
+    key_material: Option<&[u8]>,
+) -> Result<()> {
+    if plan.chain.len() != 1 || plan.target.from_guid != 0 {
+        bail!("raw encrypted incremental snapshot chains are not supported yet");
+    }
+    let key_material = key_material.ok_or_else(|| anyhow!("encrypted raw send requires a key"))?;
+    let file = File::open(stream)?;
+    let mut reader = StreamReader::new(file);
+    let mut active = false;
+    let mut key: Option<DatasetKey> = None;
+    let mut object_exists = false;
+    while let Some(record) = reader.next_record()? {
+        match &record.kind {
+            RecordKind::Begin(header) => {
+                active =
+                    header.header_type == DMU_SUBSTREAM && header.to_guid == plan.target.to_guid;
+                if active {
+                    key = Some(
+                        EncryptionParams::from_begin_payload(&record.payload)?
+                            .unlock(key_material)?,
+                    );
+                }
+                continue;
+            }
+            RecordKind::End if active => break,
+            _ if !active => continue,
+            _ => {}
+        }
+        let dataset_key = key.as_ref().expect("active raw stream has a key");
+        match record.kind {
+            RecordKind::Object(object) if object.object == resolved.object_id => {
+                output.set_len(0)?;
+                object_exists = true;
+            }
+            RecordKind::Write(write) if write.object == resolved.object_id => {
+                let protected = if is_encrypted_object_type(write.object_type) {
+                    dataset_key.decrypt_block(
+                        &write.salt,
+                        &write.iv,
+                        &write.mac,
+                        &[],
+                        &record.payload,
+                    )?
+                } else {
+                    dataset_key.authenticate_block(&record.payload, &write.mac)?;
+                    record.payload
+                };
+                let plaintext =
+                    decompress_block(write.compression_type, &protected, write.logical_size)?;
+                output.seek(SeekFrom::Start(write.offset))?;
+                output.write_all(&plaintext)?;
+            }
+            RecordKind::Free(free) if free.object == resolved.object_id => {
+                zero_range(output, free.offset, free.length)?;
+            }
+            RecordKind::FreeObjects(range) => {
+                let end = range.first_object.saturating_add(range.object_count);
+                if resolved.object_id >= range.first_object && resolved.object_id < end {
+                    output.set_len(0)?;
+                    object_exists = false;
+                }
+            }
+            RecordKind::WriteEmbedded(write) if write.object == resolved.object_id => {
+                bail!("raw embedded WRITE records are unsupported")
+            }
+            RecordKind::WriteByRef => bail!("raw deduplicated WRITE_BYREF is unsupported"),
+            RecordKind::Redact => bail!("redacted streams are unsupported"),
+            _ => {}
+        }
+    }
+    if !object_exists {
+        bail!(
+            "object {} was not present in the raw snapshot",
+            resolved.object_id
+        );
     }
     Ok(())
 }

@@ -6,7 +6,10 @@ pub const RECORD_SIZE: usize = 312;
 const CHECKSUM_OFFSET: usize = 280;
 const MAX_PAYLOAD_SIZE: u64 = 256 * 1024 * 1024;
 const DMU_BACKUP_MAGIC: u64 = 0x0002_f5ba_cbac;
-const FEATURE_RAW: u64 = 1 << 24;
+pub const FEATURE_RAW: u64 = 1 << 24;
+
+pub const DMU_SUBSTREAM: u8 = 1;
+pub const DMU_COMPOUNDSTREAM: u8 = 2;
 
 pub const DRR_BEGIN: u32 = 0;
 pub const DRR_OBJECT: u32 = 1;
@@ -41,6 +44,7 @@ pub type Result<T> = std::result::Result<T, StreamError>;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BeginRecord {
+    pub header_type: u8,
     pub to_guid: u64,
     pub from_guid: u64,
     pub creation_time: u64,
@@ -57,6 +61,14 @@ pub struct ObjectRecord {
     pub bonus_type: u32,
     pub block_size: u32,
     pub bonus_length: u32,
+    pub checksum_type: u8,
+    pub compression: u8,
+    pub dnode_slots: u8,
+    pub flags: u8,
+    pub raw_bonus_length: u32,
+    pub indirect_block_shift: u8,
+    pub levels: u8,
+    pub block_pointers: u8,
     pub max_block_id: u64,
 }
 
@@ -66,8 +78,23 @@ pub struct WriteRecord {
     pub object_type: u32,
     pub offset: u64,
     pub logical_size: u64,
+    pub checksum_type: u8,
+    pub flags: u8,
     pub compressed_size: u64,
     pub compression_type: u8,
+    pub salt: [u8; 8],
+    pub iv: [u8; 12],
+    pub mac: [u8; 16],
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ObjectRangeRecord {
+    pub first_object: u64,
+    pub object_slots: u64,
+    pub salt: [u8; 8],
+    pub iv: [u8; 12],
+    pub mac: [u8; 16],
+    pub flags: u8,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -103,7 +130,7 @@ pub enum RecordKind {
     WriteByRef,
     Spill,
     WriteEmbedded(EmbeddedWriteRecord),
-    ObjectRange,
+    ObjectRange(ObjectRangeRecord),
     Redact,
 }
 
@@ -120,7 +147,7 @@ impl RecordKind {
             Self::WriteByRef => "WRITE_BYREF",
             Self::Spill => "SPILL",
             Self::WriteEmbedded(_) => "WRITE_EMBEDDED",
-            Self::ObjectRange => "OBJECT_RANGE",
+            Self::ObjectRange(_) => "OBJECT_RANGE",
             Self::Redact => "REDACT",
         }
     }
@@ -163,7 +190,9 @@ pub struct StreamReader<R> {
     inner: R,
     offset: u64,
     started: bool,
-    ended: bool,
+    segment_open: bool,
+    compound_open: bool,
+    saw_end: bool,
     checksum: Fletcher4,
     begin: Option<BeginRecord>,
 }
@@ -175,7 +204,9 @@ impl<R: Read> StreamReader<R> {
             inner,
             offset: 0,
             started: false,
-            ended: false,
+            segment_open: false,
+            compound_open: false,
+            saw_end: false,
             checksum: Fletcher4::default(),
             begin: None,
         }
@@ -188,21 +219,27 @@ impl<R: Read> StreamReader<R> {
 
     #[must_use]
     pub fn saw_end(&self) -> bool {
-        self.ended
+        self.saw_end
     }
 
     pub fn next_record(&mut self) -> Result<Option<Record>> {
         let record_offset = self.offset;
         let mut header = [0_u8; RECORD_SIZE];
         match self.inner.read(&mut header[..1]) {
-            Ok(0) if self.ended => return Ok(None),
             Ok(0) if !self.started => return Ok(None),
-            Ok(0) => {
+            Ok(0) if self.segment_open => {
                 return Err(StreamError::Invalid {
                     offset: record_offset,
                     message: "stream ended before an END record".into(),
                 });
             }
+            Ok(0) if self.compound_open => {
+                return Err(StreamError::Invalid {
+                    offset: record_offset,
+                    message: "compound stream ended before its conclusion record".into(),
+                });
+            }
+            Ok(0) => return Ok(None),
             Ok(_) => {}
             Err(source) => {
                 return Err(StreamError::Io {
@@ -218,13 +255,6 @@ impl<R: Read> StreamReader<R> {
                 source,
             })?;
 
-        if self.ended {
-            return Err(StreamError::Invalid {
-                offset: record_offset,
-                message: "trailing data follows the END record".into(),
-            });
-        }
-
         let record_type = le_u32(&header, 0);
         if record_type >= DRR_NUMTYPES {
             return Err(StreamError::Invalid {
@@ -238,10 +268,23 @@ impl<R: Read> StreamReader<R> {
                 message: "first replay record is not BEGIN".into(),
             });
         }
-        if self.started && record_type == DRR_BEGIN {
-            return Err(StreamError::Unsupported {
+        if self.segment_open && record_type == DRR_BEGIN {
+            return Err(StreamError::Invalid {
                 offset: record_offset,
-                message: "compound or concatenated streams are not supported".into(),
+                message: "BEGIN record appears before the current substream's END".into(),
+            });
+        }
+        let conclusion = record_type == DRR_END && !self.segment_open;
+        if conclusion && !self.compound_open {
+            return Err(StreamError::Invalid {
+                offset: record_offset,
+                message: "END record appears without an open stream".into(),
+            });
+        }
+        if !self.segment_open && record_type != DRR_BEGIN && !conclusion {
+            return Err(StreamError::Invalid {
+                offset: record_offset,
+                message: "replay record appears outside a BEGIN/END substream".into(),
             });
         }
 
@@ -265,7 +308,16 @@ impl<R: Read> StreamReader<R> {
             })?;
 
         let kind = decode_kind(&header, record_type, record_offset)?;
-        self.validate_checksum(&header, &payload, record_type, record_offset)?;
+        if conclusion {
+            if header[4..].iter().any(|byte| *byte != 0) {
+                return Err(StreamError::Invalid {
+                    offset: record_offset,
+                    message: "compound conclusion record is not zero-filled".into(),
+                });
+            }
+        } else {
+            self.validate_checksum(&header, &payload, record_type, record_offset)?;
+        }
 
         if let RecordKind::Begin(begin) = &kind {
             if le_u64(&header, 8) != DMU_BACKUP_MAGIC {
@@ -280,17 +332,27 @@ impl<R: Read> StreamReader<R> {
                     message: message.into(),
                 });
             }
-            if begin.features & FEATURE_RAW != 0 {
-                return Err(StreamError::Unsupported {
-                    offset: record_offset,
-                    message: "raw/encrypted send streams are not supported".into(),
-                });
+            if begin.header_type == DMU_COMPOUNDSTREAM {
+                if self.compound_open {
+                    return Err(StreamError::Invalid {
+                        offset: record_offset,
+                        message: "nested compound streams are not supported".into(),
+                    });
+                }
+                self.compound_open = true;
+            } else if self.begin.is_none() {
+                self.begin = Some(begin.clone());
             }
-            self.begin = Some(begin.clone());
             self.started = true;
+            self.segment_open = true;
         }
         if matches!(kind, RecordKind::End) {
-            self.ended = true;
+            if conclusion {
+                self.compound_open = false;
+            } else {
+                self.segment_open = false;
+                self.saw_end = true;
+            }
         }
 
         self.offset = self
@@ -360,11 +422,11 @@ fn decode_kind(header: &[u8; RECORD_SIZE], record_type: u32, offset: u64) -> Res
                 });
             }
             let version_info = le_u64(header, 16);
-            let header_type = version_info & 0b11;
-            if header_type != 1 {
+            let header_type = (version_info & 0b11) as u8;
+            if !matches!(header_type, DMU_SUBSTREAM | DMU_COMPOUNDSTREAM) {
                 return Err(StreamError::Unsupported {
                     offset,
-                    message: format!("stream header type {header_type} is not a single substream"),
+                    message: format!("stream header type {header_type} is unsupported"),
                 });
             }
             let name_bytes = &header[56..312];
@@ -373,6 +435,7 @@ fn decode_kind(header: &[u8; RECORD_SIZE], record_type: u32, offset: u64) -> Res
                 .position(|byte| *byte == 0)
                 .unwrap_or(name_bytes.len());
             RecordKind::Begin(BeginRecord {
+                header_type,
                 to_guid: le_u64(header, 40),
                 from_guid: le_u64(header, 48),
                 creation_time: le_u64(header, 24),
@@ -388,7 +451,15 @@ fn decode_kind(header: &[u8; RECORD_SIZE], record_type: u32, offset: u64) -> Res
             bonus_type: le_u32(header, 20),
             block_size: le_u32(header, 24),
             bonus_length: le_u32(header, 28),
-            max_block_id: le_u64(header, 64),
+            checksum_type: header[32],
+            compression: header[33],
+            dnode_slots: header[34],
+            flags: header[35],
+            raw_bonus_length: le_u32(header, 36),
+            indirect_block_shift: header[48],
+            levels: header[49],
+            block_pointers: header[50],
+            max_block_id: le_u64(header, 56),
         }),
         DRR_FREEOBJECTS => RecordKind::FreeObjects(FreeObjectsRecord {
             first_object: le_u64(header, 8),
@@ -399,8 +470,13 @@ fn decode_kind(header: &[u8; RECORD_SIZE], record_type: u32, offset: u64) -> Res
             object_type: le_u32(header, 16),
             offset: le_u64(header, 24),
             logical_size: le_u64(header, 32),
+            checksum_type: header[48],
+            flags: header[49],
             compressed_size: le_u64(header, 96),
             compression_type: header[50],
+            salt: header[104..112].try_into().expect("eight-byte salt"),
+            iv: header[112..124].try_into().expect("twelve-byte IV"),
+            mac: header[124..140].try_into().expect("sixteen-byte MAC"),
         }),
         DRR_FREE => RecordKind::Free(FreeRecord {
             object: le_u64(header, 8),
@@ -417,7 +493,14 @@ fn decode_kind(header: &[u8; RECORD_SIZE], record_type: u32, offset: u64) -> Res
             compression_type: header[40],
             logical_size: le_u32(header, 48),
         }),
-        DRR_OBJECT_RANGE => RecordKind::ObjectRange,
+        DRR_OBJECT_RANGE => RecordKind::ObjectRange(ObjectRangeRecord {
+            first_object: le_u64(header, 8),
+            object_slots: le_u64(header, 16),
+            salt: header[32..40].try_into().expect("eight-byte salt"),
+            iv: header[40..52].try_into().expect("twelve-byte IV"),
+            mac: header[52..68].try_into().expect("sixteen-byte MAC"),
+            flags: header[68],
+        }),
         DRR_REDACT => RecordKind::Redact,
         _ => unreachable!("record type was range checked"),
     })

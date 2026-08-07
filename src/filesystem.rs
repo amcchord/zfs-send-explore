@@ -1,6 +1,10 @@
-use crate::stream::{BeginRecord, RecordKind, StreamReader};
+use crate::encrypted::{
+    DatasetKey, EncryptionParams, RawBlockPointer, RawDnode, RawDnodeRange, decompress_block,
+    is_encrypted_object_type,
+};
+use crate::stream::{BeginRecord, DMU_SUBSTREAM, FEATURE_RAW, RecordKind, StreamReader};
 use anyhow::{Context, Result, anyhow, bail};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::path::Path;
 use zfs_core::{
@@ -34,6 +38,12 @@ pub struct ObjectIndex {
 }
 
 #[derive(Debug, Clone)]
+pub struct SnapshotPlan {
+    pub target: BeginRecord,
+    pub chain: Vec<u64>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ResolvedPath {
     pub normalized_path: String,
     pub object_id: u64,
@@ -54,20 +64,62 @@ pub struct DirectoryEntry {
 
 impl ObjectIndex {
     pub fn build(path: &Path) -> Result<Self> {
+        Self::build_snapshot(path, None)
+    }
+
+    pub fn build_snapshot(path: &Path, selector: Option<&str>) -> Result<Self> {
+        let plan = plan_snapshot(path, selector)?;
+        Self::build_plan(path, &plan)
+    }
+
+    pub fn build_plan(path: &Path, plan: &SnapshotPlan) -> Result<Self> {
+        Self::build_plan_with_key(path, plan, None)
+    }
+
+    pub fn build_plan_with_key(
+        path: &Path,
+        plan: &SnapshotPlan,
+        key_material: Option<&[u8]>,
+    ) -> Result<Self> {
+        if plan.target.features & FEATURE_RAW != 0 {
+            return Self::build_raw_full(path, plan, key_material);
+        }
         let file = File::open(path)
             .with_context(|| format!("opening ZFS send stream {}", path.display()))?;
         let mut reader = StreamReader::new(file);
-        let mut begin = None;
+        let selected = plan.chain.iter().copied().collect::<BTreeSet<_>>();
+        let mut active_snapshot = None;
+        let mut seen = BTreeSet::new();
         let mut objects = BTreeMap::new();
         let mut data: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
 
         while let Some(record) = reader.next_record()? {
+            match &record.kind {
+                RecordKind::Begin(header) => {
+                    active_snapshot = (header.header_type == DMU_SUBSTREAM)
+                        .then_some(header.to_guid)
+                        .filter(|guid| selected.contains(guid));
+                    if let Some(guid) = active_snapshot {
+                        seen.insert(guid);
+                    }
+                    continue;
+                }
+                RecordKind::End => {
+                    active_snapshot = None;
+                    continue;
+                }
+                _ if active_snapshot.is_none() => continue,
+                _ => {}
+            }
+
             match record.kind {
-                RecordKind::Begin(header) => begin = Some(header),
                 RecordKind::Object(object) => {
                     let bonus_len = usize::try_from(object.bonus_length)
                         .unwrap_or(usize::MAX)
                         .min(record.payload.len());
+                    let preserve_data = objects
+                        .get(&object.object)
+                        .is_some_and(|meta: &ObjectMeta| meta.object_type == object.object_type);
                     objects.insert(
                         object.object,
                         ObjectMeta {
@@ -79,7 +131,11 @@ impl ObjectIndex {
                         },
                     );
                     if capture_object_data(object.object_type) {
-                        data.insert(object.object, Vec::new());
+                        if !preserve_data {
+                            data.insert(object.object, Vec::new());
+                        } else {
+                            data.entry(object.object).or_default();
+                        }
                     } else {
                         data.remove(&object.object);
                     }
@@ -108,7 +164,7 @@ impl ObjectIndex {
                         record.stream_offset
                     );
                 }
-                RecordKind::ObjectRange => {
+                RecordKind::ObjectRange(_) => {
                     bail!("raw OBJECT_RANGE record is unsupported");
                 }
                 RecordKind::Redact => bail!("redacted streams are unsupported"),
@@ -122,19 +178,203 @@ impl ObjectIndex {
                     objects.retain(|id, _| *id < range.first_object || *id >= end);
                     data.retain(|id, _| *id < range.first_object || *id >= end);
                 }
-                RecordKind::End | RecordKind::Spill => {}
+                RecordKind::Begin(_) | RecordKind::End | RecordKind::Spill => {}
             }
         }
         if !reader.saw_end() {
             bail!("ZFS send stream has no END record");
         }
-        let begin = begin.ok_or_else(|| anyhow!("ZFS send stream has no BEGIN record"))?;
-        if begin.from_guid != 0 {
-            bail!("browsing requires a full send stream, but this stream is incremental");
+        if seen.len() != plan.chain.len() {
+            bail!("stream changed between snapshot discovery and indexing");
         }
 
         Ok(Self {
-            begin,
+            begin: plan.target.clone(),
+            objects,
+            data,
+        })
+    }
+
+    fn build_raw_full(
+        path: &Path,
+        plan: &SnapshotPlan,
+        key_material: Option<&[u8]>,
+    ) -> Result<Self> {
+        if plan.chain.len() != 1 || plan.target.from_guid != 0 {
+            bail!(
+                "raw encrypted incremental snapshot chains are not supported yet; select a full raw snapshot"
+            );
+        }
+        let key_material = key_material.ok_or_else(|| {
+            anyhow!("encrypted raw send requires --key-file or an interactive key prompt")
+        })?;
+        let file = File::open(path)
+            .with_context(|| format!("opening ZFS send stream {}", path.display()))?;
+        let mut reader = StreamReader::new(file);
+        let mut active = false;
+        let mut key: Option<DatasetKey> = None;
+        let mut current_range: Option<RawDnodeRange> = None;
+        let mut range_dnodes = Vec::new();
+        let mut objects = BTreeMap::new();
+        let mut data: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+        let mut saw_target = false;
+
+        while let Some(record) = reader.next_record()? {
+            match &record.kind {
+                RecordKind::Begin(header) => {
+                    active = header.header_type == DMU_SUBSTREAM
+                        && header.to_guid == plan.target.to_guid;
+                    if active {
+                        saw_target = true;
+                        let params = EncryptionParams::from_begin_payload(&record.payload)?;
+                        key = Some(params.unlock(key_material)?);
+                    }
+                    continue;
+                }
+                RecordKind::End if active => {
+                    finish_raw_range(
+                        key.as_ref().expect("active raw stream has a key"),
+                        current_range.take(),
+                        &mut range_dnodes,
+                        &mut objects,
+                    )?;
+                    active = false;
+                    continue;
+                }
+                RecordKind::End => {
+                    active = false;
+                    continue;
+                }
+                _ if !active => continue,
+                _ => {}
+            }
+
+            let dataset_key = key.as_ref().expect("active raw stream has a key");
+            match record.kind {
+                RecordKind::ObjectRange(range) => {
+                    finish_raw_range(
+                        dataset_key,
+                        current_range.replace(RawDnodeRange {
+                            first_object: range.first_object,
+                            object_slots: range.object_slots,
+                            salt: range.salt,
+                            iv: range.iv,
+                            mac: range.mac,
+                            flags: range.flags,
+                        }),
+                        &mut range_dnodes,
+                        &mut objects,
+                    )?;
+                }
+                RecordKind::Object(object) => {
+                    if current_range.is_none() {
+                        bail!("raw OBJECT record appears before OBJECT_RANGE");
+                    }
+                    let dnode = RawDnode {
+                        object: object.object,
+                        object_type: object.object_type,
+                        bonus_type: object.bonus_type,
+                        block_size: object.block_size,
+                        bonus_length: object.bonus_length,
+                        checksum_type: object.checksum_type,
+                        compression: object.compression,
+                        slots: object.dnode_slots,
+                        flags: object.flags,
+                        indirect_block_shift: object.indirect_block_shift,
+                        levels: object.levels,
+                        block_pointers: object.block_pointers,
+                        max_block_id: object.max_block_id,
+                        bonus_ciphertext: record.payload,
+                        blocks: Vec::new(),
+                    };
+                    objects.insert(
+                        object.object,
+                        ObjectMeta {
+                            object_type: object.object_type,
+                            bonus_type: object.bonus_type,
+                            block_size: object.block_size,
+                            max_block_id: object.max_block_id,
+                            bonus: Vec::new(),
+                        },
+                    );
+                    if capture_object_data(object.object_type) {
+                        data.insert(object.object, Vec::new());
+                    }
+                    range_dnodes.push(dnode);
+                }
+                RecordKind::Write(write) => {
+                    let dnode = range_dnodes
+                        .iter_mut()
+                        .rev()
+                        .find(|dnode| dnode.object == write.object)
+                        .ok_or_else(|| {
+                            anyhow!("raw WRITE for object {} has no OBJECT record", write.object)
+                        })?;
+                    if write.logical_size == 0 || write.offset % write.logical_size != 0 {
+                        bail!(
+                            "raw WRITE for object {} has an invalid block offset",
+                            write.object
+                        );
+                    }
+                    dnode.blocks.push(RawBlockPointer {
+                        block_id: write.offset / write.logical_size,
+                        object_type: write.object_type,
+                        logical_size: write.logical_size,
+                        physical_size: write.compressed_size,
+                        compression: write.compression_type,
+                        flags: write.flags,
+                        mac: write.mac,
+                    });
+
+                    if let Some(bytes) = data.get_mut(&write.object) {
+                        let protected = if is_encrypted_object_type(write.object_type) {
+                            dataset_key.decrypt_block(
+                                &write.salt,
+                                &write.iv,
+                                &write.mac,
+                                &[],
+                                &record.payload,
+                            )?
+                        } else {
+                            dataset_key.authenticate_block(&record.payload, &write.mac)?;
+                            record.payload
+                        };
+                        let plaintext = decompress_block(
+                            write.compression_type,
+                            &protected,
+                            write.logical_size,
+                        )?;
+                        write_extent(bytes, write.offset, &plaintext)?;
+                    }
+                }
+                RecordKind::Free(free) => {
+                    if let Some(bytes) = data.get_mut(&free.object) {
+                        free_extent(bytes, free.offset, free.length)?;
+                    }
+                }
+                RecordKind::FreeObjects(range) => {
+                    let end = range.first_object.saturating_add(range.object_count);
+                    objects.retain(|id, _| *id < range.first_object || *id >= end);
+                    data.retain(|id, _| *id < range.first_object || *id >= end);
+                }
+                RecordKind::WriteEmbedded(write) => bail!(
+                    "raw embedded WRITE for object {} is unsupported",
+                    write.object
+                ),
+                RecordKind::WriteByRef => bail!("raw deduplicated WRITE_BYREF is unsupported"),
+                RecordKind::Spill => bail!("raw encrypted spill records are unsupported"),
+                RecordKind::Redact => bail!("redacted streams are unsupported"),
+                RecordKind::Begin(_) | RecordKind::End => {}
+            }
+        }
+        if !reader.saw_end() {
+            bail!("ZFS send stream has no END record");
+        }
+        if !saw_target {
+            bail!("selected raw snapshot disappeared while indexing the stream");
+        }
+        Ok(Self {
+            begin: plan.target.clone(),
             objects,
             data,
         })
@@ -237,6 +477,162 @@ impl ObjectIndex {
             .ok_or_else(|| anyhow!("SA layouts object {layouts_id} has no data"))?;
         Ok((parse_sa_registry(registry), parse_sa_layouts(layouts)))
     }
+}
+
+fn finish_raw_range(
+    key: &DatasetKey,
+    range: Option<RawDnodeRange>,
+    dnodes: &mut Vec<RawDnode>,
+    objects: &mut BTreeMap<u64, ObjectMeta>,
+) -> Result<()> {
+    let Some(range) = range else {
+        if !dnodes.is_empty() {
+            bail!("raw dnodes were collected without an OBJECT_RANGE");
+        }
+        return Ok(());
+    };
+    let bonuses = key.decrypt_dnode_bonuses(range, dnodes)?;
+    for dnode in dnodes.iter() {
+        if let Some(bonus) = bonuses.get(&dnode.object) {
+            let length =
+                usize::try_from(dnode.bonus_length).context("bonus length is too large")?;
+            let meta = objects
+                .get_mut(&dnode.object)
+                .ok_or_else(|| anyhow!("raw object {} is missing from the index", dnode.object))?;
+            meta.bonus = bonus[..length].to_vec();
+        } else if dnode.bonus_length != 0 {
+            let length =
+                usize::try_from(dnode.bonus_length).context("bonus length is too large")?;
+            if dnode.bonus_ciphertext.len() < length {
+                bail!("raw object {} has a truncated bonus", dnode.object);
+            }
+            objects
+                .get_mut(&dnode.object)
+                .expect("raw object was inserted")
+                .bonus = dnode.bonus_ciphertext[..length].to_vec();
+        }
+    }
+    dnodes.clear();
+    Ok(())
+}
+
+pub fn snapshot_headers(path: &Path) -> Result<Vec<BeginRecord>> {
+    let file =
+        File::open(path).with_context(|| format!("opening ZFS send stream {}", path.display()))?;
+    let mut reader = StreamReader::new(file);
+    let mut snapshots = Vec::new();
+    while let Some(record) = reader.next_record()? {
+        if let RecordKind::Begin(header) = record.kind
+            && header.header_type == DMU_SUBSTREAM
+        {
+            snapshots.push(header);
+        }
+    }
+    if !reader.saw_end() {
+        bail!("ZFS send stream has no END record");
+    }
+    if snapshots.is_empty() {
+        bail!("ZFS send stream contains no snapshot substreams");
+    }
+    Ok(snapshots)
+}
+
+pub fn plan_snapshot(path: &Path, selector: Option<&str>) -> Result<SnapshotPlan> {
+    let snapshots = snapshot_headers(path)?;
+    let target_index = select_snapshot(&snapshots, selector)?;
+    let target = snapshots[target_index].clone();
+    let mut chain = vec![target.to_guid];
+    let mut cursor = target_index;
+    let mut from_guid = target.from_guid;
+
+    while from_guid != 0 {
+        let Some((index, header)) = snapshots[..cursor]
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, header)| header.to_guid == from_guid)
+        else {
+            bail!(
+                "snapshot {} depends on base GUID 0x{from_guid:016x}, which is not present earlier in the send file",
+                target.dataset_name
+            );
+        };
+        chain.push(header.to_guid);
+        cursor = index;
+        from_guid = header.from_guid;
+    }
+    chain.reverse();
+    Ok(SnapshotPlan { target, chain })
+}
+
+fn select_snapshot(snapshots: &[BeginRecord], selector: Option<&str>) -> Result<usize> {
+    let Some(selector) = selector else {
+        if snapshots.len() == 1 {
+            return Ok(0);
+        }
+        bail!(
+            "send file contains {} snapshots; choose one with --snapshot (run `snapshots` to list them)",
+            snapshots.len()
+        );
+    };
+
+    let exact = snapshots
+        .iter()
+        .enumerate()
+        .filter(|(_, header)| header.dataset_name == selector)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if exact.len() == 1 {
+        return Ok(exact[0]);
+    }
+
+    let short = selector.strip_prefix('@').unwrap_or(selector);
+    let named = snapshots
+        .iter()
+        .enumerate()
+        .filter(|(_, header)| {
+            header
+                .dataset_name
+                .rsplit_once('@')
+                .is_some_and(|(_, name)| name == short)
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if named.len() == 1 {
+        return Ok(named[0]);
+    }
+    if named.len() > 1 {
+        bail!(
+            "snapshot name {selector:?} is ambiguous; use the full dataset@snapshot name or GUID"
+        );
+    }
+
+    if let Some(guid) = parse_selector_guid(selector) {
+        let matches = snapshots
+            .iter()
+            .enumerate()
+            .filter(|(_, header)| header.to_guid == guid)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if matches.len() == 1 {
+            return Ok(matches[0]);
+        }
+        if matches.len() > 1 {
+            bail!("snapshot GUID {selector:?} appears more than once in the send file");
+        }
+    }
+
+    bail!("snapshot {selector:?} was not found in the send file")
+}
+
+fn parse_selector_guid(value: &str) -> Option<u64> {
+    value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .map_or_else(
+            || value.parse().ok(),
+            |hex| u64::from_str_radix(hex, 16).ok(),
+        )
 }
 
 fn capture_object_data(object_type: u32) -> bool {
