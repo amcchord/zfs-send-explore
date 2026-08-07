@@ -693,11 +693,39 @@ fn list_fat(source: Arc<dyn ImageRead>, path: &str) -> Result<Vec<DirectoryEntry
 fn resolve_fat<R: Read + Seek>(fs: &FatFs<R>, path: &str) -> Result<FileId> {
     let mut current = fs.root();
     for component in normalize_inner_path(path)? {
-        current = fs
-            .lookup(current, component.as_bytes())?
-            .ok_or_else(|| anyhow!("inner path {path:?} was not found"))?;
+        if let Some(exact) = fs.lookup(current, component.as_bytes())? {
+            current = exact;
+            continue;
+        }
+
+        // fat-core deliberately exposes the on-disk spelling. FAT and exFAT
+        // lookup semantics are case-insensitive, however, so fall back to the
+        // effective long name and its 8.3 alias instead of making CLI/UI paths
+        // depend on the stored capitalization.
+        let matches = fs
+            .read_dir(current)?
+            .into_iter()
+            .filter(|node| {
+                !node.is_deleted
+                    && !node.is_volume_label
+                    && (fat_name_matches(&node.name, component)
+                        || fat_name_matches(&node.short_name, component))
+            })
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        current = match matches.as_slice() {
+            [only] => *only,
+            [] => bail!("inner path {path:?} was not found"),
+            _ => {
+                bail!("inner path component {component:?} is ambiguous in a damaged FAT directory")
+            }
+        };
     }
     Ok(current)
+}
+
+fn fat_name_matches(stored: &str, requested: &str) -> bool {
+    stored.eq_ignore_ascii_case(requested) || stored.to_lowercase() == requested.to_lowercase()
 }
 
 fn extract_fat(
@@ -915,6 +943,24 @@ struct PartitionLayout {
 fn discover_partitions(source: &Arc<dyn ImageRead>) -> Result<Vec<PartitionLayout>> {
     if let Some(result) = discover_gpt(source)? {
         return Ok(result);
+    }
+
+    // FAT-family and NTFS superfloppies also end their boot sector in 55 AA.
+    // Their executable boot code can contain arbitrary nonzero bytes in the
+    // legacy MBR-entry region, so validate a complete filesystem at byte zero
+    // before interpreting those bytes as a partition table. GPT remains first
+    // because its checksummed metadata is an unambiguous disk-level signal.
+    let raw = PartitionLayout {
+        selector: "raw".to_owned(),
+        scheme: "raw".to_owned(),
+        partition: 0,
+        offset: 0,
+        length: source.len(),
+        partition_type: "unpartitioned".to_owned(),
+        name: String::new(),
+    };
+    if probe_volume(source, raw).filesystem.is_some() {
+        return Ok(Vec::new());
     }
     discover_mbr(source)
 }
@@ -1729,6 +1775,8 @@ mod tests {
     };
     use crate::filesystem::{ObjectIndex, plan_snapshot};
     use anyhow::{Result, bail};
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
     use std::sync::Arc;
 
     struct Bytes(Vec<u8>);
@@ -1746,6 +1794,12 @@ mod tests {
             buffer.copy_from_slice(bytes);
             Ok(())
         }
+    }
+
+    fn inception_error(result: Result<InceptionSession>) -> anyhow::Error {
+        result
+            .err()
+            .expect("inception inspection unexpectedly succeeded")
     }
 
     #[test]
@@ -1914,6 +1968,227 @@ mod tests {
     }
 
     #[test]
+    fn supported_filesystems_work_across_every_layout_and_container() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut cases = 0;
+
+        for fixture in filesystem_fixtures() {
+            let filesystem = fixture.load();
+            for layout in MatrixLayout::ALL {
+                let (disk, selector) = layout.wrap(&filesystem, fixture.mbr_type);
+                for container in MatrixContainer::ALL {
+                    let label = format!("{} / {layout:?} / {container:?}", fixture.name);
+                    let nested = container.wrap(&disk);
+                    let session = InceptionSession::inspect_source(
+                        Arc::new(Bytes(nested)),
+                        format!("/matrix/{}.img", fixture.name),
+                    )
+                    .unwrap_or_else(|error| panic!("{label}: {error:#}"));
+
+                    assert_eq!(session.container(), container.kind(), "{label}");
+                    assert_eq!(session.image_size(), disk.len() as u64, "{label}");
+                    assert_eq!(session.volumes().len(), 1, "{label}");
+                    let volume = &session.volumes()[0];
+                    assert_eq!(volume.selector, selector, "{label}");
+                    assert_eq!(volume.filesystem, Some(fixture.kind), "{label}");
+
+                    let entries = session
+                        .list_directory(None, "/")
+                        .unwrap_or_else(|error| panic!("{label}: listing root: {error:#}"));
+                    assert!(
+                        entries.iter().any(|entry| entry.name == fixture.root_entry),
+                        "{label}: root did not contain {:?}: {entries:?}",
+                        fixture.root_entry
+                    );
+
+                    let output = temporary.path().join(format!("matrix-{cases}.bin"));
+                    let extraction = session
+                        .extract(Some(&selector), fixture.path, &output, false)
+                        .unwrap_or_else(|error| {
+                            panic!("{label}: extracting {:?}: {error:#}", fixture.path)
+                        });
+                    assert_eq!(extraction.filesystem, fixture.kind, "{label}");
+                    assert_eq!(
+                        extraction.logical_size,
+                        fixture.contents.len() as u64,
+                        "{label}"
+                    );
+                    assert_eq!(std::fs::read(&output).unwrap(), fixture.contents, "{label}");
+
+                    if layout == MatrixLayout::Raw && container == MatrixContainer::Raw {
+                        fixture.assert_extended_behaviors(&session, temporary.path());
+                    }
+                    cases += 1;
+                }
+            }
+        }
+
+        assert_eq!(cases, 7 * 3 * 3);
+    }
+
+    #[test]
+    fn explicit_windows_work_for_raw_qcow2_and_vmdk_images() {
+        let guest = fat12_image();
+        for container in MatrixContainer::ALL {
+            let nested = container.wrap(&guest);
+            let mut enclosing_file = vec![0xa5; 4096];
+            enclosing_file.extend_from_slice(&nested);
+            enclosing_file.extend_from_slice(&[0x5a; 2048]);
+            let session = InceptionSession::inspect_source_at(
+                Arc::new(Bytes(enclosing_file)),
+                format!("/vm/offset-{container:?}.bin"),
+                4096,
+                Some(nested.len() as u64),
+            )
+            .unwrap_or_else(|error| panic!("{container:?}: {error:#}"));
+            assert_eq!(session.container(), container.kind());
+            assert_eq!(session.image_offset(), 4096);
+            assert_eq!(session.stored_size(), nested.len() as u64);
+            assert_eq!(session.image_size(), guest.len() as u64);
+            assert_eq!(session.volumes()[0].filesystem, Some(FilesystemKind::Fat12));
+        }
+    }
+
+    #[test]
+    fn multiple_supported_volumes_require_and_honor_a_selector() {
+        let disk = two_partition_mbr(&fat12_image());
+        let session = InceptionSession::inspect_source(
+            Arc::new(Bytes(disk)),
+            "/vm/two-volumes.raw".to_owned(),
+        )
+        .unwrap();
+        assert_eq!(session.volumes().len(), 2);
+        let error = session.list_directory(None, "/").unwrap_err();
+        assert!(format!("{error:#}").contains("multiple supported volumes"));
+        assert!(
+            session
+                .list_directory(Some("MBR2"), "/")
+                .unwrap()
+                .iter()
+                .any(|entry| entry.name == "HELLO.TXT")
+        );
+        let missing = session.list_directory(Some("mbr9"), "/").unwrap_err();
+        assert!(format!("{missing:#}").contains("available: mbr1, mbr2"));
+    }
+
+    #[test]
+    fn malformed_containers_and_partition_tables_are_rejected() {
+        let mut qcow1 = vec![0_u8; 512];
+        qcow1[..4].copy_from_slice(&[b'Q', b'F', b'I', 0xfb]);
+        qcow1[4..8].copy_from_slice(&1_u32.to_be_bytes());
+        let error = inception_error(InceptionSession::inspect_source(
+            Arc::new(Bytes(qcow1)),
+            "/vm/qcow1.img".to_owned(),
+        ));
+        assert!(format!("{error:#}").contains("QCOW version 1 is not supported"));
+
+        let mut overlay = qcow2_sparse(&fat12_image());
+        overlay[8..16].copy_from_slice(&104_u64.to_be_bytes());
+        overlay[16..20].copy_from_slice(&12_u32.to_be_bytes());
+        overlay[104..116].copy_from_slice(b"parent.qcow2");
+        let error = inception_error(InceptionSession::inspect_source(
+            Arc::new(Bytes(overlay)),
+            "/vm/overlay.qcow2".to_owned(),
+        ));
+        assert!(format!("{error:#}").contains("backing file"));
+
+        let mut encrypted = qcow2_sparse(&fat12_image());
+        encrypted[32..36].copy_from_slice(&1_u32.to_be_bytes());
+        let error = inception_error(InceptionSession::inspect_source(
+            Arc::new(Bytes(encrypted)),
+            "/vm/encrypted.qcow2".to_owned(),
+        ));
+        assert!(format!("{error:#}").contains("encrypted QCOW2"));
+
+        let mut descriptor = vec![0_u8; 512];
+        let text = b"# Disk DescriptorFile\nversion=1\ncreateType=\"twoGbMaxExtentSparse\"\n";
+        descriptor[..text.len()].copy_from_slice(text);
+        let error = inception_error(InceptionSession::inspect_source(
+            Arc::new(Bytes(descriptor)),
+            "/vm/external.vmdk".to_owned(),
+        ));
+        assert!(format!("{error:#}").contains("external extent files"));
+
+        let mut gpt = gpt_disk(&fat12_image());
+        let last_sector = gpt.len() / 512 - 1;
+        gpt[512 + 32] ^= 0x80;
+        gpt[last_sector * 512 + 32] ^= 0x80;
+        let error = inception_error(InceptionSession::inspect_source(
+            Arc::new(Bytes(gpt)),
+            "/vm/bad-gpt.raw".to_owned(),
+        ));
+        assert!(format!("{error:#}").contains("no header validated"));
+
+        let mut out_of_bounds = vec![0_u8; 1024];
+        out_of_bounds[446 + 4] = 0x83;
+        out_of_bounds[446 + 8..446 + 12].copy_from_slice(&10_u32.to_le_bytes());
+        out_of_bounds[446 + 12..446 + 16].copy_from_slice(&1_u32.to_le_bytes());
+        out_of_bounds[510..512].copy_from_slice(&[0x55, 0xaa]);
+        let error = inception_error(InceptionSession::inspect_source(
+            Arc::new(Bytes(out_of_bounds)),
+            "/vm/bad-mbr.raw".to_owned(),
+        ));
+        assert!(format!("{error:#}").contains("lies outside the nested image"));
+
+        let error = inception_error(InceptionSession::inspect_source(
+            Arc::new(Bytes(looping_ebr())),
+            "/vm/looping-ebr.raw".to_owned(),
+        ));
+        assert!(format!("{error:#}").contains("chain contains a loop"));
+    }
+
+    #[test]
+    fn unsafe_paths_unknown_filesystems_and_invalid_windows_are_explained() {
+        let session = InceptionSession::inspect_source(
+            Arc::new(Bytes(fat12_image())),
+            "/vm/safe.raw".to_owned(),
+        )
+        .unwrap();
+        let traversal = session.list_directory(None, "/../secret").unwrap_err();
+        assert!(format!("{traversal:#}").contains("cannot contain '..'"));
+        let relative = session.list_directory(None, "relative").unwrap_err();
+        assert!(format!("{relative:#}").contains("must be absolute"));
+
+        let unknown = InceptionSession::inspect_source(
+            Arc::new(Bytes(vec![0_u8; 4096])),
+            "/vm/unknown.raw".to_owned(),
+        )
+        .unwrap();
+        assert_eq!(unknown.volumes()[0].filesystem, None);
+        assert!(
+            unknown.volumes()[0]
+                .diagnostic
+                .as_deref()
+                .unwrap()
+                .contains("no supported filesystem signature")
+        );
+        let error = unknown.list_directory(None, "/").unwrap_err();
+        assert!(format!("{error:#}").contains("contains no supported"));
+
+        let source = Arc::new(Bytes(vec![0_u8; 4096]));
+        assert!(
+            inception_error(InceptionSession::inspect_source_at(
+                source.clone(),
+                "bad".to_owned(),
+                4097,
+                None,
+            ))
+            .to_string()
+            .contains("exceeds ZFS file size")
+        );
+        assert!(
+            inception_error(InceptionSession::inspect_source_at(
+                source,
+                "bad".to_owned(),
+                2048,
+                Some(4096),
+            ))
+            .to_string()
+            .contains("outside")
+        );
+    }
+
+    #[test]
     fn send_backing_reads_only_the_selected_plain_object() {
         let stream = std::path::Path::new("tests/fixtures/tiny-full.zfs");
         let plan = plan_snapshot(stream, None).unwrap();
@@ -1948,6 +2223,570 @@ mod tests {
         let mut bytes = vec![0_u8; image.len() as usize];
         image.read_exact_at(0, &mut bytes).unwrap();
         assert_eq!(bytes, b"encrypted hello\n");
+    }
+
+    #[derive(Clone, Copy)]
+    enum FixtureSource {
+        InlineFat12,
+        ZstdBase64 {
+            encoded: &'static str,
+            compressed_sha256: &'static str,
+            raw_sha256: &'static str,
+            raw_len: usize,
+        },
+    }
+
+    #[derive(Clone, Copy)]
+    struct FilesystemFixture {
+        name: &'static str,
+        source: FixtureSource,
+        kind: FilesystemKind,
+        mbr_type: u8,
+        root_entry: &'static str,
+        path: &'static str,
+        contents: &'static [u8],
+    }
+
+    impl FilesystemFixture {
+        fn load(self) -> Vec<u8> {
+            match self.source {
+                FixtureSource::InlineFat12 => fat12_image(),
+                FixtureSource::ZstdBase64 {
+                    encoded,
+                    compressed_sha256,
+                    raw_sha256,
+                    raw_len,
+                } => {
+                    decode_zstd_fixture(self.name, encoded, compressed_sha256, raw_sha256, raw_len)
+                }
+            }
+        }
+
+        fn assert_extended_behaviors(
+            self,
+            session: &InceptionSession,
+            output_dir: &std::path::Path,
+        ) {
+            let directory_target = output_dir.join(format!("{}-directory", self.name));
+            let error = session
+                .extract(None, "/", &directory_target, false)
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("not a regular file"));
+
+            match self.name {
+                "ntfs" => {
+                    let resident = extract_bytes(
+                        session,
+                        "/file-with-12345",
+                        &output_dir.join("ntfs-resident"),
+                    );
+                    assert_eq!(resident, b"12345");
+
+                    let non_resident = extract_bytes(
+                        session,
+                        "/1000-bytes-file",
+                        &output_dir.join("ntfs-non-resident"),
+                    );
+                    assert_eq!(non_resident, b"12345".repeat(200));
+
+                    let sparse =
+                        extract_bytes(session, "/sparse-file", &output_dir.join("ntfs-sparse"));
+                    assert_eq!(sparse.len(), 500_005);
+                    assert_eq!(&sparse[..5], b"12345");
+                    assert!(sparse[5..500_000].iter().all(|byte| *byte == 0));
+                    assert_eq!(&sparse[500_000..], b"11111");
+
+                    let many = session.list_directory(None, "/many_subdirs").unwrap();
+                    assert_eq!(many.len(), 512);
+                    assert!(many.iter().any(|entry| entry.name == "512"));
+                }
+                "fat16" => {
+                    let long = extract_bytes(
+                        session,
+                        "/LongFileName_16.txt",
+                        &output_dir.join("fat16-long"),
+                    );
+                    assert_eq!(long, b"this file has a long name for LFN reassembly test\n");
+                    let nested = extract_bytes(
+                        session,
+                        "/SUBDIR/nested.txt",
+                        &output_dir.join("fat16-case-folded"),
+                    );
+                    assert_eq!(nested, b"nested file content 16\n");
+                }
+                "fat32" => {
+                    let long = extract_bytes(
+                        session,
+                        "/Long Matrix Filename FAT32.txt",
+                        &output_dir.join("fat32-long"),
+                    );
+                    assert_eq!(long, b"long FAT32 filename content\n");
+
+                    let sparse =
+                        extract_bytes(session, "/SPARSE.BIN", &output_dir.join("fat32-sparse"));
+                    assert_eq!(sparse.len(), 4 * 1024 * 1024 + 4);
+                    assert_eq!(&sparse[..4], b"HEAD");
+                    assert!(sparse[4..4 * 1024 * 1024].iter().all(|byte| *byte == 0));
+                    assert_eq!(&sparse[4 * 1024 * 1024..], b"TAIL");
+                }
+                "exfat" => {
+                    let long = extract_bytes(
+                        session,
+                        "/LongFileName_exfat.txt",
+                        &output_dir.join("exfat-long"),
+                    );
+                    assert_eq!(
+                        long,
+                        b"this exFAT file has a long name stored in File Name entries\n"
+                    );
+                    let nested = extract_bytes(
+                        session,
+                        "/SUBDIR/nested.txt",
+                        &output_dir.join("exfat-case-folded"),
+                    );
+                    assert_eq!(nested, b"nested exfat content\n");
+                }
+                "ext4" => {
+                    assert_ext_holes(session, &output_dir.join("ext4-holes"));
+                    let error = session
+                        .extract(
+                            None,
+                            "/dir1/dir2/sym_abs",
+                            &output_dir.join("ext4-symlink"),
+                            false,
+                        )
+                        .unwrap_err();
+                    assert!(format!("{error:#}").contains("symlinks are not followed"));
+                }
+                "ext2" => assert_ext_holes(session, &output_dir.join("ext2-holes")),
+                "fat12" => {}
+                other => panic!("unhandled filesystem fixture {other}"),
+            }
+        }
+    }
+
+    fn filesystem_fixtures() -> [FilesystemFixture; 7] {
+        [
+            FilesystemFixture {
+                name: "fat12",
+                source: FixtureSource::InlineFat12,
+                kind: FilesystemKind::Fat12,
+                mbr_type: 0x01,
+                root_entry: "HELLO.TXT",
+                path: "/HELLO.TXT",
+                contents: b"hello",
+            },
+            FilesystemFixture {
+                name: "fat16",
+                source: FixtureSource::ZstdBase64 {
+                    encoded: include_str!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/tests/fixtures/inception/fat16.img.zst.b64"
+                    )),
+                    compressed_sha256: "2f2ec24e7e62ae256eeb3197540e28822f130a4cf1130d812a2b6dba0062a8dd",
+                    raw_sha256: "b8dee10dcb38b6e6dfefe9e5a551405bdb1e600fb81789e80420070abdc71f8b",
+                    raw_len: 4_194_304,
+                },
+                kind: FilesystemKind::Fat16,
+                mbr_type: 0x06,
+                root_entry: "HELLO.TXT",
+                path: "/subdir/NESTED.TXT",
+                contents: b"nested file content 16\n",
+            },
+            FilesystemFixture {
+                name: "fat32",
+                source: FixtureSource::ZstdBase64 {
+                    encoded: include_str!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/tests/fixtures/inception/fat32.img.zst.b64"
+                    )),
+                    compressed_sha256: "ed871400721a9fa11f0839bb2bb51d2bde132eec9e10f40875b414d02a9c3e3b",
+                    raw_sha256: "c43eced7ec3fe9dd78a9ee402d5ecb691f58688b377e7445aa4e8e08236a0045",
+                    raw_len: 67_108_864,
+                },
+                kind: FilesystemKind::Fat32,
+                mbr_type: 0x0c,
+                root_entry: "HELLO.TXT",
+                path: "/subdir/NESTED.TXT",
+                contents: b"nested FAT32 matrix content\n",
+            },
+            FilesystemFixture {
+                name: "exfat",
+                source: FixtureSource::ZstdBase64 {
+                    encoded: include_str!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/tests/fixtures/inception/exfat.img.zst.b64"
+                    )),
+                    compressed_sha256: "cdd8cbc4944cf92fab78b2d325ce03444527713906e0fab7c66e3a16c9cbf136",
+                    raw_sha256: "4e0ab00a9c753bc20f9ece484534bbcdab59c1688a1d30590426ce4b9dba0601",
+                    raw_len: 2_097_152,
+                },
+                kind: FilesystemKind::Exfat,
+                mbr_type: 0x07,
+                root_entry: "HELLO.TXT",
+                path: "/subdir/NESTED.TXT",
+                contents: b"nested exfat content\n",
+            },
+            FilesystemFixture {
+                name: "ntfs",
+                source: FixtureSource::ZstdBase64 {
+                    encoded: include_str!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/tests/fixtures/inception/ntfs.img.zst.b64"
+                    )),
+                    compressed_sha256: "d53e13e45543501d861898f70e70d26a731ad79d4245ac6039aab6235d555dad",
+                    raw_sha256: "e3612c182b8010e3599b5eb93bff427c7d824e85bdc2ddbe46e378e3ba814eb9",
+                    raw_len: 2_097_152,
+                },
+                kind: FilesystemKind::Ntfs,
+                mbr_type: 0x07,
+                root_entry: "file-with-12345",
+                path: "/file-with-12345",
+                contents: b"12345",
+            },
+            FilesystemFixture {
+                name: "ext4",
+                source: FixtureSource::ZstdBase64 {
+                    encoded: include_str!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/tests/fixtures/inception/ext4.img.zst.b64"
+                    )),
+                    compressed_sha256: "17c740fa68d260e70a3e8e146c1537f8f5b2fee3eb3a65c6385cd493ecb5a09b",
+                    raw_sha256: "58f4ec5f880a1934bc23a73bc0d07b50a987736d7a1a8fbbafdc99bd36dfbee3",
+                    raw_len: 67_108_864,
+                },
+                kind: FilesystemKind::Ext4,
+                mbr_type: 0x83,
+                root_entry: "small_file",
+                path: "/small_file",
+                contents: b"hello, world!",
+            },
+            FilesystemFixture {
+                name: "ext2",
+                source: FixtureSource::ZstdBase64 {
+                    encoded: include_str!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/tests/fixtures/inception/ext2.img.zst.b64"
+                    )),
+                    compressed_sha256: "b7008bdc6a2d50fdcb0684e506632e39421e18db7dbdc4d56c12422656102511",
+                    raw_sha256: "b277b932c8f001c302920cbe9f47245b82e3232a123c82e5a595c5fd09c8dc3f",
+                    raw_len: 100_663_296,
+                },
+                kind: FilesystemKind::Ext4,
+                mbr_type: 0x83,
+                root_entry: "small_file",
+                path: "/small_file",
+                contents: b"hello, world!",
+            },
+        ]
+    }
+
+    fn decode_zstd_fixture(
+        name: &str,
+        encoded: &str,
+        compressed_sha256: &str,
+        raw_sha256: &str,
+        raw_len: usize,
+    ) -> Vec<u8> {
+        let compressed = decode_base64(encoded);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&compressed)),
+            compressed_sha256,
+            "{name} compressed fixture hash"
+        );
+        let mut decoder = ruzstd::decoding::StreamingDecoder::new(compressed.as_slice())
+            .unwrap_or_else(|error| panic!("{name}: opening Zstandard fixture: {error}"));
+        let mut raw = Vec::with_capacity(raw_len);
+        decoder
+            .read_to_end(&mut raw)
+            .unwrap_or_else(|error| panic!("{name}: decompressing fixture: {error}"));
+        assert_eq!(raw.len(), raw_len, "{name} raw fixture length");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&raw)),
+            raw_sha256,
+            "{name} raw fixture hash"
+        );
+        raw
+    }
+
+    fn decode_base64(encoded: &str) -> Vec<u8> {
+        let mut decoded = Vec::with_capacity(encoded.len() * 3 / 4);
+        let mut quartet = [0_u8; 4];
+        let mut count = 0;
+        for byte in encoded.bytes().filter(|byte| !byte.is_ascii_whitespace()) {
+            quartet[count] = match byte {
+                b'A'..=b'Z' => byte - b'A',
+                b'a'..=b'z' => byte - b'a' + 26,
+                b'0'..=b'9' => byte - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                b'=' => 64,
+                other => panic!("invalid base64 byte {other:#04x}"),
+            };
+            count += 1;
+            if count == 4 {
+                assert!(quartet[0] < 64 && quartet[1] < 64);
+                decoded.push((quartet[0] << 2) | (quartet[1] >> 4));
+                if quartet[2] < 64 {
+                    decoded.push((quartet[1] << 4) | (quartet[2] >> 2));
+                    if quartet[3] < 64 {
+                        decoded.push((quartet[2] << 6) | quartet[3]);
+                    }
+                }
+                count = 0;
+            }
+        }
+        assert_eq!(count, 0, "base64 fixture ended inside a quartet");
+        decoded
+    }
+
+    fn extract_bytes(session: &InceptionSession, path: &str, output: &std::path::Path) -> Vec<u8> {
+        session.extract(None, path, output, false).unwrap();
+        std::fs::read(output).unwrap()
+    }
+
+    fn assert_ext_holes(session: &InceptionSession, output: &std::path::Path) {
+        let holes = extract_bytes(session, "/holes", output);
+        let mut expected = Vec::with_capacity(10 * 1024);
+        for value in [0, 0, 0xa1, 0xa2, 0, 0, 0xa3, 0xa4, 0, 0] {
+            expected.extend(std::iter::repeat_n(value, 1024));
+        }
+        assert_eq!(holes, expected);
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum MatrixLayout {
+        Raw,
+        Mbr,
+        Gpt,
+    }
+
+    impl MatrixLayout {
+        const ALL: [Self; 3] = [Self::Raw, Self::Mbr, Self::Gpt];
+
+        fn wrap(self, filesystem: &[u8], mbr_type: u8) -> (Vec<u8>, String) {
+            match self {
+                Self::Raw => (filesystem.to_vec(), "raw".to_owned()),
+                Self::Mbr => (mbr_disk(filesystem, mbr_type), "mbr1".to_owned()),
+                Self::Gpt => (gpt_disk(filesystem), "gpt1".to_owned()),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum MatrixContainer {
+        Raw,
+        Qcow2,
+        Vmdk,
+    }
+
+    impl MatrixContainer {
+        const ALL: [Self; 3] = [Self::Raw, Self::Qcow2, Self::Vmdk];
+
+        fn wrap(self, disk: &[u8]) -> Vec<u8> {
+            match self {
+                Self::Raw => disk.to_vec(),
+                Self::Qcow2 => qcow2_sparse(disk),
+                Self::Vmdk => vmdk_sparse(disk),
+            }
+        }
+
+        fn kind(self) -> DiskContainerKind {
+            match self {
+                Self::Raw => DiskContainerKind::Raw,
+                Self::Qcow2 => DiskContainerKind::Qcow2,
+                Self::Vmdk => DiskContainerKind::Vmdk,
+            }
+        }
+    }
+
+    fn mbr_disk(filesystem: &[u8], partition_type: u8) -> Vec<u8> {
+        const SECTOR: usize = 512;
+        const FIRST_LBA: u32 = 2048;
+        let sectors = u32::try_from(filesystem.len().div_ceil(SECTOR)).unwrap();
+        let mut disk = vec![0_u8; (FIRST_LBA as usize + sectors as usize) * SECTOR];
+        disk[446 + 4] = partition_type;
+        disk[446 + 8..446 + 12].copy_from_slice(&FIRST_LBA.to_le_bytes());
+        disk[446 + 12..446 + 16].copy_from_slice(&sectors.to_le_bytes());
+        disk[510..512].copy_from_slice(&[0x55, 0xaa]);
+        let offset = FIRST_LBA as usize * SECTOR;
+        disk[offset..offset + filesystem.len()].copy_from_slice(filesystem);
+        disk
+    }
+
+    fn two_partition_mbr(filesystem: &[u8]) -> Vec<u8> {
+        const SECTOR: usize = 512;
+        let sectors = u32::try_from(filesystem.len().div_ceil(SECTOR)).unwrap();
+        let starts = [1_u32, 1 + sectors];
+        let mut disk = vec![0_u8; (starts[1] + sectors) as usize * SECTOR];
+        for (index, start) in starts.into_iter().enumerate() {
+            let entry = 446 + index * 16;
+            disk[entry + 4] = 0x01;
+            disk[entry + 8..entry + 12].copy_from_slice(&start.to_le_bytes());
+            disk[entry + 12..entry + 16].copy_from_slice(&sectors.to_le_bytes());
+            let offset = start as usize * SECTOR;
+            disk[offset..offset + filesystem.len()].copy_from_slice(filesystem);
+        }
+        disk[510..512].copy_from_slice(&[0x55, 0xaa]);
+        disk
+    }
+
+    fn looping_ebr() -> Vec<u8> {
+        let mut disk = vec![0_u8; 3 * 512];
+        disk[446 + 4] = 0x0f;
+        disk[446 + 8..446 + 12].copy_from_slice(&1_u32.to_le_bytes());
+        disk[446 + 12..446 + 16].copy_from_slice(&2_u32.to_le_bytes());
+        disk[510..512].copy_from_slice(&[0x55, 0xaa]);
+        let ebr = 512;
+        disk[ebr + 462 + 4] = 0x0f;
+        disk[ebr + 462 + 8..ebr + 462 + 12].copy_from_slice(&0_u32.to_le_bytes());
+        disk[ebr + 462 + 12..ebr + 462 + 16].copy_from_slice(&2_u32.to_le_bytes());
+        disk[ebr + 510..ebr + 512].copy_from_slice(&[0x55, 0xaa]);
+        disk
+    }
+
+    fn gpt_disk(filesystem: &[u8]) -> Vec<u8> {
+        const SECTOR: usize = 512;
+        const FIRST_PARTITION_LBA: u64 = 2048;
+        let partition_sectors = filesystem.len().div_ceil(SECTOR) as u64;
+        let total_lbas = FIRST_PARTITION_LBA + partition_sectors + 40;
+        let last_lba = total_lbas - 1;
+        let mut disk = vec![0_u8; total_lbas as usize * SECTOR];
+
+        disk[446 + 4] = 0xee;
+        disk[446 + 8..446 + 12].copy_from_slice(&1_u32.to_le_bytes());
+        disk[446 + 12..446 + 16]
+            .copy_from_slice(&u32::try_from(total_lbas - 1).unwrap().to_le_bytes());
+        disk[510..512].copy_from_slice(&[0x55, 0xaa]);
+
+        let mut entry = [0_u8; 128];
+        entry[..16].copy_from_slice(&[
+            0xa2, 0xa0, 0xd0, 0xeb, 0xe5, 0xb9, 0x33, 0x44, 0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26,
+            0x99, 0xc7,
+        ]);
+        entry[16..32].fill(1);
+        entry[32..40].copy_from_slice(&FIRST_PARTITION_LBA.to_le_bytes());
+        entry[40..48].copy_from_slice(&(FIRST_PARTITION_LBA + partition_sectors - 1).to_le_bytes());
+        for (index, unit) in "matrix".encode_utf16().enumerate() {
+            entry[56 + index * 2..58 + index * 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        let entries_crc = crc32fast::hash(&entry);
+        disk[SECTOR * 2..SECTOR * 2 + entry.len()].copy_from_slice(&entry);
+        let backup_entries_lba = last_lba - 1;
+        let backup_entries_offset = backup_entries_lba as usize * SECTOR;
+        disk[backup_entries_offset..backup_entries_offset + entry.len()].copy_from_slice(&entry);
+        disk[SECTOR..SECTOR * 2].copy_from_slice(&gpt_header(
+            1,
+            last_lba,
+            2,
+            total_lbas,
+            entries_crc,
+        ));
+        disk[last_lba as usize * SECTOR..(last_lba as usize + 1) * SECTOR].copy_from_slice(
+            &gpt_header(last_lba, 1, backup_entries_lba, total_lbas, entries_crc),
+        );
+
+        let partition_offset = FIRST_PARTITION_LBA as usize * SECTOR;
+        disk[partition_offset..partition_offset + filesystem.len()].copy_from_slice(filesystem);
+        disk
+    }
+
+    fn qcow2_sparse(guest: &[u8]) -> Vec<u8> {
+        const CLUSTER: usize = 64 * 1024;
+        let guest_clusters = guest.len().div_ceil(CLUSTER);
+        assert!(
+            guest_clusters <= CLUSTER / 8,
+            "test QCOW2 needs a second L2 table"
+        );
+        let allocated = guest
+            .chunks(CLUSTER)
+            .filter(|cluster| cluster.iter().any(|byte| *byte != 0))
+            .count();
+        let mut image = vec![0_u8; CLUSTER * (3 + allocated)];
+        image[0..4].copy_from_slice(&[b'Q', b'F', b'I', 0xfb]);
+        image[4..8].copy_from_slice(&3_u32.to_be_bytes());
+        image[20..24].copy_from_slice(&16_u32.to_be_bytes());
+        image[24..32].copy_from_slice(&(guest.len() as u64).to_be_bytes());
+        image[36..40].copy_from_slice(&1_u32.to_be_bytes());
+        image[40..48].copy_from_slice(&(CLUSTER as u64).to_be_bytes());
+        image[96..100].copy_from_slice(&4_u32.to_be_bytes());
+        image[100..104].copy_from_slice(&104_u32.to_be_bytes());
+        image[CLUSTER..CLUSTER + 8].copy_from_slice(&((CLUSTER * 2) as u64).to_be_bytes());
+
+        let mut physical_cluster = 3;
+        for (guest_cluster, bytes) in guest.chunks(CLUSTER).enumerate() {
+            if bytes.iter().all(|byte| *byte == 0) {
+                continue;
+            }
+            let physical_offset = physical_cluster * CLUSTER;
+            let l2_offset = CLUSTER * 2 + guest_cluster * 8;
+            image[l2_offset..l2_offset + 8]
+                .copy_from_slice(&(physical_offset as u64).to_be_bytes());
+            image[physical_offset..physical_offset + bytes.len()].copy_from_slice(bytes);
+            physical_cluster += 1;
+        }
+        image
+    }
+
+    fn vmdk_sparse(guest: &[u8]) -> Vec<u8> {
+        const SECTOR: usize = 512;
+        const GRAIN_SECTORS: usize = 128;
+        const GRAIN_BYTES: usize = GRAIN_SECTORS * SECTOR;
+        const ENTRIES_PER_TABLE: usize = 512;
+        const TABLE_SECTORS: usize = ENTRIES_PER_TABLE * 4 / SECTOR;
+
+        assert_eq!(guest.len() % SECTOR, 0);
+        let capacity = guest.len() / SECTOR;
+        let grains = capacity.div_ceil(GRAIN_SECTORS);
+        let table_count = grains.div_ceil(ENTRIES_PER_TABLE);
+        assert!(
+            table_count <= SECTOR / 4,
+            "test VMDK grain directory overflow"
+        );
+        let overhead = 3 + table_count * TABLE_SECTORS;
+        let allocated = guest
+            .chunks(GRAIN_BYTES)
+            .filter(|grain| grain.iter().any(|byte| *byte != 0))
+            .count();
+        let mut image = vec![0_u8; (overhead + allocated * GRAIN_SECTORS) * SECTOR];
+        image[0..4].copy_from_slice(b"KDMV");
+        image[4..8].copy_from_slice(&1_u32.to_le_bytes());
+        image[12..20].copy_from_slice(&(capacity as u64).to_le_bytes());
+        image[20..28].copy_from_slice(&(GRAIN_SECTORS as u64).to_le_bytes());
+        image[28..36].copy_from_slice(&1_u64.to_le_bytes());
+        image[36..44].copy_from_slice(&1_u64.to_le_bytes());
+        image[44..48].copy_from_slice(&(ENTRIES_PER_TABLE as u32).to_le_bytes());
+        image[56..64].copy_from_slice(&2_u64.to_le_bytes());
+        image[64..72].copy_from_slice(&(overhead as u64).to_le_bytes());
+        image[73..77].copy_from_slice(b"\n \r\n");
+        let descriptor = format!(
+            "# Disk DescriptorFile\nversion=1\nCID=fffffffe\nparentCID=ffffffff\ncreateType=\"monolithicSparse\"\n\nRW {capacity} SPARSE \"matrix.vmdk\"\n"
+        );
+        image[SECTOR..SECTOR + descriptor.len()].copy_from_slice(descriptor.as_bytes());
+
+        for table in 0..table_count {
+            let table_sector = 3 + table * TABLE_SECTORS;
+            let directory_entry = SECTOR * 2 + table * 4;
+            image[directory_entry..directory_entry + 4]
+                .copy_from_slice(&(table_sector as u32).to_le_bytes());
+        }
+
+        let mut physical_sector = overhead;
+        for (grain_index, bytes) in guest.chunks(GRAIN_BYTES).enumerate() {
+            if bytes.iter().all(|byte| *byte == 0) {
+                continue;
+            }
+            let table = grain_index / ENTRIES_PER_TABLE;
+            let slot = grain_index % ENTRIES_PER_TABLE;
+            let table_sector = 3 + table * TABLE_SECTORS;
+            let table_entry = table_sector * SECTOR + slot * 4;
+            image[table_entry..table_entry + 4]
+                .copy_from_slice(&(physical_sector as u32).to_le_bytes());
+            let physical_offset = physical_sector * SECTOR;
+            image[physical_offset..physical_offset + bytes.len()].copy_from_slice(bytes);
+            physical_sector += GRAIN_SECTORS;
+        }
+        image
     }
 
     fn fat12_image() -> Vec<u8> {

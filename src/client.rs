@@ -406,8 +406,30 @@ fn extraction_from_pool(extraction: PoolExtraction) -> ClientExtraction {
 
 #[cfg(test)]
 mod tests {
-    use super::{SourceCatalog, SourceKind, apply_incremental, child_path, parent_path};
+    use super::{
+        InceptionCatalog, SourceCatalog, SourceKind, apply_incremental, child_path, parent_path,
+    };
+    use crate::inception::{ImageRead, InceptionSession};
+    use anyhow::{Result, bail};
     use std::path::Path;
+    use std::sync::Arc;
+
+    struct Bytes(Vec<u8>);
+
+    impl ImageRead for Bytes {
+        fn len(&self) -> u64 {
+            self.0.len() as u64
+        }
+
+        fn read_exact_at(&self, offset: u64, buffer: &mut [u8]) -> Result<()> {
+            let start = offset as usize;
+            let Some(bytes) = self.0.get(start..start + buffer.len()) else {
+                bail!("outside UI test source");
+            };
+            buffer.copy_from_slice(bytes);
+            Ok(())
+        }
+    }
 
     #[test]
     fn send_catalog_browses_and_extracts_a_selected_snapshot() {
@@ -446,6 +468,41 @@ mod tests {
     }
 
     #[test]
+    fn windows_service_catalog_lists_and_extracts_from_a_retained_inception_session() {
+        let session = Arc::new(
+            InceptionSession::inspect_source(
+                Arc::new(Bytes(small_fat12_image())),
+                "/vms/disk.raw".to_owned(),
+            )
+            .unwrap(),
+        );
+        let catalog = InceptionCatalog {
+            image_path: session.image_path().to_owned(),
+            image_offset: session.image_offset(),
+            stored_size: session.stored_size(),
+            disk_size: session.image_size(),
+            container: session.container(),
+            volumes: session.volumes().to_vec(),
+            session,
+        };
+
+        assert_eq!(catalog.volumes[0].selector, "raw");
+        assert!(
+            catalog
+                .list_directory(None, "/")
+                .unwrap()
+                .iter()
+                .any(|entry| entry.name == "HELLO.TXT")
+        );
+        let temporary = tempfile::tempdir().unwrap();
+        let output = temporary.path().join("hello.txt");
+        let extraction = catalog.extract(None, "/HELLO.TXT", &output, false).unwrap();
+        assert_eq!(extraction.logical_size, 5);
+        assert!(!extraction.update_eligible);
+        assert_eq!(std::fs::read(output).unwrap(), b"hello");
+    }
+
+    #[test]
     fn client_update_flow_advances_a_verified_extraction() {
         let catalog = SourceCatalog::open_send(Path::new("tests/fixtures/tiny-full.zfs")).unwrap();
         let temporary = tempfile::tempdir().unwrap();
@@ -464,5 +521,40 @@ mod tests {
             std::fs::read_to_string(target).unwrap(),
             "hello from the incremental snapshot\nwith an appended line\n"
         );
+    }
+
+    fn small_fat12_image() -> Vec<u8> {
+        const SECTOR: usize = 512;
+        const SECTORS: usize = 64;
+        let mut image = vec![0_u8; SECTOR * SECTORS];
+        let boot = &mut image[..SECTOR];
+        boot[0..3].copy_from_slice(&[0xeb, 0x3c, 0x90]);
+        boot[3..11].copy_from_slice(b"ZFSETEST");
+        boot[11..13].copy_from_slice(&512_u16.to_le_bytes());
+        boot[13] = 1;
+        boot[14..16].copy_from_slice(&1_u16.to_le_bytes());
+        boot[16] = 2;
+        boot[17..19].copy_from_slice(&16_u16.to_le_bytes());
+        boot[19..21].copy_from_slice(&(SECTORS as u16).to_le_bytes());
+        boot[21] = 0xf8;
+        boot[22..24].copy_from_slice(&1_u16.to_le_bytes());
+        boot[24..26].copy_from_slice(&1_u16.to_le_bytes());
+        boot[26..28].copy_from_slice(&1_u16.to_le_bytes());
+        boot[38] = 0x29;
+        boot[43..54].copy_from_slice(b"ZFSE TEST  ");
+        boot[54..62].copy_from_slice(b"FAT12   ");
+        boot[510..512].copy_from_slice(&[0x55, 0xaa]);
+
+        for fat_sector in [1_usize, 2] {
+            let fat = &mut image[fat_sector * SECTOR..(fat_sector + 1) * SECTOR];
+            fat[..5].copy_from_slice(&[0xf8, 0xff, 0xff, 0xff, 0x0f]);
+        }
+        let entry = &mut image[3 * SECTOR..3 * SECTOR + 32];
+        entry[..11].copy_from_slice(b"HELLO   TXT");
+        entry[11] = 0x20;
+        entry[26..28].copy_from_slice(&2_u16.to_le_bytes());
+        entry[28..32].copy_from_slice(&5_u32.to_le_bytes());
+        image[4 * SECTOR..4 * SECTOR + 5].copy_from_slice(b"hello");
+        image
     }
 }

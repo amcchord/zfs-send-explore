@@ -735,7 +735,10 @@ fn load_key_for_requirement(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_byte_argument;
+    use super::{
+        Cli, Command, InceptionCommand, PoolCommand, PoolInceptionCommand, parse_byte_argument,
+    };
+    use clap::Parser;
 
     #[test]
     fn image_windows_accept_decimal_hex_and_grouping() {
@@ -743,5 +746,117 @@ mod tests {
         assert_eq!(parse_byte_argument("0x1000").unwrap(), 4096);
         assert_eq!(parse_byte_argument("1_048_576").unwrap(), 1_048_576);
         assert!(parse_byte_argument("4 MiB").is_err());
+    }
+
+    #[test]
+    fn cli_exposes_every_inception_operation_and_image_window() {
+        let inspect = Cli::try_parse_from([
+            "zfse",
+            "inception",
+            "inspect",
+            "backup.zfs",
+            "/vms/disk.qcow2",
+            "--snapshot",
+            "nightly",
+            "--image-offset",
+            "0x1000",
+            "--image-length",
+            "1_048_576",
+            "--json",
+        ])
+        .unwrap();
+        let Command::Inception {
+            command:
+                InceptionCommand::Inspect {
+                    snapshot,
+                    window,
+                    json,
+                    ..
+                },
+        } = inspect.command
+        else {
+            panic!("wrong inception inspect command")
+        };
+        assert_eq!(snapshot.as_deref(), Some("nightly"));
+        assert_eq!(window.image_offset, 4096);
+        assert_eq!(window.image_length, Some(1_048_576));
+        assert!(json);
+
+        let list = Cli::try_parse_from([
+            "zfse",
+            "inception",
+            "list",
+            "backup.zfs",
+            "/vms/disk.vmdk",
+            "/Windows/System32",
+            "--volume",
+            "gpt2",
+        ])
+        .unwrap();
+        let Command::Inception {
+            command: InceptionCommand::List { path, volume, .. },
+        } = list.command
+        else {
+            panic!("wrong inception list command")
+        };
+        assert_eq!(path, "/Windows/System32");
+        assert_eq!(volume.as_deref(), Some("gpt2"));
+
+        let extract = Cli::try_parse_from([
+            "zfse",
+            "inception",
+            "extract",
+            "backup.zfs",
+            "/vms/disk.raw",
+            "/etc/hostname",
+            "--output",
+            "hostname",
+            "--force",
+        ])
+        .unwrap();
+        let Command::Inception {
+            command: InceptionCommand::Extract { path, force, .. },
+        } = extract.command
+        else {
+            panic!("wrong inception extract command")
+        };
+        assert_eq!(path, "/etc/hostname");
+        assert!(force);
+
+        let pool = Cli::try_parse_from([
+            "zfse",
+            "pool",
+            "inception",
+            "extract",
+            "member.img",
+            "tank/vms@nightly",
+            "/disk.qcow2",
+            "/Users/example/report.docx",
+            "--output",
+            "report.docx",
+            "--volume",
+            "mbr1",
+            "--image-offset",
+            "4096",
+        ])
+        .unwrap();
+        let Command::Pool {
+            command:
+                PoolCommand::Inception {
+                    command:
+                        PoolInceptionCommand::Extract {
+                            dataset,
+                            volume,
+                            window,
+                            ..
+                        },
+                },
+        } = pool.command
+        else {
+            panic!("wrong pool inception extract command")
+        };
+        assert_eq!(dataset, "tank/vms@nightly");
+        assert_eq!(volume.as_deref(), Some("mbr1"));
+        assert_eq!(window.image_offset, 4096);
     }
 }
