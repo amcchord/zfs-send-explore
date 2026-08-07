@@ -5,6 +5,7 @@
 //! result back to its event loop.
 
 use crate::filesystem::DirectoryEntry;
+use crate::inception::{DiskContainerKind, InceptionSession, VolumeInfo};
 use crate::operations::{self, EncryptionRequirement, Sidecar};
 use crate::pool::{PoolExtraction, PoolMember};
 use crate::stream::FEATURE_RAW;
@@ -12,6 +13,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use zeroize::Zeroizing;
 
 /// The two read-only backup sources understood by the application.
@@ -51,6 +53,43 @@ pub struct ClientExtraction {
     pub logical_size: u64,
     pub sha256: String,
     pub update_eligible: bool,
+}
+
+/// Lightweight nested-image description retained by the Windows UI.
+#[derive(Clone)]
+pub struct InceptionCatalog {
+    pub image_path: String,
+    pub image_offset: u64,
+    pub stored_size: u64,
+    pub disk_size: u64,
+    pub container: DiskContainerKind,
+    pub volumes: Vec<VolumeInfo>,
+    session: Arc<InceptionSession>,
+}
+
+impl InceptionCatalog {
+    /// List a directory through the already-inspected virtual disk. Retaining
+    /// the session avoids rescanning a large ZFS send stream on every click.
+    pub fn list_directory(&self, volume: Option<&str>, path: &str) -> Result<Vec<DirectoryEntry>> {
+        self.session.list_directory(volume, path)
+    }
+
+    /// Extract from the already-inspected subordinate filesystem. Nested
+    /// extractions intentionally do not produce ZFS incremental sidecars.
+    pub fn extract(
+        &self,
+        volume: Option<&str>,
+        path: &str,
+        destination: &Path,
+        force: bool,
+    ) -> Result<ClientExtraction> {
+        let extraction = self.session.extract(volume, path, destination, force)?;
+        Ok(ClientExtraction {
+            logical_size: extraction.logical_size,
+            sha256: extraction.sha256,
+            update_eligible: false,
+        })
+    }
 }
 
 impl SourceCatalog {
@@ -209,6 +248,65 @@ impl SourceCatalog {
                 )?;
                 Ok(extraction_from_pool(extraction))
             }
+        }
+    }
+
+    /// Detect the disk container, partitions, and subordinate filesystems in
+    /// one regular file from the selected ZFS view.
+    pub fn inspect_inception(
+        &self,
+        view_index: usize,
+        image_path: &str,
+        key_file: Option<&Path>,
+        image_offset: u64,
+        image_length: Option<u64>,
+    ) -> Result<InceptionCatalog> {
+        let session = Arc::new(self.open_inception(
+            view_index,
+            image_path,
+            key_file,
+            image_offset,
+            image_length,
+        )?);
+        Ok(InceptionCatalog {
+            image_path: session.image_path().to_owned(),
+            image_offset: session.image_offset(),
+            stored_size: session.stored_size(),
+            disk_size: session.image_size(),
+            container: session.container(),
+            volumes: session.volumes().to_vec(),
+            session,
+        })
+    }
+
+    fn open_inception(
+        &self,
+        view_index: usize,
+        image_path: &str,
+        key_file: Option<&Path>,
+        image_offset: u64,
+        image_length: Option<u64>,
+    ) -> Result<InceptionSession> {
+        let view = self.view(view_index)?;
+        match self.kind {
+            SourceKind::SendStream => {
+                let key = key_for_snapshot(&self.path, &view.selector, key_file)?;
+                InceptionSession::from_send_at(
+                    &self.path,
+                    Some(&view.selector),
+                    image_path,
+                    key.as_deref().map(Vec::as_slice),
+                    image_offset,
+                    image_length,
+                )
+            }
+            SourceKind::PoolMember => InceptionSession::from_pool_at(
+                &self.path,
+                &view.selector,
+                image_path,
+                image_offset,
+                image_length,
+            ),
         }
     }
 }

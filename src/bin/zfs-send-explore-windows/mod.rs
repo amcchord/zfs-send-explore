@@ -42,7 +42,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use zfs_send_extract::client::{
-    ClientExtraction, SourceCatalog, apply_incremental, child_path, parent_path,
+    ClientExtraction, InceptionCatalog, SourceCatalog, apply_incremental, child_path, parent_path,
 };
 use zfs_send_extract::filesystem::DirectoryEntry;
 use zfs_send_extract::operations::Sidecar;
@@ -64,6 +64,11 @@ const ID_EXTRACT: u16 = 110;
 const ID_UPDATE: u16 = 111;
 const ID_EXIT: u16 = 112;
 const ID_ABOUT: u16 = 113;
+const ID_INCEPTION: u16 = 114;
+const ID_LEAVE_IMAGE: u16 = 115;
+const ID_VOLUME: u16 = 116;
+const ID_IMAGE_OFFSET: u16 = 117;
+const ID_IMAGE_LENGTH: u16 = 118;
 
 const WM_JOB_COMPLETE: u32 = WM_APP + 1;
 
@@ -74,12 +79,17 @@ struct Controls {
     open_send: HWND,
     open_pool: HWND,
     view: HWND,
+    volume: HWND,
     path: HWND,
     up: HWND,
     go: HWND,
     choose_key: HWND,
     list: HWND,
     extract: HWND,
+    inception: HWND,
+    leave_image: HWND,
+    image_offset: HWND,
+    image_length: HWND,
     update: HWND,
     status: HWND,
 }
@@ -92,6 +102,7 @@ struct AppState {
     entries: Vec<DirectoryEntry>,
     current_path: String,
     key_file: Option<PathBuf>,
+    inception: Option<InceptionCatalog>,
     busy: bool,
 }
 
@@ -105,6 +116,7 @@ impl Default for AppState {
             entries: Vec::new(),
             current_path: "/".to_owned(),
             key_file: None,
+            inception: None,
             busy: false,
         }
     }
@@ -119,7 +131,9 @@ enum JobResult {
     Extracted {
         destination: PathBuf,
         extraction: ClientExtraction,
+        nested: bool,
     },
+    InceptionOpened(InceptionCatalog),
     Updated {
         target: PathBuf,
         sidecar: Sidecar,
@@ -337,6 +351,18 @@ unsafe fn initialize_window(state: &mut AppState) -> Result<()> {
     append_menu(
         actions_menu,
         MF_STRING,
+        ID_INCEPTION as usize,
+        "Explore selected disk image…",
+    );
+    append_menu(
+        actions_menu,
+        MF_STRING,
+        ID_LEAVE_IMAGE as usize,
+        "Leave disk image",
+    );
+    append_menu(
+        actions_menu,
+        MF_STRING,
         ID_UPDATE as usize,
         "Update an extracted file…",
     );
@@ -379,6 +405,15 @@ unsafe fn initialize_window(state: &mut AppState) -> Result<()> {
         0,
         ID_VIEW,
     );
+    controls.volume = control(
+        state.hwnd,
+        instance,
+        windows_sys::core::w!("COMBOBOX"),
+        "",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST as u32,
+        0,
+        ID_VOLUME,
+    );
     controls.path = control(
         state.hwnd,
         instance,
@@ -407,6 +442,38 @@ unsafe fn initialize_window(state: &mut AppState) -> Result<()> {
         ID_LIST,
     );
     controls.extract = button(state.hwnd, instance, "Extract selected…", ID_EXTRACT, false);
+    controls.inception = button(
+        state.hwnd,
+        instance,
+        "Explore disk image…",
+        ID_INCEPTION,
+        false,
+    );
+    controls.leave_image = button(
+        state.hwnd,
+        instance,
+        "Leave disk image",
+        ID_LEAVE_IMAGE,
+        false,
+    );
+    controls.image_offset = control(
+        state.hwnd,
+        instance,
+        windows_sys::core::w!("EDIT"),
+        "",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER,
+        0,
+        ID_IMAGE_OFFSET,
+    );
+    controls.image_length = control(
+        state.hwnd,
+        instance,
+        windows_sys::core::w!("EDIT"),
+        "",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER,
+        0,
+        ID_IMAGE_LENGTH,
+    );
     controls.update = button(
         state.hwnd,
         instance,
@@ -436,6 +503,20 @@ unsafe fn initialize_window(state: &mut AppState) -> Result<()> {
         EM_SETCUEBANNER,
         1,
         cue.as_ptr() as isize,
+    );
+    let offset_cue = wide("Image offset");
+    SendMessageW(
+        controls.image_offset,
+        EM_SETCUEBANNER,
+        0,
+        offset_cue.as_ptr() as isize,
+    );
+    let length_cue = wide("Image length (optional)");
+    SendMessageW(
+        controls.image_length,
+        EM_SETCUEBANNER,
+        0,
+        length_cue.as_ptr() as isize,
     );
     SendMessageW(
         controls.list,
@@ -473,11 +554,17 @@ unsafe fn handle_command(state: &mut AppState, wparam: WPARAM) {
         }
         ID_OPEN_SEND => open_source(state, true),
         ID_OPEN_POOL => open_source(state, false),
-        ID_VIEW if notification == CBN_SELCHANGE as u16 => browse(state, "/".to_owned()),
+        ID_VIEW if notification == CBN_SELCHANGE as u16 => {
+            leave_inception(state, false);
+            browse(state, "/".to_owned());
+        }
+        ID_VOLUME if notification == CBN_SELCHANGE as u16 => browse(state, "/".to_owned()),
         ID_GO => browse(state, get_text(state.controls.path)),
         ID_UP => browse(state, parent_path(&state.current_path)),
         ID_CHOOSE_KEY => choose_key(state),
         ID_EXTRACT => extract_selected(state),
+        ID_INCEPTION => explore_selected_image(state),
+        ID_LEAVE_IMAGE => leave_inception(state, true),
         ID_UPDATE => update_extracted_file(state),
         ID_EXIT => {
             DestroyWindow(state.hwnd);
@@ -553,12 +640,28 @@ unsafe fn browse(state: &mut AppState, path: String) {
     let Some(view) = selected_view(state) else {
         return;
     };
+    let inception = state.inception.clone();
+    let selected_volume_index = if inception.is_some() {
+        let Some(index) = selected_volume_index(state) else {
+            return;
+        };
+        index
+    } else {
+        0
+    };
     let key = state.key_file.clone();
     set_busy(state, true, "Reading directory…");
     spawn_job(state.hwnd, move || {
-        catalog
-            .list_directory(view, &path, key.as_deref())
-            .map(|entries| JobResult::Directory { path, entries })
+        let entries = if let Some(inception) = inception {
+            let volume = inception
+                .volumes
+                .get(selected_volume_index)
+                .ok_or_else(|| anyhow::anyhow!("selected inner volume no longer exists"))?;
+            inception.list_directory(Some(&volume.selector), &path)
+        } else {
+            catalog.list_directory(view, &path, key.as_deref())
+        }?;
+        Ok(JobResult::Directory { path, entries })
     });
 }
 
@@ -599,15 +702,115 @@ unsafe fn extract_selected(state: &mut AppState) {
         }
     };
     let key = state.key_file.clone();
+    let inception = state.inception.clone();
+    let volume_index = selected_volume_index(state);
     set_busy(state, true, "Extracting into a sparse temporary file…");
     spawn_job(state.hwnd, move || {
-        catalog
-            .extract(view, &source_path, &destination, true, key.as_deref())
-            .map(|extraction| JobResult::Extracted {
-                destination,
-                extraction,
-            })
+        let (extraction, nested) = if let Some(inception) = inception {
+            let volume = inception
+                .volumes
+                .get(volume_index.ok_or_else(|| anyhow::anyhow!("no inner volume selected"))?)
+                .ok_or_else(|| anyhow::anyhow!("selected inner volume no longer exists"))?;
+            (
+                inception.extract(Some(&volume.selector), &source_path, &destination, true)?,
+                true,
+            )
+        } else {
+            (
+                catalog.extract(view, &source_path, &destination, true, key.as_deref())?,
+                false,
+            )
+        };
+        Ok(JobResult::Extracted {
+            destination,
+            extraction,
+            nested,
+        })
     });
+}
+
+unsafe fn explore_selected_image(state: &mut AppState) {
+    if state.inception.is_some() {
+        return;
+    }
+    let Some(index) = selected_index(state.controls.list) else {
+        show_error(
+            state.hwnd,
+            "No disk image selected",
+            "Select a regular file that contains a raw, QCOW2, or VMDK disk image.",
+        );
+        return;
+    };
+    let Some(entry) = state.entries.get(index) else {
+        return;
+    };
+    if entry.dirent_type != 8 {
+        show_error(
+            state.hwnd,
+            "Cannot explore this item",
+            "Only regular files can contain a subordinate disk image.",
+        );
+        return;
+    }
+    let image_path = match child_path(&state.current_path, &entry.name) {
+        Ok(path) => path,
+        Err(error) => {
+            show_error(state.hwnd, "Invalid image path", &error.to_string());
+            return;
+        }
+    };
+    let image_offset = match parse_byte_value(&get_text(state.controls.image_offset), false) {
+        Ok(Some(value)) => value,
+        Ok(None) => 0,
+        Err(error) => {
+            show_error(state.hwnd, "Invalid image offset", &error);
+            return;
+        }
+    };
+    let image_length = match parse_byte_value(&get_text(state.controls.image_length), true) {
+        Ok(value) => value,
+        Err(error) => {
+            show_error(state.hwnd, "Invalid image length", &error);
+            return;
+        }
+    };
+    let Some(catalog) = state.catalog.clone() else {
+        return;
+    };
+    let Some(view) = selected_view(state) else {
+        return;
+    };
+    let key = state.key_file.clone();
+    set_busy(
+        state,
+        true,
+        "Opening disk container and detecting inner volumes…",
+    );
+    spawn_job(state.hwnd, move || {
+        catalog
+            .inspect_inception(
+                view,
+                &image_path,
+                key.as_deref(),
+                image_offset,
+                image_length,
+            )
+            .map(JobResult::InceptionOpened)
+    });
+}
+
+unsafe fn leave_inception(state: &mut AppState, browse_outer: bool) {
+    if state.inception.take().is_none() {
+        return;
+    }
+    SendMessageW(state.controls.volume, CB_RESETCONTENT, 0, 0);
+    set_text(state.controls.image_offset, "");
+    set_text(state.controls.image_length, "");
+    state.current_path = "/".to_owned();
+    set_source_enabled(state, !state.busy && state.catalog.is_some());
+    if browse_outer {
+        browse(state, "/".to_owned());
+    }
 }
 
 unsafe fn update_extracted_file(state: &mut AppState) {
@@ -659,6 +862,8 @@ unsafe fn finish_job(state: &mut AppState, result: JobMessage) {
     match result {
         Err(error) => show_error(state.hwnd, "The operation did not complete", &error),
         Ok(JobResult::Catalog(catalog)) => {
+            state.inception = None;
+            SendMessageW(state.controls.volume, CB_RESETCONTENT, 0, 0);
             SendMessageW(state.controls.view, CB_RESETCONTENT, 0, 0);
             for view in &catalog.views {
                 let label = wide(&view.label);
@@ -685,18 +890,85 @@ unsafe fn finish_job(state: &mut AppState, result: JobMessage) {
             set_status(
                 state,
                 &format!(
-                    "{} item{} in {}",
+                    "{} item{} in {}{}",
                     state.entries.len(),
                     if state.entries.len() == 1 { "" } else { "s" },
-                    state.current_path
+                    state.current_path,
+                    state
+                        .inception
+                        .as_ref()
+                        .map_or_else(String::new, |image| format!(" inside {}", image.image_path))
                 ),
             );
+        }
+        Ok(JobResult::InceptionOpened(inception)) => {
+            SendMessageW(state.controls.volume, CB_RESETCONTENT, 0, 0);
+            let mut first_supported = None;
+            for (index, volume) in inception.volumes.iter().enumerate() {
+                let label = wide(&volume.label());
+                SendMessageW(
+                    state.controls.volume,
+                    CB_ADDSTRING,
+                    0,
+                    label.as_ptr() as isize,
+                );
+                if first_supported.is_none() && volume.filesystem.is_some() {
+                    first_supported = Some(index);
+                }
+            }
+            let Some(selected) = first_supported else {
+                let details = inception
+                    .volumes
+                    .iter()
+                    .filter_map(|volume| volume.diagnostic.as_deref())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                show_error(
+                    state.hwnd,
+                    "No supported inner filesystem",
+                    if details.is_empty() {
+                        "No NTFS, FAT, exFAT, or ext filesystem was detected."
+                    } else {
+                        &details
+                    },
+                );
+                SendMessageW(state.controls.volume, CB_RESETCONTENT, 0, 0);
+                return;
+            };
+            SendMessageW(state.controls.volume, CB_SETCURSEL, selected, 0);
+            set_text(
+                state.controls.image_offset,
+                &inception.image_offset.to_string(),
+            );
+            set_text(
+                state.controls.image_length,
+                &inception.stored_size.to_string(),
+            );
+            let status = format!(
+                "Inception mode · {} · {} virtual bytes · {} volume{}",
+                inception.container,
+                inception.disk_size,
+                inception.volumes.len(),
+                if inception.volumes.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            );
+            state.inception = Some(inception);
+            state.current_path = "/".to_owned();
+            set_source_enabled(state, true);
+            set_status(state, &status);
+            browse(state, "/".to_owned());
         }
         Ok(JobResult::Extracted {
             destination,
             extraction,
+            nested,
         }) => {
-            let update = if extraction.update_eligible {
+            let update = if nested {
+                " The subordinate filesystem and its ZFS source were not modified."
+            } else if extraction.update_eligible {
                 " Update metadata was saved beside it."
             } else {
                 " This current-dataset extraction cannot be advanced by an incremental send."
@@ -818,13 +1090,41 @@ unsafe fn set_source_enabled(state: &AppState, enabled: bool) {
         state.controls.choose_key,
         state.controls.list,
         state.controls.extract,
+        state.controls.inception,
+        state.controls.image_offset,
+        state.controls.image_length,
     ] {
         EnableWindow(control, enabled);
     }
+    EnableWindow(
+        state.controls.volume,
+        (enabled != 0 && state.inception.is_some()) as i32,
+    );
+    EnableWindow(
+        state.controls.leave_image,
+        (enabled != 0 && state.inception.is_some()) as i32,
+    );
+    EnableWindow(
+        state.controls.inception,
+        (enabled != 0 && state.inception.is_none()) as i32,
+    );
+    EnableWindow(
+        state.controls.image_offset,
+        (enabled != 0 && state.inception.is_none()) as i32,
+    );
+    EnableWindow(
+        state.controls.image_length,
+        (enabled != 0 && state.inception.is_none()) as i32,
+    );
 }
 
 unsafe fn selected_view(state: &AppState) -> Option<usize> {
     let selected = SendMessageW(state.controls.view, CB_GETCURSEL, 0, 0);
+    (selected >= 0).then_some(selected as usize)
+}
+
+unsafe fn selected_volume_index(state: &AppState) -> Option<usize> {
+    let selected = SendMessageW(state.controls.volume, CB_GETCURSEL, 0, 0);
     (selected >= 0).then_some(selected as usize)
 }
 
@@ -888,8 +1188,53 @@ unsafe fn layout(state: &AppState) {
     x += go_width + gap;
     MoveWindow(state.controls.choose_key, x, second_y, key_width, row, 1);
 
+    let third_y = second_y + row + gap;
+    let volume_width = (width * 36 / 100).max(scale(260));
+    let offset_width = scale(116);
+    let length_width = scale(154);
+    let inception_width = scale(156);
+    let leave_width = scale(126);
+    x = pad;
+    MoveWindow(
+        state.controls.volume,
+        x,
+        third_y,
+        volume_width,
+        scale(240),
+        1,
+    );
+    x += volume_width + gap;
+    MoveWindow(
+        state.controls.image_offset,
+        x,
+        third_y,
+        offset_width,
+        row,
+        1,
+    );
+    x += offset_width + gap;
+    MoveWindow(
+        state.controls.image_length,
+        x,
+        third_y,
+        length_width,
+        row,
+        1,
+    );
+    x += length_width + gap;
+    MoveWindow(
+        state.controls.inception,
+        x,
+        third_y,
+        inception_width,
+        row,
+        1,
+    );
+    x += inception_width + gap;
+    MoveWindow(state.controls.leave_image, x, third_y, leave_width, row, 1);
+
     let actions_y = height - status_height - pad - row;
-    let list_y = second_y + row + gap;
+    let list_y = third_y + row + gap;
     let list_height = (actions_y - gap - list_y).max(scale(80));
     MoveWindow(
         state.controls.list,
@@ -955,19 +1300,24 @@ unsafe fn button(parent: HWND, instance: HINSTANCE, text: &str, id: u16, default
     )
 }
 
-unsafe fn all_controls(controls: &Controls) -> [HWND; 13] {
+unsafe fn all_controls(controls: &Controls) -> [HWND; 18] {
     [
         controls.source_path,
         controls.browse_source,
         controls.open_send,
         controls.open_pool,
         controls.view,
+        controls.volume,
         controls.path,
         controls.up,
         controls.go,
         controls.choose_key,
         controls.list,
         controls.extract,
+        controls.inception,
+        controls.leave_image,
+        controls.image_offset,
+        controls.image_length,
         controls.update,
         controls.status,
     ]
@@ -1030,6 +1380,26 @@ unsafe fn get_text(hwnd: HWND) -> String {
     let mut buffer = vec![0_u16; length as usize + 1];
     GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
     String::from_utf16_lossy(&buffer[..length as usize])
+}
+
+fn parse_byte_value(value: &str, empty_is_none: bool) -> std::result::Result<Option<u64>, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return if empty_is_none { Ok(None) } else { Ok(Some(0)) };
+    }
+    let parsed = if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16)
+    } else {
+        value.parse()
+    }
+    .map_err(|_| format!("{value:?} is not a valid byte count (decimal or 0x hexadecimal)"))?;
+    if empty_is_none && parsed == 0 {
+        return Err("image length must be greater than zero".to_owned());
+    }
+    Ok(Some(parsed))
 }
 
 #[derive(Clone, Copy)]
@@ -1114,7 +1484,7 @@ unsafe fn show_about(owner: HWND) {
     show_information(
         owner,
         "About ZFS Send Explorer",
-        "Browse snapshots in ZFS send files and exported pool members without importing or mounting them.\n\nSources are always opened read-only. Extractions and validated incremental updates preserve sparse file ranges when the destination filesystem supports them.",
+        "Browse snapshots in ZFS send files and exported pool members without importing or mounting them. Inception mode opens raw, QCOW2, and self-contained sparse VMDK files to explore NTFS, FAT, exFAT, and ext filesystems one layer deeper.\n\nSources are always opened read-only. Extractions and validated incremental updates preserve sparse file ranges when the destination filesystem supports them.",
     );
 }
 

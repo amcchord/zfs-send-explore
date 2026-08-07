@@ -5,7 +5,7 @@
 The extraction machine does **not** need ZFS, `libzfs`, or a ZFS kernel module. The tool never invokes `zfs` or `zpool`, and pool members are opened read-only.
 
 > [!IMPORTANT]
-> This is an early `0.1.0` implementation. The CLI, Windows UI, sidecar format, and supported on-disk profile may change. Stream fixtures are produced on little-endian OpenZFS systems. Linux validates the core end to end, and CI builds and tests the native Windows target.
+> This is an early `0.2.0` implementation. The CLI, Windows UI, sidecar format, and supported on-disk profile may change. Stream fixtures are produced on little-endian OpenZFS systems. Linux validates the core end to end, and CI builds and tests the native Windows target.
 
 Detailed implementation and validation material lives in:
 
@@ -30,6 +30,9 @@ Detailed implementation and validation material lives in:
 | Read embedded-data replay records from `zfs send -e` | Supported |
 | Browse a single exported disk/file vdev or one leaf of a single top-level mirror | Supported |
 | Browse current datasets and named snapshots directly from a pool member | Supported |
+| Explore a raw or sparse disk image stored as a regular ZFS file | Supported, including explicit byte offset/length windows |
+| Explore self-contained QCOW2 and VMDK sparse containers stored on ZFS | QCOW2 v2/v3 and VMDK `monolithicSparse` |
+| Browse and extract from a subordinate filesystem (“inception mode”) | NTFS, FAT12/16/32, exFAT, ext4, and compatible ext2 |
 | Native Windows snapshot browser and extractor | Supported as `zfs-send-explore-windows.exe` |
 | Open a GPT whole-disk image or `\\.\PhysicalDriveN` | Supported when exactly one partition has a supported ZFS vdev label |
 | Preserve sparse holes during extraction and incremental updates | Supported; zero ranges are deallocated when the destination filesystem permits it |
@@ -222,6 +225,61 @@ Extracting from a named pool snapshot writes the same incremental-compatible `.z
 
 The pool reader targets ZFS filesystem datasets. ZVOLs contain a block device rather than a ZPL path tree and therefore cannot be browsed as individual files by this tool.
 
+## Explore a filesystem inside a ZFS file
+
+Inception mode treats one regular file in a ZFS filesystem as a read-only virtual disk. It follows the layers directly—ZFS file extents, an optional sparse-disk container, a partition, and the subordinate filesystem—without first exporting the complete image or mounting it on the host.
+
+Inspect an image in a send-stream snapshot before browsing it:
+
+```sh
+zfs-send-extract inception inspect backup.zfs /vms/server.qcow2 \
+  --snapshot tank/vms@nightly
+
+zfs-send-extract inception list backup.zfs /vms/server.qcow2 / \
+  --snapshot tank/vms@nightly --volume gpt2
+
+zfs-send-extract inception extract backup.zfs /vms/server.qcow2 \
+  /Windows/System32/config/SYSTEM --snapshot tank/vms@nightly \
+  --volume gpt2 --output SYSTEM
+```
+
+The same operations work against a current dataset or named snapshot in an offline pool member:
+
+```sh
+zfs-send-extract pool inception inspect member.img tank/vms@nightly /images/server.vmdk
+zfs-send-extract pool inception list member.img tank/vms@nightly \
+  /images/server.vmdk /etc --volume gpt1
+zfs-send-extract pool inception extract member.img tank/vms@nightly \
+  /images/server.vmdk /etc/hostname --volume gpt1 --output hostname
+```
+
+`inspect` reports the container, virtual disk size, partition selectors, byte ranges, filesystem types, labels, and a diagnostic for every unrecognized partition. When exactly one supported volume exists, `--volume` can be omitted; otherwise selection is required so the tool never guesses. `--json` makes inspection scriptable.
+
+For an image embedded after an appliance header or inside a larger sparse file, provide a bounded byte window. Decimal, hexadecimal, and underscore-grouped values are accepted:
+
+```sh
+zfs-send-extract inception inspect backup.zfs /appliance/blob.bin \
+  --image-offset 0x10_0000 --image-length 8_589_934_592
+```
+
+The layer support is deliberately explicit:
+
+| Layer | Read-only support |
+| --- | --- |
+| Raw/sparse image | Unpartitioned filesystem or MBR/GPT disk; absent ZFS extents read as zeroes |
+| QCOW | Self-contained QCOW2 v2/v3, including sparse, zero, and deflate-compressed clusters |
+| VMDK | Self-contained `monolithicSparse` sparse extent |
+| Partition table | MBR primary and bounded EBR logical partitions; GPT with header and entry CRC validation, 512/4096-byte sectors, and backup-header recovery |
+| NTFS | NTFS 3.x directory browsing and extraction of the unnamed regular-file data stream |
+| FAT | FAT12, FAT16, FAT32, and exFAT directory browsing and regular-file extraction |
+| ext | ext4 and compatible ext2 directory browsing and regular-file extraction |
+
+QCOW1, QCOW2 overlays that require a backing file, encrypted QCOW2, multi-file/split/flat/stream-optimized VMDK, NTFS-compressed or EFS-encrypted data, and non-UTF-8 ext names are reported rather than silently misread. ext symlinks are listed but never followed during extraction. Inception mode extracts one regular file and does not recreate inner ACLs, alternate NTFS streams, ownership, permissions, or directory trees.
+
+For send streams, the selected snapshot chain is scanned once when the image is opened to build a compact map from virtual ZFS-file ranges to replay payloads. Reads then decode only the blocks requested by the partition and filesystem readers, with a one-block cache. Pool-member reads similarly fetch only the addressed ZFS blocks. Sparse virtual disk capacity therefore does not become an equivalent RAM or temporary-disk requirement.
+
+The ZFS source, container, partition, and subordinate filesystem are never written. A recovered inner file uses the ordinary extraction path: a same-directory temporary file, sparse writes, synchronization, atomic replacement, and SHA-256. It intentionally has no `.zfse.json` incremental-update sidecar because it is not itself a ZFS object.
+
 ## Compression support
 
 Dataset compression does not normally make a plaintext send incompatible: without `zfs send -c`, OpenZFS emits logical, uncompressed replay payloads. Compressed replay records emitted by `zfs send -c` are also decoded directly.
@@ -262,11 +320,15 @@ This remains experimental software, not a replacement for maintaining independen
 | `list <stream> [path] [--snapshot ...] [--key-file ...]` | List one directory in a selected snapshot |
 | `extract <stream> <path> -o <file> [--snapshot ...] [--key-file ...] [--force]` | Extract one regular file and write its sidecar |
 | `apply <incremental-stream> <target> [--key-file ...]` | Atomically update a previously extracted file; the key is required for raw sends |
+| `inception inspect <stream> <image> [--snapshot ...] [--image-offset ...] [--image-length ...] [--json]` | Detect a nested container, partitions, and subordinate filesystems |
+| `inception list <stream> <image> [path] [--volume ...] [...]` | List a directory inside a selected subordinate filesystem |
+| `inception extract <stream> <image> <path> -o <file> [--volume ...] [...]` | Extract one regular file from a subordinate filesystem |
 | `pool inspect <member> [--json]` | Validate a vdev member and summarize its active pool state |
 | `pool datasets <member>` | List reachable filesystem datasets |
 | `pool snapshots <member> [dataset]` | List named snapshots, optionally for one dataset |
 | `pool list <member> <dataset[@snapshot]> [path]` | List one directory from a dataset head or snapshot |
 | `pool extract <member> <dataset[@snapshot]> <path> -o <file> [--force]` | Extract one regular file directly from the member |
+| `pool inception inspect/list/extract ...` | Perform the same nested-image operations directly against an offline pool dataset or snapshot |
 
 Run `zfs-send-extract <command> --help` for complete argument details.
 

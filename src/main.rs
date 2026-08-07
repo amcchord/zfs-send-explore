@@ -1,9 +1,9 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
 use zeroize::Zeroizing;
-use zfs_send_extract::{operations, pool::PoolMember};
+use zfs_send_extract::{inception::InceptionSession, operations, pool::PoolMember};
 
 #[derive(Debug, Parser)]
 #[command(name = "zfs-send-extract")]
@@ -72,6 +72,11 @@ enum Command {
         #[arg(long, value_name = "FILE")]
         key_file: Option<PathBuf>,
     },
+    /// Explore a disk image stored as a regular file in a send-stream snapshot.
+    Inception {
+        #[command(subcommand)]
+        command: InceptionCommand,
+    },
     /// Browse an offline ZFS vdev member or image directly.
     Pool {
         #[command(subcommand)]
@@ -125,6 +130,121 @@ enum PoolCommand {
         /// Replace an existing destination.
         #[arg(long)]
         force: bool,
+    },
+    /// Explore a disk image stored as a regular file in a dataset or snapshot.
+    Inception {
+        #[command(subcommand)]
+        command: PoolInceptionCommand,
+    },
+}
+
+#[derive(Debug, Clone, Args)]
+struct ImageWindow {
+    /// Byte offset within the ZFS file where the disk container starts.
+    #[arg(
+        long,
+        default_value_t = 0,
+        value_name = "BYTES",
+        value_parser = parse_byte_argument
+    )]
+    image_offset: u64,
+    /// Limit the disk container to this many bytes after --image-offset.
+    #[arg(long, value_name = "BYTES", value_parser = parse_byte_argument)]
+    image_length: Option<u64>,
+}
+
+#[derive(Debug, Subcommand)]
+enum InceptionCommand {
+    /// Detect the disk container, partition table, and inner filesystems.
+    Inspect {
+        stream: PathBuf,
+        /// Absolute path of the disk image inside the ZFS snapshot.
+        image: String,
+        #[arg(long)]
+        snapshot: Option<String>,
+        #[arg(long, value_name = "FILE")]
+        key_file: Option<PathBuf>,
+        #[command(flatten)]
+        window: ImageWindow,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List a directory in a filesystem inside the selected disk image.
+    List {
+        stream: PathBuf,
+        image: String,
+        /// Absolute path inside the subordinate filesystem.
+        #[arg(default_value = "/")]
+        path: String,
+        #[arg(long)]
+        snapshot: Option<String>,
+        #[arg(long, value_name = "FILE")]
+        key_file: Option<PathBuf>,
+        /// Volume selector reported by `inception inspect` (for example gpt2).
+        #[arg(long)]
+        volume: Option<String>,
+        #[command(flatten)]
+        window: ImageWindow,
+    },
+    /// Extract one file from a filesystem inside the selected disk image.
+    Extract {
+        stream: PathBuf,
+        image: String,
+        /// Absolute path inside the subordinate filesystem.
+        path: String,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        snapshot: Option<String>,
+        #[arg(long, value_name = "FILE")]
+        key_file: Option<PathBuf>,
+        #[arg(long)]
+        volume: Option<String>,
+        #[command(flatten)]
+        window: ImageWindow,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PoolInceptionCommand {
+    /// Detect the disk container, partition table, and inner filesystems.
+    Inspect {
+        member: PathBuf,
+        dataset: String,
+        image: String,
+        #[command(flatten)]
+        window: ImageWindow,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List a directory in a filesystem inside the selected disk image.
+    List {
+        member: PathBuf,
+        dataset: String,
+        image: String,
+        #[arg(default_value = "/")]
+        path: String,
+        #[arg(long)]
+        volume: Option<String>,
+        #[command(flatten)]
+        window: ImageWindow,
+    },
+    /// Extract one file from a filesystem inside the selected disk image.
+    Extract {
+        member: PathBuf,
+        dataset: String,
+        image: String,
+        path: String,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        volume: Option<String>,
+        #[command(flatten)]
+        window: ImageWindow,
     },
 }
 
@@ -238,6 +358,7 @@ fn main() -> Result<()> {
                 sidecar.path, sidecar.logical_size, sidecar.snapshot_guid, sidecar.sha256
             );
         }
+        Command::Inception { command } => run_inception(command)?,
         Command::Pool { command } => run_pool(command)?,
     }
     Ok(())
@@ -326,8 +447,220 @@ fn run_pool(command: PoolCommand) -> Result<()> {
                 );
             }
         }
+        PoolCommand::Inception { command } => run_pool_inception(command)?,
     }
     Ok(())
+}
+
+fn run_inception(command: InceptionCommand) -> Result<()> {
+    match command {
+        InceptionCommand::Inspect {
+            stream,
+            image,
+            snapshot,
+            key_file,
+            window,
+            json,
+        } => {
+            let key = load_key_material(&stream, snapshot.as_deref(), key_file.as_ref())?;
+            let session = InceptionSession::from_send_at(
+                &stream,
+                snapshot.as_deref(),
+                &image,
+                key.as_deref().map(Vec::as_slice),
+                window.image_offset,
+                window.image_length,
+            )?;
+            print_inception_inspection(&session, json)?;
+        }
+        InceptionCommand::List {
+            stream,
+            image,
+            path,
+            snapshot,
+            key_file,
+            volume,
+            window,
+        } => {
+            let key = load_key_material(&stream, snapshot.as_deref(), key_file.as_ref())?;
+            let session = InceptionSession::from_send_at(
+                &stream,
+                snapshot.as_deref(),
+                &image,
+                key.as_deref().map(Vec::as_slice),
+                window.image_offset,
+                window.image_length,
+            )?;
+            print_directory(session.list_directory(volume.as_deref(), &path)?);
+        }
+        InceptionCommand::Extract {
+            stream,
+            image,
+            path,
+            output,
+            force,
+            snapshot,
+            key_file,
+            volume,
+            window,
+        } => {
+            let key = load_key_material(&stream, snapshot.as_deref(), key_file.as_ref())?;
+            let session = InceptionSession::from_send_at(
+                &stream,
+                snapshot.as_deref(),
+                &image,
+                key.as_deref().map(Vec::as_slice),
+                window.image_offset,
+                window.image_length,
+            )?;
+            let extraction = session.extract(volume.as_deref(), &path, &output, force)?;
+            println!(
+                "extracted {} bytes from {} volume {} to {} (sha256 {})",
+                extraction.logical_size,
+                extraction.filesystem,
+                extraction.volume,
+                output.display(),
+                extraction.sha256
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_pool_inception(command: PoolInceptionCommand) -> Result<()> {
+    match command {
+        PoolInceptionCommand::Inspect {
+            member,
+            dataset,
+            image,
+            window,
+            json,
+        } => {
+            let session = InceptionSession::from_pool_at(
+                &member,
+                &dataset,
+                &image,
+                window.image_offset,
+                window.image_length,
+            )?;
+            print_inception_inspection(&session, json)?;
+        }
+        PoolInceptionCommand::List {
+            member,
+            dataset,
+            image,
+            path,
+            volume,
+            window,
+        } => {
+            let session = InceptionSession::from_pool_at(
+                &member,
+                &dataset,
+                &image,
+                window.image_offset,
+                window.image_length,
+            )?;
+            print_directory(session.list_directory(volume.as_deref(), &path)?);
+        }
+        PoolInceptionCommand::Extract {
+            member,
+            dataset,
+            image,
+            path,
+            output,
+            force,
+            volume,
+            window,
+        } => {
+            let session = InceptionSession::from_pool_at(
+                &member,
+                &dataset,
+                &image,
+                window.image_offset,
+                window.image_length,
+            )?;
+            let extraction = session.extract(volume.as_deref(), &path, &output, force)?;
+            println!(
+                "extracted {} bytes from {} volume {} to {} (sha256 {})",
+                extraction.logical_size,
+                extraction.filesystem,
+                extraction.volume,
+                output.display(),
+                extraction.sha256
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_directory(entries: Vec<zfs_send_extract::filesystem::DirectoryEntry>) {
+    for entry in entries {
+        let kind = match entry.dirent_type {
+            4 => 'd',
+            8 => 'f',
+            10 => 'l',
+            _ => '?',
+        };
+        let size = entry
+            .logical_size
+            .map_or_else(|| "-".to_owned(), |value| value.to_string());
+        println!("{kind}\t{size}\t{}\t{}", entry.object_id, entry.name);
+    }
+}
+
+fn print_inception_inspection(session: &InceptionSession, json: bool) -> Result<()> {
+    if json {
+        let output = serde_json::json!({
+            "image_path": session.image_path(),
+            "image_offset": session.image_offset(),
+            "stored_bytes": session.stored_size(),
+            "container": session.container(),
+            "virtual_disk_bytes": session.image_size(),
+            "volumes": session.volumes(),
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
+    println!("image: {}", session.image_path());
+    println!("image offset: {}", session.image_offset());
+    println!("stored bytes: {}", session.stored_size());
+    println!("container: {}", session.container());
+    println!("virtual disk bytes: {}", session.image_size());
+    println!("volumes: {}", session.volumes().len());
+    for volume in session.volumes() {
+        let filesystem = volume
+            .filesystem
+            .map_or_else(|| "unknown".to_owned(), |kind| kind.to_string());
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            volume.selector,
+            filesystem,
+            volume.offset,
+            volume.length,
+            volume.partition_type,
+            volume.name
+        );
+        if let Some(diagnostic) = &volume.diagnostic {
+            println!("  note: {diagnostic}");
+        }
+    }
+    Ok(())
+}
+
+fn parse_byte_argument(value: &str) -> std::result::Result<u64, String> {
+    let compact = value.trim().replace('_', "");
+    if compact.is_empty() {
+        return Err("byte count cannot be empty".to_owned());
+    }
+    let parsed = if let Some(hex) = compact
+        .strip_prefix("0x")
+        .or_else(|| compact.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16)
+    } else {
+        compact.parse()
+    };
+    parsed.map_err(|_| format!("{value:?} is not a byte count (use decimal or 0x hexadecimal)"))
 }
 
 fn load_key_material(
@@ -398,4 +731,17 @@ fn load_key_for_requirement(
     );
     let material = rpassword::prompt_password(prompt)?;
     Ok(Some(Zeroizing::new(material.into_bytes())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_byte_argument;
+
+    #[test]
+    fn image_windows_accept_decimal_hex_and_grouping() {
+        assert_eq!(parse_byte_argument("4096").unwrap(), 4096);
+        assert_eq!(parse_byte_argument("0x1000").unwrap(), 4096);
+        assert_eq!(parse_byte_argument("1_048_576").unwrap(), 1_048_576);
+        assert!(parse_byte_argument("4 MiB").is_err());
+    }
 }

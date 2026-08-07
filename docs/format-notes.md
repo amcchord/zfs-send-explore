@@ -62,6 +62,18 @@ The MOS object directory's `root_dataset` entry opens the DSL directory tree. `d
 
 Embedded block pointers store 14 payload words inline, excluding `blk_prop` (word 6) and logical birth (word 10). Payload bytes are reconstructed from each decoded word's low bits first, independent of pool byte order, before the normal compression decoder runs. This matters for freshly created pools, where small MOS and ZAP blocks are commonly embedded and LZ4-compressed.
 
+## Inception-mode layered reads
+
+Inception mode converts one resolved regular ZPL file into the same finite positioned-read interface for both source backends. A pool source translates each requested range into dnode block ids, follows direct or indirect block pointers, verifies and decompresses only those blocks, and fills holes or short final blocks with zeroes. A send source scans the selected full/incremental chain once and builds a non-overlapping interval map whose leaves identify replay payload offsets and encodings. Later reads reopen payloads with positioned I/O, confirm the payload CRC captured during the checked scan, authenticate/decrypt raw records where necessary, decode only intersecting blocks, and retain one decoded block in a synchronized cache.
+
+An explicit image offset and length first create a hard-bounded view of the ZFS file. Container detection then recognizes QCOW2 by `QFI\xfb` and VMDK sparse extents by `KDMV`; an unrecognized prefix remains raw. QCOW2 v2/v3 cluster lookup handles unallocated/zero, ordinary, and DEFLATE-compressed clusters, but rejects backing files, encryption, and incompatible external/extended layouts. The VMDK reader accepts only an embedded-descriptor `monolithicSparse` extent and rejects descriptor-only, split, flat, and stream-optimized layouts rather than attempting to locate other files.
+
+Partition discovery tries GPT before MBR. GPT candidates at primary and final LBAs are considered with 512-byte and 4096-byte logical sectors. Header CRC-32, current/alternate LBAs, usable bounds, entry count/size, a 64 MiB entry-array cap, entry-array CRC-32, and every non-empty partition range are validated. A damaged primary can therefore fall back to a valid backup. MBR discovery bounds primary partitions and follows EBR chains with an explicit extended-container bound, loop detection, partition-type validation, and a 128-entry cap. If neither table yields a partition, the entire virtual disk is probed as a superfloppy filesystem.
+
+Filesystem probes are signature-gated and then require the corresponding parser to open successfully. FAT BPB invariants are used instead of trusting the informational `FAT12`/`FAT16`/`FAT32` label. Directory resolution normalizes absolute paths and refuses `..` or NUL components. NTFS lookup uses the volume `$UpCase` table; extraction accepts the unnamed `$DATA` stream but refuses NTFS compression and EFS. FAT12/16/32 and exFAT use cluster-chain-bounded reads. ext4 and compatible ext2 lookup uses byte paths, exposes regular/directory/symlink types, refuses names the UTF-16 Windows UI cannot represent losslessly, and does not follow symlinks for extraction.
+
+The destination path is the only write target in this stack. File data passes through sparse extent writes and SHA-256 into a temporary file in the destination directory; length and byte count must match before synchronization and atomic persistence. No container, partition, filesystem, ZFS stream, or pool-member write API is exposed.
+
 Primary references:
 
 - [OpenZFS send replay structures](https://github.com/openzfs/zfs/blob/master/include/sys/zfs_ioctl.h)

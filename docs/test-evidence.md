@@ -17,6 +17,14 @@ For direct-drive coverage, an isolated 1 GiB single-file vdev was exported and a
 
 The run exposed and verified fixes for three Windows/on-disk edge cases: releasing the open base-file handle before atomic replacement, using `IOCTL_DISK_GET_LENGTH_INFO` when `File::metadata()` rejects a raw drive, and zero-extending short or ancestor-hole ZFS leaves to the dnode record size during sparse pool extraction. The full unit/integration suite, native clippy, Windows-target clippy, and release cross-build passed after those changes.
 
+## Inception-mode validation
+
+Deterministic in-memory disk fixtures exercise the nested layers without requiring a host mount or filesystem driver. A 1.44 MiB FAT12 image contains `HELLO.TXT`; tests list and extract that file from an unpartitioned raw image, a raw image beginning at an explicit 4 KiB offset, a bounded MBR partition, a synthetic QCOW2 v3 sparse image, and a synthetic VMDK `monolithicSparse` image. A GPT fixture corrupts a CRC-covered byte in the primary header and confirms that the valid backup header and entry array recover the FAT volume.
+
+Separate tests drive the new positioned ZFS-file source against committed real OpenZFS streams. They read `/hello.txt` directly from `tiny-full.zfs`, reconstruct the longer `/version.txt` value at `s2` across the full/incremental chain in `multi-snapshot.zfs`, and authenticate/decrypt `/docs/hello.txt` from `encrypted-raw-s1.zfs`. These tests compare exact bytes while bypassing ordinary whole-file extraction, so the replay interval map, payload positioning, incremental overwrite semantics, raw key path, and block cache all participate.
+
+The subordinate filesystem dispatch and extraction tests currently use FAT12 because its complete deterministic fixture is small enough to build inline. NTFS, exFAT, ext4, and compatible ext2 are backed by dedicated read-only parsers and are compiled on native and Windows targets; adding redistributable real-volume fixtures for those formats remains useful follow-up validation. No claim is made here that the new Windows GUI workflow has already been recaptured in the older screenshots above.
+
 ## Initial send-stream milestone
 
 The initial end-to-end test ran on a Debian 13 x86-64 VM with OpenZFS 2.3.2. ZFS was used to produce the streams; the release CLI was then built as a normal userspace executable and run against the files.
