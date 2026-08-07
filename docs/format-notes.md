@@ -21,7 +21,7 @@ A `zfs send -w` substream sets `DMU_BACKUP_FEATURE_RAW`. Its BEGIN payload conta
 
 Passphrases use PBKDF2-HMAC-SHA1 with the stream's little-endian 64-bit salt and iteration count. The resulting 256-bit wrapping key unwraps the dataset master key and 512-bit HMAC key using the declared AES-CCM/GCM suite. Version 1 authenticates the key GUID, cipher-suite number, and key version as little-endian AAD. A bad key therefore fails before any filesystem metadata is trusted.
 
-Each encrypted WRITE carries an 8-byte salt, 12-byte IV, and 16-byte tag. HKDF-SHA512 derives its AES block key from the dataset master key and block salt. Object types OpenZFS marks as authenticated rather than encrypted remain plaintext but carry a truncated HMAC-SHA512, which is also checked. The resulting bytes are then decompressed according to the raw on-disk compression field; off and the OpenZFS LZ4 wrapper are currently implemented.
+Each encrypted WRITE carries an 8-byte salt, 12-byte IV, and 16-byte tag. HKDF-SHA512 derives its AES block key from the dataset master key and block salt. Object types OpenZFS marks as authenticated rather than encrypted remain plaintext but carry a truncated HMAC-SHA512, which is also checked. The resulting bytes are then decompressed according to the raw on-disk compression field; off, LZJB, LZ4, gzip levels 1-9, ZLE, and Zstandard share the same decoder as direct pool-member reads.
 
 OBJECT bonuses are encrypted together at dnode-block granularity and protected by the preceding OBJECT_RANGE tag. Authentication requires more than concatenating bonus ciphertext. The implementation reconstructs each portable 64-byte dnode core, root block-pointer property/MAC tuple, holes, and indirect checksum-of-MAC tree, then supplies those bytes as AES AAD. Only after the range tag verifies are SA bonuses used for file size and path metadata.
 
@@ -33,6 +33,18 @@ The starting snapshot named to `zfs send -I` is not itself present in the compou
 
 Path lookup starts at ZPL object 1 (the master node), reads its `ROOT` entry, then walks directory ZAP values. Directory values use the low 48 bits for the object number and the high nibble for the dirent type. Modern file sizes are decoded from the `DMU_OT_SA` bonus using the dataset's `SA_ATTRS -> REGISTRY/LAYOUTS` objects. The exact byte offset of `ZPL_SIZE` is saved in the extraction sidecar so a later incremental OBJECT record can update the output length without needing the full base stream again.
 
+## Pool-member reads
+
+The direct backend starts at each of the four 256 KiB vdev labels and uses the highest valid uberblock transaction group found there. A DVA is translated to a member-relative byte offset as `(offset << 9) + 4 MiB`; this release accepts only top-level vdev id 0 and rejects any pool whose label reports more than one top-level vdev. Mirror replication happens below that top-level address, so the same offset can be read from either healthy leaf of a one-mirror pool.
+
+Blocks are fetched with positioned reads and never cached as a whole-vdev buffer. Every Fletcher-2, Fletcher-4, or SHA-256 checksum present is checked before decompression; a mismatch is fatal for that DVA, and alternate DVA copies are tried before extraction fails. A block explicitly configured with checksum `off` has no checksum to validate. Inherit/default sentinels, unsupported checksum algorithms, gang blocks, and DVAs naming unavailable top-level vdevs fail explicitly.
+
+OpenZFS Zstandard blocks start with a big-endian compressed length and version/level word, followed by a Zstandard frame written without the standard four-byte magic. The reader bounds the input using that compressed length, restores the standard magic for the pure-Rust decoder, and requires the result to match the block pointer's logical size exactly. This works for both ordinary DVA-backed blocks and compressed payloads in embedded block pointers.
+
+The MOS object directory's `root_dataset` entry opens the DSL directory tree. `dd_child_dir_zapobj` enumerates filesystem datasets, while the head dataset's `ds_snapnames_zapobj` maps snapshot names to snapshot dataset objects. Each chosen head or snapshot contributes its `ds_bp`, which roots a ZPL objset. Named snapshots use the permanent `ds_guid` at bonus offset 112 for send-compatible extraction sidecars.
+
+Embedded block pointers store 14 payload words inline, excluding `blk_prop` (word 6) and logical birth (word 10). Payload bytes are reconstructed from each decoded word's low bits first, independent of pool byte order, before the normal compression decoder runs. This matters for freshly created pools, where small MOS and ZAP blocks are commonly embedded and LZ4-compressed.
+
 Primary references:
 
 - [OpenZFS send replay structures](https://github.com/openzfs/zfs/blob/master/include/sys/zfs_ioctl.h)
@@ -40,4 +52,9 @@ Primary references:
 - [OpenZFS raw encryption logic](https://github.com/openzfs/zfs/blob/master/module/os/linux/zfs/zio_crypt.c)
 - [OpenZFS wrapping-key metadata](https://github.com/openzfs/zfs/blob/master/module/zfs/dsl_crypt.c)
 - [OpenZFS zstream framing](https://github.com/openzfs/zfs/blob/master/cmd/zstream/zstream_io.c)
+- [OpenZFS block-pointer and DVA layout](https://github.com/openzfs/zfs/blob/master/include/sys/spa.h)
+- [OpenZFS embedded block-pointer codec](https://github.com/openzfs/zfs/blob/master/module/zfs/blkptr.c)
+- [OpenZFS DSL dataset and directory layouts](https://github.com/openzfs/zfs/blob/master/include/sys/dsl_dataset.h)
+- [OpenZFS Zstandard block codec](https://github.com/openzfs/zfs/blob/master/module/zstd/zfs_zstd.c)
+- [OpenZFS Zstandard header](https://github.com/openzfs/zfs/blob/master/include/sys/zstd/zstd.h)
 - [zfs-forensic-core ZAP/SA/ZPL parser](https://github.com/SecurityRonin/zfs-forensic/tree/main/core/src)

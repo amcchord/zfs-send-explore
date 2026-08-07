@@ -3,11 +3,11 @@ use clap::{Parser, Subcommand};
 use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
 use zeroize::Zeroizing;
-use zfs_send_extract::operations;
+use zfs_send_extract::{operations, pool::PoolMember};
 
 #[derive(Debug, Parser)]
 #[command(name = "zfs-send-extract")]
-#[command(about = "Browse and extract files from ZFS send streams without ZFS")]
+#[command(about = "Browse ZFS send streams and offline pool members without ZFS")]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
@@ -68,6 +68,60 @@ enum Command {
         stream: PathBuf,
         /// File previously created by `extract`.
         target: PathBuf,
+    },
+    /// Browse an offline ZFS vdev member or image directly.
+    Pool {
+        #[command(subcommand)]
+        command: PoolCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PoolCommand {
+    /// Validate a member and summarize its active pool state.
+    Inspect {
+        /// Exact ZFS vdev partition, file vdev, or image (opened read-only).
+        member: PathBuf,
+        /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List filesystem datasets reachable from the member.
+    Datasets {
+        /// Exact ZFS vdev partition, file vdev, or image.
+        member: PathBuf,
+    },
+    /// List named snapshots stored in the pool.
+    Snapshots {
+        /// Exact ZFS vdev partition, file vdev, or image.
+        member: PathBuf,
+        /// Restrict output to one full dataset name.
+        dataset: Option<String>,
+    },
+    /// List one directory from a current dataset or named snapshot.
+    List {
+        /// Exact ZFS vdev partition, file vdev, or image.
+        member: PathBuf,
+        /// Full dataset name, optionally followed by @snapshot.
+        dataset: String,
+        /// Absolute path inside the dataset or snapshot.
+        #[arg(default_value = "/")]
+        path: String,
+    },
+    /// Extract one regular file directly from a dataset or snapshot.
+    Extract {
+        /// Exact ZFS vdev partition, file vdev, or image.
+        member: PathBuf,
+        /// Full dataset name, optionally followed by @snapshot.
+        dataset: String,
+        /// Absolute path inside the dataset or snapshot.
+        path: String,
+        /// Destination file.
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Replace an existing destination.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -171,6 +225,94 @@ fn main() -> Result<()> {
                 "updated {} to {} bytes at {} (sha256 {})",
                 sidecar.path, sidecar.logical_size, sidecar.snapshot_guid, sidecar.sha256
             );
+        }
+        Command::Pool { command } => run_pool(command)?,
+    }
+    Ok(())
+}
+
+fn run_pool(command: PoolCommand) -> Result<()> {
+    match command {
+        PoolCommand::Inspect { member, json } => {
+            let pool = PoolMember::open(&member)?;
+            let inspection = pool.inspect()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&inspection)?);
+            } else {
+                println!("pool: {}", inspection.pool_name);
+                println!("pool guid: {}", inspection.pool_guid);
+                println!(
+                    "vdev: {} ({}, {} top-level)",
+                    inspection.vdev_guid, inspection.vdev_type, inspection.top_level_vdevs
+                );
+                println!("member bytes: {}", inspection.source_bytes);
+                println!("active txg: {}", inspection.txg);
+                println!("byte order: {}", inspection.endian);
+                println!("datasets: {}", inspection.datasets);
+                println!("snapshots: {}", inspection.snapshots);
+            }
+        }
+        PoolCommand::Datasets { member } => {
+            let pool = PoolMember::open(&member)?;
+            for dataset in pool.datasets()? {
+                println!(
+                    "{}\t{}\t{}",
+                    dataset.head_guid, dataset.head_dataset_object, dataset.name
+                );
+            }
+        }
+        PoolCommand::Snapshots { member, dataset } => {
+            let pool = PoolMember::open(&member)?;
+            for snapshot in pool.snapshots(dataset.as_deref())? {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    snapshot.guid,
+                    snapshot.creation_txg,
+                    snapshot.creation_time,
+                    snapshot.full_name
+                );
+            }
+        }
+        PoolCommand::List {
+            member,
+            dataset,
+            path,
+        } => {
+            let pool = PoolMember::open(&member)?;
+            for entry in pool.list_directory(&dataset, &path)? {
+                let kind = match entry.dirent_type {
+                    4 => 'd',
+                    8 => 'f',
+                    10 => 'l',
+                    _ => '?',
+                };
+                let size = entry
+                    .logical_size
+                    .map_or_else(|| "-".to_owned(), |value| value.to_string());
+                println!("{kind}\t{size}\t{}\t{}", entry.object_id, entry.name);
+            }
+        }
+        PoolCommand::Extract {
+            member,
+            dataset,
+            path,
+            output,
+            force,
+        } => {
+            let pool = PoolMember::open(&member)?;
+            let extraction = pool.extract(&dataset, &path, &output, force)?;
+            println!(
+                "extracted {} bytes from object {} to {} (sha256 {})",
+                extraction.logical_size,
+                extraction.object_id,
+                output.display(),
+                extraction.sha256
+            );
+            if !extraction.sidecar_written {
+                println!(
+                    "note: current-head extraction has no incremental-send sidecar; select a named snapshot to create one"
+                );
+            }
         }
     }
     Ok(())

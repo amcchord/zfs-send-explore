@@ -216,3 +216,14 @@ fn raw_encrypted_send_lists_and_extracts_with_an_authenticated_key() {
         String::from_utf8_lossy(&rejected.stderr).contains("supplied key did not authenticate")
     );
 }
+
+#[test]
+fn pool_commands_reject_a_non_zfs_member() {
+    let temporary = tempfile::tempdir().unwrap();
+    let member = temporary.path().join("not-zfs.img");
+    fs::write(&member, vec![0u8; 4 * 256 * 1024]).unwrap();
+    let output = run(&["pool", "inspect", member.to_str().unwrap()]);
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("no readable ZFS vdev label"), "{error}");
+}

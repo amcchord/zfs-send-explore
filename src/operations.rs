@@ -13,7 +13,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
-const SIDECAR_VERSION: u32 = 1;
+pub(crate) const SIDECAR_VERSION: u32 = 1;
 const ZERO_CHUNK_SIZE: usize = 64 * 1024;
 
 #[derive(Debug, Serialize)]
@@ -530,7 +530,7 @@ fn persist_replace(temporary: NamedTempFile, path: &Path, force: bool) -> Result
     Ok(())
 }
 
-fn save_sidecar(target: &Path, sidecar: &Sidecar) -> Result<()> {
+pub(crate) fn save_sidecar(target: &Path, sidecar: &Sidecar) -> Result<()> {
     let path = sidecar_path(target);
     let mut temporary = temporary_for(&path)?;
     serde_json::to_writer_pretty(temporary.as_file_mut(), sidecar)?;
@@ -539,7 +539,7 @@ fn save_sidecar(target: &Path, sidecar: &Sidecar) -> Result<()> {
     persist_replace(temporary, &path, true)
 }
 
-fn sidecar_path(target: &Path) -> PathBuf {
+pub(crate) fn sidecar_path(target: &Path) -> PathBuf {
     let mut name: OsString = target.as_os_str().to_owned();
     name.push(".zfse.json");
     PathBuf::from(name)
@@ -559,7 +559,7 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
-fn guid_string(guid: u64) -> String {
+pub(crate) fn guid_string(guid: u64) -> String {
     format!("0x{guid:016x}")
 }
 

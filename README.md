@@ -1,6 +1,6 @@
 # zfs-send-extract
 
-`zfs-send-extract` is an experimental, pure-userspace CLI for browsing a ZFS send file and extracting one regular file without mounting a pool or installing ZFS. It supports ordinary plaintext sends and full OpenZFS raw encrypted sends (`zfs send -w`). It can also select a snapshot from compound or concatenated multi-snapshot send files. An extracted file carries a small JSON sidecar, allowing a later plaintext incremental send stream to update the file atomically.
+`zfs-send-extract` is an experimental, pure-userspace CLI for browsing ZFS send files and offline ZFS pool members without mounting a pool or installing ZFS. It supports ordinary plaintext sends, full OpenZFS raw encrypted sends (`zfs send -w`), and direct read-only extraction from a single disk/file vdev or one member of a single top-level mirror. It can select snapshots from compound send files or from the pool's on-disk DSL snapshot catalog. An extracted snapshot file carries a small JSON sidecar, allowing a later plaintext incremental send stream to update the file atomically.
 
 The current profile targets streams produced on little-endian systems. It does not link `libzfs`, load a kernel module, invoke `zfs`, or receive the stream into a pool. Encrypted stream handling uses portable Rust cryptography and verifies the OpenZFS authentication tags before using decrypted file or path metadata.
 
@@ -16,6 +16,12 @@ zfs-send-extract extract history.zfs /payload/large.bin --snapshot daily-2026-08
 zfs-send-extract list encrypted-raw.zfs / --key-file ./dataset.key
 zfs-send-extract extract encrypted-raw.zfs /payload/large.bin --key-file ./dataset.key --output large.bin
 zfs-send-extract apply incremental.zfs large.bin
+
+zfs-send-extract pool inspect /dev/sdb1
+zfs-send-extract pool datasets /dev/sdb1
+zfs-send-extract pool snapshots /dev/sdb1 tank/data
+zfs-send-extract pool list /dev/sdb1 tank/data@s1 /payload
+zfs-send-extract pool extract /dev/sdb1 tank/data@s1 /payload/large.bin --output large.bin
 ```
 
 `--snapshot` accepts a short snapshot name, a full `dataset@snapshot` name, or a `0x`-prefixed snapshot GUID. It is required when the file contains more than one snapshot, which avoids silently choosing the wrong dataset in a recursive package. The selected snapshot is reconstructed by following its `fromguid` ancestry back to a full substream and replaying that chain only.
@@ -26,6 +32,24 @@ For a multi-snapshot file, `extract` makes a catalog pass followed by two replay
 
 `extract` also writes `large.bin.zfse.json`. The sidecar records the DMU object number, base snapshot GUID, logical size, metadata offset, and SHA-256. `apply` verifies both the GUID chain and the existing file hash before replaying only that object's `WRITE` and `FREE` records into a temporary file, then renames the result into place.
 
+## Offline pool members
+
+The `pool` command family reads an exported vdev with positioned I/O. It scans the four vdev labels, chooses the highest active uberblock, enforces every supported checksum present before decompression, walks the MOS and DSL dataset tree, and then uses the same ZPL ZAP/SA metadata model as send extraction. The source is always opened read-only and is not loaded into memory as one giant image.
+
+Pass the exact ZFS vdev partition or file vdev. Whole disks containing GPT partitions are not auto-sliced yet. Export the pool first so blocks cannot be freed and reused while the reader is traversing a fixed uberblock:
+
+```sh
+zpool export tank
+zfs-send-extract pool inspect /dev/disk/by-id/example-part1 --json
+zfs-send-extract pool snapshots /dev/disk/by-id/example-part1 tank/data
+zfs-send-extract pool extract /dev/disk/by-id/example-part1 \
+  tank/data@backup-2026-08-07 /payload/large.bin --output large.bin
+```
+
+A healthy member of a mirror is sufficient only when that mirror is the pool's sole top-level vdev. A pool with several top-level mirrors needs one member from every mirror and is rejected by this release. Pools with RAIDZ/dRAID, special or dedup allocation classes, device-removal mappings, gang blocks, or encrypted datasets are also outside the initial direct-member profile.
+
+Extraction from a named on-disk snapshot writes the normal `.zfse.json` sidecar using `dsl_dataset_phys_t.ds_guid`, so `apply` can advance that file with an ordinary incremental send. Extraction from a live head is supported but deliberately omits the sidecar because a head dataset is not a valid incremental-send base snapshot.
+
 ## Build
 
 Rust 1.87 or later is required.
@@ -35,10 +59,13 @@ cargo build --release
 cargo test
 ```
 
-`tests/fixtures` contains small real OpenZFS 2.3.2 streams, including a three-snapshot archive and an AES-256-GCM raw encrypted send. The integration tests exercise snapshot discovery and selection, path listing, extraction, encrypted key rejection, block authentication, incremental update, and checksum-corruption rejection on every CI run. The 20+ MiB milestone fixture stays out of Git and can be verified on Linux with:
+`tests/fixtures` contains small real OpenZFS 2.3.2 streams, including a three-snapshot archive and an AES-256-GCM raw encrypted send. The integration tests exercise snapshot discovery and selection, path listing, extraction, encrypted key rejection, block authentication, incremental update, positioned block reads, and checksum-corruption rejection on every CI run. The 20+ MiB milestone fixtures stay out of Git and can be verified on Linux with:
 
 ```sh
 scripts/verify-fixtures.sh target/release/zfs-send-extract .artifacts/lab
+scripts/verify-pool-member.sh target/release/zfs-send-extract \
+  /path/to/exported-member.vdev tank/data@s1 /payload/large.bin \
+  expected-s1-sha256 .artifacts/pool-member
 ```
 
 The resulting executable has no ZFS runtime dependency:
@@ -76,20 +103,31 @@ This initial version supports:
 - regular-file data represented by ordinary, uncompressed `WRITE` records;
 - a full raw encrypted `zfs send -w` snapshot using OpenZFS AES-CCM or AES-GCM (128, 192, or 256-bit), with raw, hex, or passphrase key formats;
 - authenticated decryption of raw WRITE blocks and encrypted dnode bonus metadata;
-- uncompressed and LZ4-compressed blocks inside raw sends;
+- off, LZJB, LZ4, gzip, ZLE, and Zstandard-compressed blocks inside raw sends;
 - micro-ZAP and fat-ZAP directories; and
 - modern SA metadata plus legacy znode bonuses.
 
 It deliberately rejects:
 
 - raw encrypted incremental chains and `apply` on raw encrypted sends;
-- raw encrypted spill blocks and raw compression algorithms other than off/LZ4;
+- raw encrypted spill blocks;
 - compressed (`zfs send -c`) and embedded-data (`zfs send -e`) streams;
 - a selected incremental snapshot whose full base is not present earlier in the same file;
 - deduplicated, redacted, resumed, or big-endian streams; and
 - an incremental update that deletes and recreates the file under a new DMU object number.
 
-Dataset compression is fine for ordinary sends: `zfs send` emits uncompressed replay payloads unless `-c` is explicitly requested. Raw sends always preserve their on-disk representation; this release can decompress the common off and LZ4 forms.
+The direct pool-member backend additionally supports:
+
+- exact file vdevs, ZFS partitions, and images opened read-only;
+- a pool with one top-level `disk`, `file`, or `mirror` vdev;
+- current filesystem datasets and named snapshots;
+- Fletcher-2, Fletcher-4, and SHA-256 block validation;
+- embedded blocks plus off, LZJB, LZ4, gzip levels 1-9, ZLE, and Zstandard compression; and
+- compatible incremental-send sidecars for files extracted from named snapshots.
+
+Dataset compression is fine for ordinary sends: `zfs send` emits uncompressed replay payloads unless `-c` is explicitly requested. Direct pool-member reads and raw encrypted sends share an OpenZFS-aware decoder for off, LZJB, LZ4, gzip levels 1-9, ZLE, and Zstandard, including ZFS's magicless Zstandard framing. Plaintext compressed replay records produced by `zfs send -c` remain outside the current send-stream profile.
+
+The pool reader targets ZFS filesystem datasets. ZVOLs are block devices rather than path-based filesystems, so their contents cannot be browsed as individual files without also understanding the filesystem stored inside the volume.
 
 An important OpenZFS detail is that `zfs send -I pool/fs@s1 pool/fs@s3` includes `s2` and `s3`, but not the starting snapshot `s1`. That stream alone is not sufficient to reconstruct file data. A self-contained history file can be made by concatenating the full base and the compound incremental stream:
 

@@ -526,36 +526,10 @@ fn size_field(size: u64) -> Result<u64> {
 }
 
 pub fn decompress_block(compression: u8, payload: &[u8], logical_size: u64) -> Result<Vec<u8>> {
-    let logical_size = usize::try_from(logical_size).context("logical block size is too large")?;
-    match compression {
-        // Raw sends preserve the on-disk compression value even for uncompressed blocks.
-        0 | 2 => {
-            if payload.len() != logical_size {
-                bail!(
-                    "uncompressed ZFS block is {} bytes, expected {logical_size}",
-                    payload.len()
-                );
-            }
-            Ok(payload.to_vec())
-        }
-        15 => {
-            if payload.len() < 4 {
-                bail!("ZFS LZ4 block is missing its size prefix");
-            }
-            let encoded = u32::from_be_bytes(payload[..4].try_into().expect("four bytes")) as usize;
-            if encoded + 4 > payload.len() {
-                bail!("ZFS LZ4 block has an invalid compressed-size prefix");
-            }
-            let mut output = vec![0_u8; logical_size];
-            let written = lz4_flex::block::decompress_into(&payload[4..4 + encoded], &mut output)
-                .context("decompressing ZFS LZ4 block")?;
-            if written != logical_size {
-                bail!("ZFS LZ4 block expanded to {written} bytes, expected {logical_size}");
-            }
-            Ok(output)
-        }
-        value => bail!("ZFS compression type {value} in raw sends is unsupported"),
-    }
+    // Some raw-send producers use zero in DRR_WRITE to mean an uncompressed
+    // payload even though an on-disk blkptr stores ZIO_COMPRESS_OFF as two.
+    let compression = if compression == 0 { 2 } else { compression };
+    crate::compression::decompress_block(compression, payload, logical_size)
 }
 
 fn decrypt_aead(
