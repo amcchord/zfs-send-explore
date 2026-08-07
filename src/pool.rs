@@ -6,6 +6,7 @@
 
 use crate::compression::decompress_block;
 use crate::filesystem::DirectoryEntry;
+use crate::inception::ImageRead;
 use crate::operations::{SIDECAR_VERSION, Sidecar, guid_string, save_sidecar, sidecar_path};
 use crate::sparse;
 use anyhow::{Context, Result, anyhow, bail};
@@ -395,6 +396,14 @@ pub struct PoolMember {
     mos: ObjsetPhys,
 }
 
+/// A regular ZPL file exposed as a bounded positioned reader. This is the
+/// bridge used by inception mode: nested filesystem parsers see the selected
+/// ZFS file as a read-only virtual disk without first exporting it.
+pub(crate) struct PoolImageFile {
+    member: PoolMember,
+    resolved: ResolvedPoolPath,
+}
+
 impl PoolMember {
     /// Open an exact ZFS vdev partition, a file-backed vdev, or an image of one.
     /// GPT whole disks are auto-sliced only when one partition has ZFS labels.
@@ -659,6 +668,18 @@ impl PoolMember {
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(entries)
+    }
+
+    pub(crate) fn into_image_file(self, selector: &str, path: &str) -> Result<PoolImageFile> {
+        let view = self.dataset_view(selector)?;
+        let resolved = self.resolve_path(&view, path)?;
+        if resolved.dirent_type != 8 {
+            bail!("{} is not a regular file", resolved.normalized_path);
+        }
+        Ok(PoolImageFile {
+            member: self,
+            resolved,
+        })
     }
 
     /// Extract a regular file. Named-snapshot extraction writes a sidecar that
@@ -1063,6 +1084,53 @@ impl PoolMember {
             return Ok(vec![0; dnode.data_block_size()]);
         }
         read_block_from(&self.source, 0, &pointer)
+    }
+}
+
+impl ImageRead for PoolImageFile {
+    fn len(&self) -> u64 {
+        self.resolved.logical_size
+    }
+
+    fn read_exact_at(&self, offset: u64, buffer: &mut [u8]) -> Result<()> {
+        let count = u64::try_from(buffer.len()).context("nested read size exceeds u64")?;
+        let end = offset
+            .checked_add(count)
+            .ok_or_else(|| anyhow!("nested ZFS-file read offset overflows"))?;
+        if end > self.resolved.logical_size {
+            bail!(
+                "nested read [{offset}, {end}) exceeds ZFS file {} ({} bytes)",
+                self.resolved.normalized_path,
+                self.resolved.logical_size
+            );
+        }
+
+        let block_size = self.resolved.dnode.data_block_size();
+        if block_size == 0 {
+            bail!("nested image file has a zero ZFS record size");
+        }
+        let mut position = offset;
+        let mut filled = 0usize;
+        while filled < buffer.len() {
+            let block_id = position / block_size as u64;
+            let within = usize::try_from(position % block_size as u64)
+                .context("nested block offset exceeds usize")?;
+            let wanted = (buffer.len() - filled).min(block_size - within);
+            let block = if block_id > self.resolved.dnode.dn_maxblkid {
+                Vec::new()
+            } else {
+                self.member
+                    .read_dnode_data(&self.resolved.dnode, block_id)?
+            };
+            let present = block.len().saturating_sub(within).min(wanted);
+            if present != 0 {
+                buffer[filled..filled + present].copy_from_slice(&block[within..within + present]);
+            }
+            buffer[filled + present..filled + wanted].fill(0);
+            position += wanted as u64;
+            filled += wanted;
+        }
+        Ok(())
     }
 }
 

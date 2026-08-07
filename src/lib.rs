@@ -6,6 +6,7 @@ mod compression;
 pub mod client;
 pub mod encrypted;
 pub mod filesystem;
+pub mod inception;
 pub mod operations;
 pub mod pool;
 pub mod sparse;

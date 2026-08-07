@@ -1,6 +1,6 @@
 # Native Windows client
 
-`zfs-send-explore-windows.exe` is the native Windows desktop client for ZFS Send Explore. It browses ZFS send files and supported exported pool members without installing ZFS, importing a pool, or mounting a dataset. It can extract one regular file from an exact snapshot and can advance a previously extracted file with a matching incremental send.
+`zfs-send-explore-windows.exe` is the native Windows desktop client for ZFS Send Explore. It browses ZFS send files and supported exported pool members without installing ZFS, importing a pool, or mounting a dataset. It can extract one regular file from an exact snapshot, look one layer deeper into a VM disk image stored as a ZFS file, and advance a previously extracted ZFS file with a matching incremental send.
 
 The executable uses the same checked stream, encryption, pool, extraction, sparse-file, and update library as `zfs-send-extract`. It does not shell out to the CLI and it does not require `libzfs` or a filesystem driver.
 
@@ -41,10 +41,13 @@ From top to bottom:
 5. **View selector** — chooses the exact send snapshot, pool snapshot, or current read-only dataset head.
 6. **Path, Up, and Go** — navigates an absolute path inside the selected filesystem view.
 7. **Decryption key** — selects a passphrase, hex-key, or 32-byte raw-key file for a raw encrypted send.
-8. **File list** — reports name, type, logical size, and DMU object number. Double-click a folder to enter it.
-9. **Extract selected** — extracts the selected regular file through the Windows Save As dialog.
-10. **Update extracted file** — validates an extracted file and advances it with a matching standalone incremental send.
-11. **Status bar** — shows progress, the current path, item counts, and completed operations.
+8. **Inner volume selector** — chooses a detected partition while inception mode is active.
+9. **Image offset and length** — optionally bound a raw, QCOW2, or VMDK container inside the selected ZFS file; decimal and `0x` hexadecimal values are accepted.
+10. **Explore disk image / Leave disk image** — enters or leaves the subordinate filesystem without mounting it.
+11. **File list** — reports name, type, logical size, and an object or entry identifier. Double-click a folder to enter it.
+12. **Extract selected** — extracts the selected regular file through the Windows Save As dialog.
+13. **Update extracted file** — validates an extracted ZFS file and advances it with a matching standalone incremental send. Inner-file extractions are not update bases.
+14. **Status bar** — shows progress, the current path, item counts, and completed operations.
 
 Menus provide the same source, extraction, update, key, About, and Exit actions.
 
@@ -69,6 +72,30 @@ To navigate:
 - select another view to return to that view's root.
 
 Only regular files can be extracted. Directories and symbolic links are listed for navigation and identification but are not recreated.
+
+## Explore a VM disk image one layer deeper
+
+Inception mode opens a disk image that is itself a regular file in the selected ZFS snapshot or dataset. Partition and filesystem reads go back to the original ZFS source on demand; the GUI does not export the complete image, attach a virtual disk, install a filesystem driver, or mount anything.
+
+1. Browse to the ZFS directory containing the image and select its regular-file row.
+2. If the container starts at byte zero and runs to the end of the ZFS file, leave **Image offset** and **Image length** unchanged. For an embedded image, enter the byte offset and optional length in decimal or `0x` hexadecimal.
+3. Select **Explore disk image…**. The scan validates the container and partition metadata before enabling inner navigation.
+4. Choose a supported item in the inner volume selector if the image has several partitions.
+5. Navigate and extract regular files with the same list, Path, Up, Go, double-click, and Save As controls used for ZFS browsing.
+6. Select **Leave disk image** to return to the outer ZFS filesystem.
+
+The GUI recognizes:
+
+- raw and sparse images, including an unpartitioned filesystem;
+- self-contained QCOW2 v2/v3 images;
+- self-contained VMDK `monolithicSparse` images;
+- CRC-validated GPT, with primary/backup recovery and 512- or 4096-byte logical sectors;
+- MBR primary and extended/logical partitions; and
+- NTFS, FAT12/16/32, exFAT, ext4, and compatible ext2 subordinate filesystems.
+
+Sources and all inner layers remain read-only. The extracted file is built in a same-directory sparse temporary file, synchronized, hashed with SHA-256, and moved into place only after success. It does not receive a `.zfse.json` sidecar because the inner file is not a directly addressable ZFS object; the completion dialog calls this out.
+
+The initial implementation intentionally rejects QCOW1, QCOW2 backing-file overlays and encryption, split/flat/stream-optimized VMDKs, compressed NTFS data streams, EFS-encrypted files, and non-UTF-8 ext names. ext symlinks are visible but are not followed for extraction. An error dialog reports the unsupported layer instead of falling back to potentially incorrect raw interpretation.
 
 ## Extract one file
 
@@ -235,6 +262,10 @@ The target is copied into a same-directory sparse temporary file. Matching `OBJE
 | Target hash or size differs | The extracted file was changed locally. Preserve it and re-extract a clean base before applying the incremental. |
 | Incremental `fromguid` does not match | The chosen incremental starts from another snapshot. Select the send whose base is the sidecar's snapshot. |
 | A current pool head cannot be updated | Re-extract the file from a named snapshot so a stable base GUID and sidecar can be recorded. |
+| **No supported inner filesystem** | Run `inception inspect` in the CLI for per-volume diagnostics; confirm the image window, container variant, partition integrity, and filesystem type. |
+| A valid filesystem starts after an appliance header | Enter its exact byte offset before choosing **Explore disk image…**; optionally enter a length to prevent reads beyond the embedded image. |
+| QCOW or VMDK reports an unsupported feature | Use a self-contained QCOW2 v2/v3 or VMDK `monolithicSparse` image. Backing files and external/split VMDK extents are not guessed or searched for. |
+| An inner NTFS file cannot be extracted | NTFS compression and EFS encryption are currently rejected; select an ordinary unnamed `$DATA` file stream. |
 | Sparse extraction has the right length but consumes full space | The destination filesystem may not support Windows sparse controls, or a storage layer may materialize holes. Logical content remains authoritative. |
 | An older build reports **Incorrect function** for a raw drive | Update to a build containing the Windows physical-drive length probe; ordinary file metadata calls do not work for every raw device handle. |
 
