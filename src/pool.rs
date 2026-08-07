@@ -473,8 +473,10 @@ impl PoolMember {
                     &view.registry,
                     &view.layouts,
                 ),
+                size_spill_offset: None,
                 snapshot_guid: guid_string(snapshot_guid),
                 sha256: sha256.clone(),
+                raw_state: None,
             };
             save_sidecar(output, &sidecar)?;
             true

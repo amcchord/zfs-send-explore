@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -15,6 +16,10 @@ fn run(arguments: &[&str]) -> Output {
         .args(arguments)
         .output()
         .expect("run CLI")
+}
+
+fn sha256(path: &Path) -> String {
+    format!("{:x}", Sha256::digest(fs::read(path).unwrap()))
 }
 
 #[test]
@@ -214,6 +219,170 @@ fn raw_encrypted_send_lists_and_extracts_with_an_authenticated_key() {
     assert!(!rejected.status.success());
     assert!(
         String::from_utf8_lossy(&rejected.stderr).contains("supplied key did not authenticate")
+    );
+}
+
+#[test]
+fn raw_zstd_spill_chain_extracts_and_applies_an_authenticated_incremental() {
+    let full = fixture("advanced-raw-full.zfs");
+    let incremental = fixture("advanced-raw-incremental.zfs");
+    let temporary = tempfile::tempdir().unwrap();
+    let key = temporary.path().join("passphrase");
+    fs::write(&key, b"zfs-send-fixture-passphrase\n").unwrap();
+
+    let mut reader = StreamReader::new(fs::File::open(&full).unwrap());
+    let mut saw_spill = false;
+    let mut saw_zstd = false;
+    while let Some(record) = reader.next_record().unwrap() {
+        match record.kind {
+            RecordKind::Spill(_) => saw_spill = true,
+            RecordKind::Write(write) if write.compression_type == 16 => saw_zstd = true,
+            _ => {}
+        }
+    }
+    assert!(saw_spill, "real raw fixture must contain an SA spill block");
+    assert!(saw_zstd, "real raw fixture must contain Zstandard blocks");
+
+    let target = temporary.path().join("raw-target.bin");
+    let extract = run(&[
+        "extract",
+        full.to_str().unwrap(),
+        "/payload/target.bin",
+        "--output",
+        target.to_str().unwrap(),
+        "--key-file",
+        key.to_str().unwrap(),
+    ]);
+    assert!(
+        extract.status.success(),
+        "{}",
+        String::from_utf8_lossy(&extract.stderr)
+    );
+    assert_eq!(fs::metadata(&target).unwrap().len(), 2 * 1024 * 1024);
+    assert_eq!(
+        sha256(&target),
+        "9aa35c1088ccaa0785d8c10fa23c740e9202368d29fb2e4972ec10a28d9d490f"
+    );
+    let sidecar = fs::read_to_string(format!("{}.zfse.json", target.display())).unwrap();
+    assert!(sidecar.contains("\"raw_state\""));
+    assert!(!sidecar.contains("zfs-send-fixture-passphrase"));
+
+    let missing_key = run(&[
+        "apply",
+        incremental.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ]);
+    assert!(!missing_key.status.success());
+    assert!(String::from_utf8_lossy(&missing_key.stderr).contains("--key-file"));
+
+    let apply = run(&[
+        "apply",
+        incremental.to_str().unwrap(),
+        target.to_str().unwrap(),
+        "--key-file",
+        key.to_str().unwrap(),
+    ]);
+    assert!(
+        apply.status.success(),
+        "{}",
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    assert_eq!(fs::metadata(&target).unwrap().len(), 2_359_296);
+    assert_eq!(
+        sha256(&target),
+        "db5d733aba08cebf9d52621e01f64fe925c071a74de697dc2ba4792bfac38d28"
+    );
+
+    let history = temporary.path().join("raw-history.zfs");
+    let mut history_bytes = fs::read(&full).unwrap();
+    history_bytes.extend_from_slice(&fs::read(&incremental).unwrap());
+    fs::write(&history, history_bytes).unwrap();
+    let from_chain = temporary.path().join("raw-chain-target.bin");
+    let chain_extract = run(&[
+        "extract",
+        history.to_str().unwrap(),
+        "/payload/target.bin",
+        "--snapshot",
+        "s2",
+        "--output",
+        from_chain.to_str().unwrap(),
+        "--key-file",
+        key.to_str().unwrap(),
+    ]);
+    assert!(
+        chain_extract.status.success(),
+        "{}",
+        String::from_utf8_lossy(&chain_extract.stderr)
+    );
+    assert_eq!(sha256(&from_chain), sha256(&target));
+}
+
+#[test]
+fn compressed_and_embedded_streams_extract_and_apply() {
+    let full = fixture("advanced-plain-full.zfs");
+    let incremental = fixture("advanced-plain-incremental.zfs");
+    let temporary = tempfile::tempdir().unwrap();
+
+    let mut reader = StreamReader::new(fs::File::open(&full).unwrap());
+    let mut saw_compressed = false;
+    let mut saw_embedded = false;
+    while let Some(record) = reader.next_record().unwrap() {
+        match record.kind {
+            RecordKind::Write(write) if write.compression_type != 0 => saw_compressed = true,
+            RecordKind::WriteEmbedded(_) => saw_embedded = true,
+            _ => {}
+        }
+    }
+    assert!(saw_compressed);
+    assert!(saw_embedded);
+
+    let target = temporary.path().join("plain-target.bin");
+    let embedded = temporary.path().join("embedded.bin");
+    for (path, output) in [
+        ("/payload/target.bin", target.as_path()),
+        ("/payload/embedded.bin", embedded.as_path()),
+    ] {
+        let result = run(&[
+            "extract",
+            full.to_str().unwrap(),
+            path,
+            "--output",
+            output.to_str().unwrap(),
+        ]);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    assert_eq!(
+        sha256(&target),
+        "af2e223b435354ed53190ee2e9cbbe8612e90ab691639aa91f71dce0de47a027"
+    );
+    assert_eq!(
+        sha256(&embedded),
+        "fcf23bb6294ddeca564cb0cf6a256dd15dc01516a792f644b694e172e4f7f89f"
+    );
+
+    for output in [&target, &embedded] {
+        let result = run(&[
+            "apply",
+            incremental.to_str().unwrap(),
+            output.to_str().unwrap(),
+        ]);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    assert_eq!(
+        sha256(&target),
+        "c8a198dbc1e37af9ae2899906d7b95266fc2c1e2e3f49f5a5b8c3463d14ef368"
+    );
+    assert_eq!(
+        sha256(&embedded),
+        "e45b0cd2e205653ec280d92f9bad6b9b793f0e98c948dac72cd0f558de7ba1c5"
     );
 }
 

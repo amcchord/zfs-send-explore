@@ -68,6 +68,9 @@ enum Command {
         stream: PathBuf,
         /// File previously created by `extract`.
         target: PathBuf,
+        /// File containing the ZFS passphrase, hex key, or 32-byte raw key.
+        #[arg(long, value_name = "FILE")]
+        key_file: Option<PathBuf>,
     },
     /// Browse an offline ZFS vdev member or image directly.
     Pool {
@@ -219,8 +222,17 @@ fn main() -> Result<()> {
                 sidecar.sha256
             );
         }
-        Command::Apply { stream, target } => {
-            let sidecar = operations::apply_incremental(&stream, &target)?;
+        Command::Apply {
+            stream,
+            target,
+            key_file,
+        } => {
+            let key = load_apply_key_material(&stream, key_file.as_ref())?;
+            let sidecar = operations::apply_incremental_with_key(
+                &stream,
+                &target,
+                key.as_deref().map(Vec::as_slice),
+            )?;
             println!(
                 "updated {} to {} bytes at {} (sha256 {})",
                 sidecar.path, sidecar.logical_size, sidecar.snapshot_guid, sidecar.sha256
@@ -323,7 +335,23 @@ fn load_key_material(
     snapshot: Option<&str>,
     key_file: Option<&PathBuf>,
 ) -> Result<Option<Zeroizing<Vec<u8>>>> {
-    let Some(requirement) = operations::encryption_requirement(stream, snapshot)? else {
+    let requirement = operations::encryption_requirement(stream, snapshot)?;
+    load_key_for_requirement(requirement, key_file)
+}
+
+fn load_apply_key_material(
+    stream: &std::path::Path,
+    key_file: Option<&PathBuf>,
+) -> Result<Option<Zeroizing<Vec<u8>>>> {
+    let requirement = operations::apply_encryption_requirement(stream)?;
+    load_key_for_requirement(requirement, key_file)
+}
+
+fn load_key_for_requirement(
+    requirement: Option<operations::EncryptionRequirement>,
+    key_file: Option<&PathBuf>,
+) -> Result<Option<Zeroizing<Vec<u8>>>> {
+    let Some(requirement) = requirement else {
         if key_file.is_some() {
             anyhow::bail!("--key-file is only valid for a raw encrypted send");
         }

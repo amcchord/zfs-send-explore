@@ -33,6 +33,49 @@ pub(crate) fn decompress_block(
     }
 }
 
+/// Decode a non-raw DRR_WRITE payload. A zero wire value means that the
+/// sender placed the complete logical block in the stream; non-zero values
+/// are OpenZFS compression identifiers from a `zfs send -c` stream.
+pub(crate) fn decode_replay_write(
+    compression: u8,
+    payload: &[u8],
+    logical_size: u64,
+) -> Result<Vec<u8>> {
+    if compression == 0 {
+        let logical_size =
+            usize::try_from(logical_size).context("logical replay WRITE size is too large")?;
+        if payload.len() != logical_size {
+            bail!(
+                "uncompressed replay WRITE is {} bytes, expected {logical_size}",
+                payload.len()
+            );
+        }
+        return Ok(payload.to_vec());
+    }
+    decompress_block(compression, payload, logical_size)
+}
+
+/// Decode the meaningful bytes of a DRR_WRITE_EMBEDDED payload. The replay
+/// payload is padded to an eight-byte boundary, while `physical_size` excludes
+/// that padding and `logical_size` is the size after decompression.
+pub(crate) fn decode_embedded_write(
+    compression: u8,
+    embedded_type: u8,
+    payload: &[u8],
+    physical_size: u32,
+    logical_size: u32,
+) -> Result<Vec<u8>> {
+    if embedded_type != 0 {
+        bail!("unsupported ZFS embedded block type {embedded_type}");
+    }
+    let physical_size =
+        usize::try_from(physical_size).context("embedded replay payload size is too large")?;
+    let encoded = payload
+        .get(..physical_size)
+        .context("embedded replay payload is shorter than its physical size")?;
+    decompress_block(compression, encoded, u64::from(logical_size))
+}
+
 fn decompress_gzip(payload: &[u8], logical_size: usize) -> Result<Vec<u8>> {
     let limit = logical_size
         .checked_add(1)
