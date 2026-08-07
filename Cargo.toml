@@ -15,9 +15,11 @@ aes-gcm = "0.10"
 anyhow = "1.0"
 ccm = "0.5"
 clap = { version = "4.5", features = ["derive"] }
+crc32fast = "1.5"
 flate2 = "1.1"
 hmac = "0.12"
 hkdf = "0.12"
+libc = "0.2"
 lz4_flex = "0.11"
 pbkdf2 = "0.12"
 rpassword = "7.4"
@@ -31,6 +33,24 @@ tempfile = "3.20"
 thiserror = "2.0"
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
 zfs-forensic-core = "0.1.1"
+
+[build-dependencies]
+embed-resource = "3.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [profile.release]
 lto = "thin"

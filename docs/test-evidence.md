@@ -2,6 +2,21 @@
 
 The committed integration fixtures and the larger lab scenarios below were produced with OpenZFS 2.3.2 on Debian 13 x86-64. Fixture tests run without ZFS; the lab runs independently compare extracted files with mounted source snapshots and record exact sizes and SHA-256 hashes.
 
+## Native Windows client validation
+
+The x86-64 Windows GUI was exercised on Microsoft Windows 11 Pro build 26100 using the real native controls and file dialogs documented in [`windows-client.md`](windows-client.md). The final tested executable had SHA-256 `d5ced64ce03b607352309a1d6ca3443515dd2f7494ddc3de211451080fa21a9e`.
+
+The UI run opened `multi-snapshot.zfs`, selected all three full/incremental views, and extracted a file from `s2` with its update sidecar. A second base extraction from `tiny-full.zfs` was advanced with `tiny-incremental.zfs`; the target changed from 29 to 58 bytes and matched the expected two-line incremental content. The raw `encrypted-raw-s1.zfs` fixture was opened with its passphrase key, authenticated, and browsed through `/docs/hello.txt`.
+
+For direct-drive coverage, an isolated 1 GiB single-file vdev was exported and attached to Windows read-only as `\\.\PhysicalDrive1`. The client enumerated `archive@baseline`, `archive@after-update`, and both current read-only dataset heads without importing or mounting the pool. It then extracted a 268,435,456-byte sparse file whose first and last markers matched the source. NTFS reported `Archive, SparseFile` and only two 131,072-byte allocated ranges:
+
+| Range | Offset | Length |
+| --- | ---: | ---: |
+| First marker | `0x0` | `0x20000` |
+| Last marker | `0xffe0000` | `0x20000` |
+
+The run exposed and verified fixes for three Windows/on-disk edge cases: releasing the open base-file handle before atomic replacement, using `IOCTL_DISK_GET_LENGTH_INFO` when `File::metadata()` rejects a raw drive, and zero-extending short or ancestor-hole ZFS leaves to the dnode record size during sparse pool extraction. The full unit/integration suite, native clippy, Windows-target clippy, and release cross-build passed after those changes.
+
 ## Initial send-stream milestone
 
 The initial end-to-end test ran on a Debian 13 x86-64 VM with OpenZFS 2.3.2. ZFS was used to produce the streams; the release CLI was then built as a normal userspace executable and run against the files.

@@ -6,6 +6,7 @@ use crate::encrypted::{
 use crate::filesystem::{
     DirectoryEntry, ObjectIndex, ResolvedPath, SnapshotPlan, plan_snapshot, snapshot_headers,
 };
+use crate::sparse;
 use crate::stream::{
     BeginRecord, DMU_SUBSTREAM, FEATURE_RAW, ObjectRecord, RecordKind, StreamReader,
 };
@@ -15,12 +16,11 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
 pub(crate) const SIDECAR_VERSION: u32 = 1;
-const ZERO_CHUNK_SIZE: usize = 64 * 1024;
 const MAX_REPLAY_BLOCK_SIZE: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Serialize)]
@@ -142,6 +142,7 @@ pub fn extract_snapshot_with_key(
     }
 
     let mut temporary = temporary_for(output)?;
+    sparse::prepare(temporary.as_file())?;
     replay_object(
         stream,
         &plan,
@@ -273,9 +274,9 @@ pub fn apply_incremental_with_key(
         return apply_raw_incremental(stream, target, sidecar, key_material);
     }
 
-    let source = File::open(target)?;
+    let mut source = File::open(target)?;
     let mut temporary = temporary_for(target)?;
-    io::copy(&mut io::BufReader::new(source), temporary.as_file_mut())?;
+    sparse::copy(&mut source, temporary.as_file_mut())?;
 
     let file = File::open(stream).with_context(|| format!("opening {}", stream.display()))?;
     let mut reader = StreamReader::new(file);
@@ -325,10 +326,7 @@ pub fn apply_incremental_with_key(
                     &record.payload,
                     write.logical_size,
                 )?;
-                temporary
-                    .as_file_mut()
-                    .seek(SeekFrom::Start(write.offset))?;
-                temporary.as_file_mut().write_all(&plaintext)?;
+                sparse::write_extent(temporary.as_file_mut(), write.offset, &plaintext)?;
                 saw_target_change = true;
             }
             RecordKind::WriteEmbedded(write) if write.object == sidecar.object_id => {
@@ -362,7 +360,7 @@ pub fn apply_incremental_with_key(
                 bail!("deduplicated WRITE_BYREF streams are unsupported")
             }
             RecordKind::Free(free) if free.object == sidecar.object_id => {
-                zero_range(temporary.as_file_mut(), free.offset, free.length)?;
+                sparse::zero_range(temporary.as_file_mut(), free.offset, free.length)?;
                 saw_target_change = true;
             }
             RecordKind::FreeObjects(range) => {
@@ -391,6 +389,10 @@ pub fn apply_incremental_with_key(
     let begin = begin.ok_or_else(|| anyhow!("incremental stream has no BEGIN record"))?;
     temporary.as_file_mut().set_len(new_size)?;
     temporary.as_file_mut().sync_all()?;
+    // Windows will not replace a destination while this process still has the
+    // original file open without a compatible delete share. Release the base
+    // handle before the atomic tempfile persist.
+    drop(source);
     persist_replace(temporary, target, true)?;
 
     sidecar.logical_size = new_size;
@@ -426,9 +428,9 @@ fn apply_raw_incremental(
         bail!("the extraction sidecar is missing the target raw dnode");
     }
 
-    let source = File::open(target)?;
+    let mut source = File::open(target)?;
     let mut temporary = temporary_for(target)?;
-    io::copy(&mut io::BufReader::new(source), temporary.as_file_mut())?;
+    sparse::copy(&mut source, temporary.as_file_mut())?;
 
     let file = File::open(stream).with_context(|| format!("opening {}", stream.display()))?;
     let mut reader = StreamReader::new(file);
@@ -602,10 +604,7 @@ fn apply_raw_incremental(
                     };
                     let plaintext =
                         decompress_block(write.compression_type, &protected, write.logical_size)?;
-                    temporary
-                        .as_file_mut()
-                        .seek(SeekFrom::Start(write.offset))?;
-                    temporary.as_file_mut().write_all(&plaintext)?;
+                    sparse::write_extent(temporary.as_file_mut(), write.offset, &plaintext)?;
                 }
             }
             RecordKind::Free(free) if current_range.is_some() => {
@@ -613,7 +612,7 @@ fn apply_raw_incremental(
                     free_raw_apply_blocks(dnode, free.offset, free.length)?;
                 }
                 if free.object == sidecar.object_id {
-                    zero_range(temporary.as_file_mut(), free.offset, free.length)?;
+                    sparse::zero_range(temporary.as_file_mut(), free.offset, free.length)?;
                 }
             }
             RecordKind::FreeObjects(range) if current_range.is_some() => {
@@ -669,6 +668,7 @@ fn apply_raw_incremental(
     let begin = begin.ok_or_else(|| anyhow!("incremental stream has no BEGIN record"))?;
     temporary.as_file_mut().set_len(new_size)?;
     temporary.as_file_mut().sync_all()?;
+    drop(source);
     persist_replace(temporary, target, true)?;
 
     raw_state.dnodes = raw_dnodes.into_values().collect();
@@ -801,8 +801,7 @@ fn replay_object(
                     &record.payload,
                     write.logical_size,
                 )?;
-                output.seek(SeekFrom::Start(write.offset))?;
-                output.write_all(&plaintext)?;
+                sparse::write_extent(output, write.offset, &plaintext)?;
             }
             RecordKind::WriteEmbedded(write) if write.object == resolved.object_id => {
                 let plaintext = decode_embedded_write(
@@ -816,7 +815,7 @@ fn replay_object(
             }
             RecordKind::WriteByRef => bail!("deduplicated WRITE_BYREF streams are unsupported"),
             RecordKind::Free(free) if free.object == resolved.object_id => {
-                zero_range(output, free.offset, free.length)?;
+                sparse::zero_range(output, free.offset, free.length)?;
             }
             RecordKind::FreeObjects(range) => {
                 let end = range.first_object.saturating_add(range.object_count);
@@ -900,11 +899,10 @@ fn replay_raw_object(
                 };
                 let plaintext =
                     decompress_block(write.compression_type, &protected, write.logical_size)?;
-                output.seek(SeekFrom::Start(write.offset))?;
-                output.write_all(&plaintext)?;
+                sparse::write_extent(output, write.offset, &plaintext)?;
             }
             RecordKind::Free(free) if free.object == resolved.object_id => {
-                zero_range(output, free.offset, free.length)?;
+                sparse::zero_range(output, free.offset, free.length)?;
             }
             RecordKind::FreeObjects(range) => {
                 let end = range.first_object.saturating_add(range.object_count);
@@ -933,26 +931,6 @@ fn replay_raw_object(
     Ok(())
 }
 
-fn zero_range(file: &mut File, offset: u64, length: u64) -> Result<()> {
-    let current_len = file.metadata()?.len();
-    if offset >= current_len {
-        return Ok(());
-    }
-    if length == u64::MAX {
-        file.set_len(offset)?;
-        return Ok(());
-    }
-    let mut remaining = length.min(current_len - offset);
-    file.seek(SeekFrom::Start(offset))?;
-    let zeros = [0_u8; ZERO_CHUNK_SIZE];
-    while remaining > 0 {
-        let count = usize::try_from(remaining.min(ZERO_CHUNK_SIZE as u64)).unwrap();
-        file.write_all(&zeros[..count])?;
-        remaining -= count as u64;
-    }
-    Ok(())
-}
-
 fn replace_file_extent(file: &mut File, offset: u64, length: u64, payload: &[u8]) -> Result<()> {
     if length > MAX_REPLAY_BLOCK_SIZE {
         bail!("embedded replay block exceeds the 16 MiB safety limit");
@@ -960,16 +938,8 @@ fn replace_file_extent(file: &mut File, offset: u64, length: u64, payload: &[u8]
     if u64::try_from(payload.len()).unwrap_or(u64::MAX) > length {
         bail!("embedded replay payload exceeds its logical block length");
     }
-    file.seek(SeekFrom::Start(offset))?;
-    let zeros = [0_u8; ZERO_CHUNK_SIZE];
-    let mut remaining = length;
-    while remaining != 0 {
-        let count = usize::try_from(remaining.min(ZERO_CHUNK_SIZE as u64)).unwrap();
-        file.write_all(&zeros[..count])?;
-        remaining -= count as u64;
-    }
-    file.seek(SeekFrom::Start(offset))?;
-    file.write_all(payload)?;
+    sparse::zero_range(file, offset, length)?;
+    sparse::write_extent(file, offset, payload)?;
     Ok(())
 }
 
