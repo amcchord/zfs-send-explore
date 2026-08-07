@@ -5,7 +5,7 @@
 The extraction machine does **not** need ZFS, `libzfs`, or a ZFS kernel module. The tool never invokes `zfs` or `zpool`, and pool members are opened read-only.
 
 > [!IMPORTANT]
-> This is an early `0.2.1` implementation. The CLI, Windows UI, sidecar format, and supported on-disk profile may change. Stream fixtures are produced on little-endian OpenZFS systems. Linux validates the core end to end, and CI runs the full test suite and release packaging on native Windows.
+> This is an early `0.3.0` implementation. The CLI, Windows UI, sidecar format, and supported on-disk profile may change. Stream and native-encryption pool fixtures are produced on little-endian OpenZFS systems. Linux validates the core end to end, and CI runs the full test suite and release packaging on native Windows.
 
 Detailed implementation and validation material lives in:
 
@@ -37,7 +37,7 @@ Detailed implementation and validation material lives in:
 | Open a GPT whole-disk image or `\\.\PhysicalDriveN` | Supported when exactly one partition has a supported ZFS vdev label |
 | Preserve sparse holes during extraction and incremental updates | Supported; zero ranges are deallocated when the destination filesystem permits it |
 | Read compressed and embedded blocks from a pool member | LZJB, LZ4, gzip, ZLE, and Zstandard |
-| Extract from a native-encrypted pool dataset | Not yet supported |
+| Extract from a native-encrypted pool dataset | AES-CCM/GCM at 128/192/256 bits with raw, hex, or passphrase keys on little-endian pools |
 | Read RAIDZ/dRAID or pools with several top-level vdevs | Not yet supported |
 
 The tool extracts regular files only. It can list directories and report symlinks, but it does not recreate directory trees, symlinks, ownership, permissions, ACLs, or other filesystem metadata.
@@ -212,6 +212,25 @@ zfs-send-extract pool extract /dev/disk/by-id/example-part1 \
   --output large.bin
 ```
 
+Native-encrypted dataset heads and snapshots use the same commands. Supply a
+key file, or omit it in an interactive terminal to receive a no-echo prompt:
+
+```sh
+zfs-send-extract pool list encrypted-member.img tank/private@backup / \
+  --key-file ./tank-private.key
+zfs-send-extract pool extract encrypted-member.img tank/private@backup \
+  /payload/large.bin --key-file ./tank-private.key --output large.bin
+```
+
+The reader follows `com.datto:crypto_key_obj` through the DSL parent chain, so
+an encrypted child can use its inherited encryption-root key. The same raw,
+hex, and passphrase key-file rules and AES-CCM/GCM suites documented for raw
+sends apply. Wrapped keys, the objset portable MAC, authenticated metadata,
+encrypted dnode bonuses, encrypted file and directory blocks, truncated
+physical checksums, and indirect checksum-of-MAC trees are validated before
+plaintext is used. Key material is zeroized after the operation and never
+written to a sidecar.
+
 The reader scans all four vdev labels, selects the highest active uberblock, validates supported checksums before decompression, walks the MOS and DSL dataset tree, and resolves paths through ZPL ZAP and System Attribute metadata. It does not load the entire member into memory.
 
 Current pool-layout support is intentionally conservative:
@@ -219,7 +238,7 @@ Current pool-layout support is intentionally conservative:
 - one top-level disk or file vdev; or
 - one top-level mirror, using either healthy leaf independently.
 
-A pool containing multiple top-level vdevs needs members from each top-level vdev and is rejected because the CLI currently accepts only one source. RAIDZ/dRAID, special or dedup allocation classes, device-removal mappings, gang blocks, and native-encrypted datasets are also rejected explicitly.
+A pool containing multiple top-level vdevs needs members from each top-level vdev and is rejected because the CLI currently accepts only one source. RAIDZ/dRAID, special or dedup allocation classes, device-removal mappings, and gang blocks are also rejected explicitly. Native-encrypted datasets are supported on little-endian pools; encrypted big-endian pools are rejected explicitly until their byte-swapped authentication path is validated.
 
 Extracting from a named pool snapshot writes the same incremental-compatible `.zfse.json` sidecar used by send extraction. Extracting from a current dataset head is supported, but it intentionally removes or omits the sidecar because a live head is not a valid incremental-send base snapshot.
 
@@ -253,6 +272,9 @@ zfs-send-extract pool inception extract member.img tank/vms@nightly \
   /images/server.vmdk /etc/hostname --volume gpt1 --output hostname
 ```
 
+Add `--key-file ./dataset.key` to any `pool inception` command when its outer
+dataset or snapshot is native-encrypted.
+
 `inspect` reports the container, virtual disk size, partition selectors, byte ranges, filesystem types, labels, and a diagnostic for every unrecognized partition. When exactly one supported volume exists, `--volume` can be omitted; otherwise selection is required so the tool never guesses. `--json` makes inspection scriptable.
 
 For an image embedded after an appliance header or inside a larger sparse file, provide a bounded byte window. Decimal, hexadecimal, and underscore-grouped values are accepted:
@@ -276,7 +298,7 @@ The layer support is deliberately explicit:
 
 ### What the inception release gate validates
 
-The v0.2.1 release gate runs a 63-case cross-product: FAT12, FAT16, FAT32, exFAT, NTFS, ext4, and compatible ext2 are each tested unpartitioned, in MBR, and in GPT; every resulting disk is then tested as raw, sparse QCOW2 v3, and VMDK `monolithicSparse`. Each case detects the layers, lists a real directory, resolves a nested path, extracts through an explicit volume selector, and compares exact bytes.
+The v0.3.0 release gate runs a 63-case cross-product: FAT12, FAT16, FAT32, exFAT, NTFS, ext4, and compatible ext2 are each tested unpartitioned, in MBR, and in GPT; every resulting disk is then tested as raw, sparse QCOW2 v3, and VMDK `monolithicSparse`. Each case detects the layers, lists a real directory, resolves a nested path, extracts through an explicit volume selector, and compares exact bytes.
 
 Focused tests additionally validate resident, non-resident, and sparse NTFS data; a 512-entry NTFS directory index; FAT/exFAT long names, nested paths, and case-insensitive lookup; ext2/ext4 holes; and refusal to follow ext symlinks. Corruption tests cover QCOW1, QCOW2 backing files and encryption, external VMDK descriptors, invalid and backup GPT metadata, out-of-bounds MBR entries, looping EBR chains, unknown filesystems, unsafe paths, multiple-volume selection, and explicit container windows.
 
@@ -308,8 +330,8 @@ The send reader handles `WRITE_EMBEDDED` records emitted by `zfs send -e`, inclu
 The CLI treats stream and pool metadata as untrusted input and fails closed when it encounters an unsupported or inconsistent layout:
 
 - send records and terminal stream checksums are validated, and truncated streams are rejected;
-- raw encrypted keys, block tags, authenticated metadata, spill blocks, and dnode-range tags are verified before decrypted bytes are used;
-- supported pool block checksums are verified before decompression, with alternate DVA copies tried when present;
+- raw-send and native-pool wrapped keys, block tags, authenticated metadata, spill blocks, dnode-range tags, and objset portable MACs are verified before decrypted bytes are used;
+- supported pool block checksums, including the truncated/folded checksums used beside native-encryption MACs, are verified before decompression, with alternate DVA copies tried when present;
 - pool members are never written, imported, or mounted; and
 - extraction and incremental updates are built in a temporary file beside the destination, synchronized, and atomically renamed only after validation completes.
 
@@ -334,9 +356,9 @@ This remains experimental software, not a replacement for maintaining independen
 | `pool inspect <member> [--json]` | Validate a vdev member and summarize its active pool state |
 | `pool datasets <member>` | List reachable filesystem datasets |
 | `pool snapshots <member> [dataset]` | List named snapshots, optionally for one dataset |
-| `pool list <member> <dataset[@snapshot]> [path]` | List one directory from a dataset head or snapshot |
-| `pool extract <member> <dataset[@snapshot]> <path> -o <file> [--force]` | Extract one regular file directly from the member |
-| `pool inception inspect/list/extract ...` | Perform the same nested-image operations directly against an offline pool dataset or snapshot |
+| `pool list <member> <dataset[@snapshot]> [path] [--key-file ...]` | List one directory from a dataset head or snapshot |
+| `pool extract <member> <dataset[@snapshot]> <path> -o <file> [--key-file ...] [--force]` | Extract one regular file directly from the member |
+| `pool inception inspect/list/extract ... [--key-file ...]` | Perform the same nested-image operations directly against an offline pool dataset or snapshot |
 
 Run `zfs-send-extract <command> --help` for complete argument details.
 
@@ -363,7 +385,7 @@ It deliberately rejects:
 
 ## Validation and fixtures
 
-The committed fixtures were produced by OpenZFS 2.3.2 and cover plaintext full and incremental streams, a three-snapshot archive, AES-256-GCM raw encrypted sends, raw incremental and spill records, Zstandard raw blocks, compressed replay records, and embedded-data records. Automated tests exercise stream inspection, snapshot selection, directory listing, extraction, key rejection, authentication failure, plaintext and raw incremental updates, positioned block reads, codec handling, and checksum-corruption rejection.
+The committed send fixtures were produced by OpenZFS 2.3.2 and cover plaintext full and incremental streams, a three-snapshot archive, AES-256-GCM raw encrypted sends, raw incremental and spill records, Zstandard raw blocks, compressed replay records, and embedded-data records. A separately licensed OpenZFS 2.2.2 fixture adds a real AES-256-GCM passphrase-encrypted pool image. Automated tests exercise stream inspection, snapshot selection, directory listing, extraction, missing/wrong-key rejection, authentication failure, native-pool objset/dnode/block authentication, plaintext and raw incremental updates, positioned block reads, codec handling, and checksum-corruption rejection. Native-pool fixture provenance and hashes are recorded in [`tests/fixtures/native-encrypted-pool.README.md`](tests/fixtures/native-encrypted-pool.README.md).
 
 Inception mode additionally has a 63-case matrix spanning FAT12/16/32, exFAT, NTFS, ext4, and compatible ext2 across unpartitioned, MBR, and GPT layouts in raw, sparse QCOW2, and `monolithicSparse` VMDK containers. The real-volume fixture loader verifies compressed and raw SHA-256 values; focused tests cover sparse files, long and nested names, case-insensitive lookup, ext holes and symlinks, offsets, volume selection, corrupt partition metadata, and unsupported container profiles.
 
@@ -372,6 +394,7 @@ The larger Linux lab scenarios have validated:
 - extraction and incremental update of a 20+ MiB file from a dataset containing other files;
 - selection and reconstruction of three snapshot versions;
 - authenticated extraction of a 20 MiB file from a raw encrypted send;
+- authenticated directory listing and byte-exact extraction from a real native-encrypted pool dataset;
 - authenticated application and chain reconstruction of a Zstandard-compressed raw incremental containing an SA spill block;
 - extraction and incremental update from `zfs send -c -e`, including ordinary Zstandard writes and embedded data;
 - direct extraction from a 6 GiB exported file vdev;
@@ -407,6 +430,9 @@ scripts/verify-pool-member.sh \
   expected-s1-sha256 \
   .artifacts/pool-member
 ```
+
+For a native-encrypted pool snapshot, pass its key file as the final
+`verify-pool-member.sh` argument after the output directory.
 
 ## Implementation notes
 

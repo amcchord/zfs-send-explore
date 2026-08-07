@@ -5,14 +5,19 @@
 //! a multi-terabyte member is never buffered in full.
 
 use crate::compression::decompress_block;
+use crate::encrypted::{
+    DatasetKey, EncryptionParams, is_encrypted_object_type, pool_block_pointer_auth,
+};
 use crate::filesystem::DirectoryEntry;
 use crate::inception::ImageRead;
-use crate::operations::{SIDECAR_VERSION, Sidecar, guid_string, save_sidecar, sidecar_path};
+use crate::operations::{
+    EncryptionRequirement, SIDECAR_VERSION, Sidecar, guid_string, save_sidecar, sidecar_path,
+};
 use crate::sparse;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, VecDeque};
+use sha2::{Digest, Sha256, Sha512};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -21,7 +26,7 @@ use zfs_core::{
     BLKPTR_SIZE, Blkptr, ChecksumType, DMU_OST_META, DMU_OST_ZFS, DNODE_SIZE, Dnode, Endian,
     LABEL_SIZE, MAX_BLOCK_SIZE, MAX_INDIRECT_LEVELS, ObjsetPhys, Reader, SaLayouts, SaRegistry,
     VdevLabel, ZPL_DIRENT_OBJ_MASK, decode_sa_bonus, decode_znode_phys, label_offsets,
-    parse_sa_layouts, parse_sa_registry, zap_list, zap_lookup,
+    parse_sa_layouts, parse_sa_registry, zap_list, zap_list_arrays, zap_lookup,
 };
 
 const MAX_DATASETS: usize = 16_384;
@@ -30,6 +35,10 @@ const MAX_ZAP_BYTES: usize = 64 * 1024 * 1024;
 const DMU_OT_ZNODE: u8 = 17;
 const DMU_OT_SA: u8 = 44;
 const ZPL_MASTER_NODE_OBJ: u64 = 1;
+const DD_FIELD_CRYPTO_KEY_OBJ: &str = "com.datto:crypto_key_obj";
+const MAX_DSL_PARENT_WALK: usize = 64;
+const DMU_OT_DNODE: u8 = 10;
+const DMU_OT_OBJSET: u8 = 11;
 
 /// Summary of the selected pool member and the state rooted at its active
 /// uberblock.
@@ -382,6 +391,105 @@ fn device_length(_file: &File) -> Result<u64> {
     bail!("platform has no block-device length control")
 }
 
+#[derive(Debug, Clone)]
+struct PoolBlockPointer {
+    pointer: Blkptr,
+    raw: [u8; BLKPTR_SIZE],
+    endian: Endian,
+}
+
+impl PoolBlockPointer {
+    fn parse(raw: &[u8], endian: Endian) -> Result<Self> {
+        let bytes: [u8; BLKPTR_SIZE] = raw
+            .get(..BLKPTR_SIZE)
+            .ok_or_else(|| anyhow!("truncated on-disk block pointer"))?
+            .try_into()
+            .unwrap();
+        let pointer = parse_blkptr(&bytes, endian);
+        Ok(Self {
+            pointer,
+            raw: bytes,
+            endian,
+        })
+    }
+
+    fn uses_crypt(&self) -> bool {
+        blkptr_uses_crypt(&self.raw, self.endian)
+    }
+
+    fn raw(&self) -> &[u8; BLKPTR_SIZE] {
+        &self.raw
+    }
+}
+
+impl std::ops::Deref for PoolBlockPointer {
+    type Target = Blkptr;
+
+    fn deref(&self) -> &Self::Target {
+        &self.pointer
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PoolDnode {
+    dnode: Dnode,
+    pointers: Vec<PoolBlockPointer>,
+}
+
+impl PoolDnode {
+    fn parse(raw: &[u8], endian: Endian) -> Result<Self> {
+        let mut dnode =
+            Dnode::parse(raw, endian).ok_or_else(|| anyhow!("on-disk dnode is truncated"))?;
+        let mut pointers = Vec::with_capacity(dnode.blkptrs.len());
+        for index in 0..dnode.blkptrs.len() {
+            let offset = 64 + index * BLKPTR_SIZE;
+            let pointer = PoolBlockPointer::parse(
+                raw.get(offset..offset + BLKPTR_SIZE)
+                    .ok_or_else(|| anyhow!("dnode block pointer {index} is truncated"))?,
+                endian,
+            )?;
+            dnode.blkptrs[index] = pointer.pointer;
+            pointers.push(pointer);
+        }
+        Ok(Self { dnode, pointers })
+    }
+
+    fn blkptr(&self, index: usize) -> Option<&PoolBlockPointer> {
+        self.pointers.get(index)
+    }
+}
+
+impl std::ops::Deref for PoolDnode {
+    type Target = Dnode;
+
+    fn deref(&self) -> &Self::Target {
+        &self.dnode
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PoolObjset {
+    objset: ObjsetPhys,
+    meta_dnode: PoolDnode,
+}
+
+impl PoolObjset {
+    fn parse(raw: &[u8], endian: Endian) -> Result<Self> {
+        Ok(Self {
+            objset: ObjsetPhys::parse(raw, endian)?,
+            meta_dnode: PoolDnode::parse(raw, endian)?,
+        })
+    }
+}
+
+impl std::ops::Deref for PoolObjset {
+    type Target = ObjsetPhys;
+
+    fn deref(&self) -> &Self::Target {
+        &self.objset
+    }
+}
+
 /// An opened offline vdev member. All methods are read-only with respect to the
 /// source; extraction writes only to the explicitly selected destination.
 pub struct PoolMember {
@@ -393,7 +501,7 @@ pub struct PoolMember {
     top_level_vdevs: u64,
     txg: u64,
     endian: Endian,
-    mos: ObjsetPhys,
+    mos: PoolObjset,
 }
 
 /// A regular ZPL file exposed as a bounded positioned reader. This is the
@@ -402,6 +510,7 @@ pub struct PoolMember {
 pub(crate) struct PoolImageFile {
     member: PoolMember,
     resolved: ResolvedPoolPath,
+    key: Option<DatasetKey>,
 }
 
 impl PoolMember {
@@ -520,7 +629,7 @@ impl PoolMember {
             )
         })?;
         let mos =
-            ObjsetPhys::parse(&mos_block, uberblock.endian).context("decoding the MOS objset")?;
+            PoolObjset::parse(&mos_block, uberblock.endian).context("decoding the MOS objset")?;
         if mos.os_type != DMU_OST_META {
             bail!(
                 "active uberblock resolved objset type {}, not the MOS type {DMU_OST_META}",
@@ -642,18 +751,27 @@ impl PoolMember {
     }
 
     pub fn list_directory(&self, selector: &str, path: &str) -> Result<Vec<DirectoryEntry>> {
-        let view = self.dataset_view(selector)?;
+        self.list_directory_with_key(selector, path, None)
+    }
+
+    pub fn list_directory_with_key(
+        &self,
+        selector: &str,
+        path: &str,
+        key_material: Option<&[u8]>,
+    ) -> Result<Vec<DirectoryEntry>> {
+        let view = self.dataset_view(selector, key_material)?;
         let resolved = self.resolve_path(&view, path)?;
         if resolved.dirent_type != 4 {
             bail!("{} is not a directory", resolved.normalized_path);
         }
-        let directory = self.read_zap_object(&resolved.dnode)?;
+        let directory = self.read_zap_object_with_key(&resolved.dnode, view.key.as_ref())?;
         let mut entries = zap_list(&directory)
             .into_iter()
             .map(|(name, raw)| {
                 let object_id = raw & ZPL_DIRENT_OBJ_MASK;
                 let logical_size = self
-                    .mos_dnode(&view.zpl, object_id)
+                    .dnode_with_key(&view.zpl, object_id, view.key.as_ref())
                     .ok()
                     .flatten()
                     .and_then(|dnode| attrs(&dnode, &view.registry, &view.layouts))
@@ -670,8 +788,13 @@ impl PoolMember {
         Ok(entries)
     }
 
-    pub(crate) fn into_image_file(self, selector: &str, path: &str) -> Result<PoolImageFile> {
-        let view = self.dataset_view(selector)?;
+    pub(crate) fn into_image_file_with_key(
+        self,
+        selector: &str,
+        path: &str,
+        key_material: Option<&[u8]>,
+    ) -> Result<PoolImageFile> {
+        let view = self.dataset_view(selector, key_material)?;
         let resolved = self.resolve_path(&view, path)?;
         if resolved.dirent_type != 8 {
             bail!("{} is not a regular file", resolved.normalized_path);
@@ -679,6 +802,7 @@ impl PoolMember {
         Ok(PoolImageFile {
             member: self,
             resolved,
+            key: view.key,
         })
     }
 
@@ -692,7 +816,18 @@ impl PoolMember {
         output: &Path,
         force: bool,
     ) -> Result<PoolExtraction> {
-        let view = self.dataset_view(selector)?;
+        self.extract_with_key(selector, path, output, force, None)
+    }
+
+    pub fn extract_with_key(
+        &self,
+        selector: &str,
+        path: &str,
+        output: &Path,
+        force: bool,
+        key_material: Option<&[u8]>,
+    ) -> Result<PoolExtraction> {
+        let view = self.dataset_view(selector, key_material)?;
         let resolved = self.resolve_path(&view, path)?;
         if resolved.dirent_type != 8 {
             bail!("{} is not a regular file", resolved.normalized_path);
@@ -707,7 +842,12 @@ impl PoolMember {
         let mut temporary = temporary_for(output)?;
         sparse::prepare(temporary.as_file())?;
         let mut digest = Sha256::new();
-        self.write_file(&resolved, temporary.as_file_mut(), &mut digest)?;
+        self.write_file(
+            &resolved,
+            temporary.as_file_mut(),
+            &mut digest,
+            view.key.as_ref(),
+        )?;
         temporary.as_file_mut().set_len(resolved.logical_size)?;
         temporary.as_file_mut().sync_all()?;
         persist_replace(temporary, output, force)?;
@@ -798,7 +938,78 @@ impl PoolMember {
         Ok(snapshots)
     }
 
-    fn dataset_view(&self, selector: &str) -> Result<DatasetView> {
+    pub fn encryption_requirement(&self, selector: &str) -> Result<Option<EncryptionRequirement>> {
+        let (dataset, dataset_object, _) = self.select_dataset(selector)?;
+        let dataset_dnode = self
+            .mos_dnode(&self.mos, dataset_object)?
+            .ok_or_else(|| anyhow!("DSL dataset object {dataset_object} is absent"))?;
+        let dataset_pointer_raw = dataset_dnode
+            .bonus
+            .get(128..256)
+            .ok_or_else(|| anyhow!("DSL dataset object {dataset_object} has a truncated ds_bp"))?;
+        if !blkptr_uses_crypt(dataset_pointer_raw, dataset_dnode.endian) {
+            return Ok(None);
+        }
+        let params = self.encryption_params(dataset.dsl_dir_object)?;
+        Ok(Some(EncryptionRequirement {
+            dataset_name: dataset.name,
+            key_format: params.key_format_name()?.to_owned(),
+        }))
+    }
+
+    fn encryption_params(&self, dsl_dir_object: u64) -> Result<EncryptionParams> {
+        let mut current = dsl_dir_object;
+        let mut seen = BTreeSet::new();
+        let mut crypto_object = None;
+        for _ in 0..MAX_DSL_PARENT_WALK {
+            if current == 0 || !seen.insert(current) {
+                break;
+            }
+            let directory = self
+                .mos_dnode(&self.mos, current)?
+                .ok_or_else(|| anyhow!("DSL directory object {current} is absent"))?;
+            let data = self.read_zap_object(&directory)?;
+            if let Some(object) = zap_lookup(&data, DD_FIELD_CRYPTO_KEY_OBJ)
+                && object != 0
+            {
+                crypto_object = Some(object);
+                break;
+            }
+            current = Reader::new(directory.endian).u64(&directory.bonus, 0);
+        }
+        let crypto_object = crypto_object.ok_or_else(|| {
+            anyhow!(
+                "encrypted dataset has no {DD_FIELD_CRYPTO_KEY_OBJ:?} entry in its DSL parent chain"
+            )
+        })?;
+        let crypto_dnode = self
+            .mos_dnode(&self.mos, crypto_object)?
+            .ok_or_else(|| anyhow!("DSL crypto-key object {crypto_object} is absent"))?;
+        let data = self.read_zap_object(&crypto_dnode)?;
+        let fat_zap = Reader::new(crypto_dnode.endian).u64(&data, 0) == ((1_u64 << 63) | 1);
+        let integers = [
+            "DSL_CRYPTO_SUITE",
+            "DSL_CRYPTO_GUID",
+            "DSL_CRYPTO_VERSION",
+            "keyformat",
+            "pbkdf2iters",
+            "pbkdf2salt",
+        ];
+        let mut values = BTreeMap::new();
+        for (name, mut value) in zap_list_arrays(&data) {
+            if fat_zap && integers.contains(&name.as_str()) {
+                let bytes: [u8; 8] = value
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow!("DSL crypto-key ZAP {name} is not a uint64"))?;
+                value = u64::from_be_bytes(bytes).to_le_bytes().to_vec();
+            }
+            values.insert(name, value);
+        }
+        EncryptionParams::from_pool_zap(&values)
+    }
+
+    fn select_dataset(&self, selector: &str) -> Result<(DatasetInfo, u64, Option<u64>)> {
         let (dataset_name, snapshot_name) = selector
             .split_once('@')
             .map_or((selector, None), |(dataset, snapshot)| {
@@ -841,6 +1052,11 @@ impl PoolMember {
         } else {
             (dataset.head_dataset_object, None)
         };
+        Ok((dataset, dataset_object, snapshot_guid))
+    }
+
+    fn dataset_view(&self, selector: &str, key_material: Option<&[u8]>) -> Result<DatasetView> {
+        let (dataset, dataset_object, snapshot_guid) = self.select_dataset(selector)?;
 
         let dataset_dnode = self
             .mos_dnode(&self.mos, dataset_object)?
@@ -849,60 +1065,84 @@ impl PoolMember {
             .bonus
             .get(128..256)
             .ok_or_else(|| anyhow!("DSL dataset object {dataset_object} has a truncated ds_bp"))?;
-        if blkptr_uses_crypt(dataset_pointer_raw, dataset_dnode.endian) {
-            bail!(
-                "{selector} uses native ZFS dataset encryption; encrypted pool-member extraction is not supported yet (raw encrypted send extraction is supported)"
-            );
-        }
-        let dataset_pointer = parse_blkptr(dataset_pointer_raw, dataset_dnode.endian);
-        let objset_block = read_block_from(&self.source, 0, &dataset_pointer)
+        let encrypted = blkptr_uses_crypt(dataset_pointer_raw, dataset_dnode.endian);
+        let key = if encrypted {
+            if dataset_dnode.endian != Endian::Little {
+                bail!("native-encrypted big-endian pool datasets are not supported yet");
+            }
+            let params = self.encryption_params(dataset.dsl_dir_object)?;
+            let material = key_material.ok_or_else(|| {
+                anyhow!(
+                    "{selector} uses native ZFS dataset encryption; provide its {} key",
+                    params.key_format_name().unwrap_or("supported")
+                )
+            })?;
+            Some(params.unlock(material)?)
+        } else {
+            if key_material.is_some() {
+                bail!("a ZFS key was supplied for unencrypted dataset {selector}");
+            }
+            None
+        };
+        let dataset_pointer = PoolBlockPointer::parse(dataset_pointer_raw, dataset_dnode.endian)?;
+        let objset_block = read_pool_block_from(&self.source, 0, &dataset_pointer, key.as_ref())
             .with_context(|| format!("reading objset for {selector}"))?;
-        let zpl = ObjsetPhys::parse(&objset_block, dataset_dnode.endian)
+        if let Some(key) = key.as_ref() {
+            verify_objset_mac(&objset_block, dataset_dnode.endian, key)
+                .with_context(|| format!("authenticating objset for {selector}"))?;
+        }
+        let zpl = PoolObjset::parse(&objset_block, dataset_dnode.endian)
             .with_context(|| format!("decoding ZPL objset for {selector}"))?;
         if zpl.os_type != DMU_OST_ZFS {
             bail!(
-                "{selector} resolves objset type {}, not a ZFS filesystem ({DMU_OST_ZFS}); encrypted datasets and volumes are outside the first pool-member profile",
+                "{selector} resolves objset type {}, not a ZFS filesystem ({DMU_OST_ZFS}); volumes are not browseable as file trees",
                 zpl.os_type
             );
         }
 
         let master = self
-            .mos_dnode(&zpl, ZPL_MASTER_NODE_OBJ)?
+            .dnode_with_key(&zpl, ZPL_MASTER_NODE_OBJ, key.as_ref())?
             .ok_or_else(|| anyhow!("ZPL master node is absent for {selector}"))?;
-        let master_data = self.read_zap_object(&master)?;
+        let master_data = self.read_zap_object_with_key(&master, key.as_ref())?;
         let root_id = zap_lookup(&master_data, "ROOT")
             .ok_or_else(|| anyhow!("ZPL master node for {selector} has no ROOT entry"))?;
-        let (registry, layouts) = self.sa_context(&zpl, &master_data)?;
+        let (registry, layouts) = self.sa_context(&zpl, &master_data, key.as_ref())?;
         Ok(DatasetView {
             zpl,
             registry,
             layouts,
             root_id,
             snapshot_guid,
+            key,
         })
     }
 
-    fn sa_context(&self, zpl: &ObjsetPhys, master_data: &[u8]) -> Result<(SaRegistry, SaLayouts)> {
+    fn sa_context(
+        &self,
+        zpl: &PoolObjset,
+        master_data: &[u8],
+        key: Option<&DatasetKey>,
+    ) -> Result<(SaRegistry, SaLayouts)> {
         let Some(sa_master_object) = zap_lookup(master_data, "SA_ATTRS") else {
             return Ok((SaRegistry::default(), SaLayouts::default()));
         };
         let sa_master = self
-            .mos_dnode(zpl, sa_master_object)?
+            .dnode_with_key(zpl, sa_master_object, key)?
             .ok_or_else(|| anyhow!("SA master object {sa_master_object} is absent"))?;
-        let sa_master = self.read_zap_object(&sa_master)?;
+        let sa_master = self.read_zap_object_with_key(&sa_master, key)?;
         let registry_object = zap_lookup(&sa_master, "REGISTRY")
             .ok_or_else(|| anyhow!("SA master object has no REGISTRY entry"))?;
         let layouts_object = zap_lookup(&sa_master, "LAYOUTS")
             .ok_or_else(|| anyhow!("SA master object has no LAYOUTS entry"))?;
         let registry = self
-            .mos_dnode(zpl, registry_object)?
+            .dnode_with_key(zpl, registry_object, key)?
             .ok_or_else(|| anyhow!("SA registry object {registry_object} is absent"))?;
         let layouts = self
-            .mos_dnode(zpl, layouts_object)?
+            .dnode_with_key(zpl, layouts_object, key)?
             .ok_or_else(|| anyhow!("SA layouts object {layouts_object} is absent"))?;
         Ok((
-            parse_sa_registry(&self.read_zap_object(&registry)?),
-            parse_sa_layouts(&self.read_zap_object(&layouts)?),
+            parse_sa_registry(&self.read_zap_object_with_key(&registry, key)?),
+            parse_sa_layouts(&self.read_zap_object_with_key(&layouts, key)?),
         ))
     }
 
@@ -915,9 +1155,9 @@ impl PoolMember {
                 bail!("path component {component:?} follows a non-directory object");
             }
             let directory = self
-                .mos_dnode(&view.zpl, current)?
+                .dnode_with_key(&view.zpl, current, view.key.as_ref())?
                 .ok_or_else(|| anyhow!("directory object {current} is absent"))?;
-            let directory = self.read_zap_object(&directory)?;
+            let directory = self.read_zap_object_with_key(&directory, view.key.as_ref())?;
             let raw = zap_list(&directory)
                 .into_iter()
                 .find(|(name, _)| name == component)
@@ -927,7 +1167,7 @@ impl PoolMember {
             dirent_type = (raw >> 60) as u8;
         }
         let dnode = self
-            .mos_dnode(&view.zpl, current)?
+            .dnode_with_key(&view.zpl, current, view.key.as_ref())?
             .ok_or_else(|| anyhow!("object {current} for path {normalized:?} is absent"))?;
         let logical_size = attrs(&dnode, &view.registry, &view.layouts)
             .ok_or_else(|| anyhow!("could not decode ZPL metadata for object {current}"))?
@@ -946,6 +1186,7 @@ impl PoolMember {
         resolved: &ResolvedPoolPath,
         output: &mut File,
         digest: &mut Sha256,
+        key: Option<&DatasetKey>,
     ) -> Result<()> {
         if resolved.logical_size == 0 {
             return Ok(());
@@ -969,7 +1210,7 @@ impl PoolMember {
         let mut remaining = resolved.logical_size;
         for block_id in 0..blocks {
             let block = self
-                .read_dnode_data(&resolved.dnode, block_id)
+                .read_dnode_data_with_key(&resolved.dnode, block_id, key)
                 .with_context(|| {
                     format!(
                         "reading file object {} block {block_id}",
@@ -987,7 +1228,16 @@ impl PoolMember {
         Ok(())
     }
 
-    fn mos_dnode(&self, objset: &ObjsetPhys, object_id: u64) -> Result<Option<Dnode>> {
+    fn mos_dnode(&self, objset: &PoolObjset, object_id: u64) -> Result<Option<PoolDnode>> {
+        self.dnode_with_key(objset, object_id, None)
+    }
+
+    fn dnode_with_key(
+        &self,
+        objset: &PoolObjset,
+        object_id: u64,
+        key: Option<&DatasetKey>,
+    ) -> Result<Option<PoolDnode>> {
         let meta = &objset.meta_dnode;
         let data_block_size = meta.data_block_size();
         if data_block_size < DNODE_SIZE {
@@ -1001,26 +1251,24 @@ impl PoolMember {
         let within = usize::try_from(object_id % per_block)
             .unwrap_or(usize::MAX)
             .saturating_mul(DNODE_SIZE);
-        let block = self.read_dnode_data(meta, block_id)?;
+        let block = self.read_dnode_data_with_key(meta, block_id, key)?;
         let raw = block.get(within..).ok_or_else(|| {
             anyhow!("dnode object {object_id} starts outside its meta-dnode block")
         })?;
-        let mut dnode = Dnode::parse(raw, objset.endian)
-            .ok_or_else(|| anyhow!("dnode object {object_id} is truncated"))?;
-        // zfs-forensic-core 0.1.1 skips the wrong reserved word when gathering
-        // an embedded BP payload. Correct it while the original dnode bytes are
-        // still available. This can be dropped when the dependency releases its
-        // upstream fix.
-        for (index, pointer) in dnode.blkptrs.iter_mut().enumerate() {
-            let offset = 64 + index * BLKPTR_SIZE;
-            if let Some(bytes) = raw.get(offset..offset + BLKPTR_SIZE) {
-                correct_embedded_payload(pointer, bytes, objset.endian);
-            }
-        }
+        let dnode = PoolDnode::parse(raw, objset.endian)
+            .with_context(|| format!("decoding dnode object {object_id}"))?;
         Ok((dnode.dn_type != 0).then_some(dnode))
     }
 
-    fn read_zap_object(&self, dnode: &Dnode) -> Result<Vec<u8>> {
+    fn read_zap_object(&self, dnode: &PoolDnode) -> Result<Vec<u8>> {
+        self.read_zap_object_with_key(dnode, None)
+    }
+
+    fn read_zap_object_with_key(
+        &self,
+        dnode: &PoolDnode,
+        key: Option<&DatasetKey>,
+    ) -> Result<Vec<u8>> {
         let block_size = dnode.data_block_size();
         if block_size == 0 {
             bail!("ZAP object has a zero block size");
@@ -1034,12 +1282,17 @@ impl PoolMember {
         }
         let mut data = Vec::with_capacity(requested.saturating_mul(block_size));
         for block_id in 0..requested {
-            data.extend_from_slice(&self.read_dnode_data(dnode, block_id as u64)?);
+            data.extend_from_slice(&self.read_dnode_data_with_key(dnode, block_id as u64, key)?);
         }
         Ok(data)
     }
 
-    fn read_dnode_data(&self, dnode: &Dnode, block_id: u64) -> Result<Vec<u8>> {
+    fn read_dnode_data_with_key(
+        &self,
+        dnode: &PoolDnode,
+        block_id: u64,
+        key: Option<&DatasetKey>,
+    ) -> Result<Vec<u8>> {
         if dnode.dn_nlevels == 0 || dnode.dn_nlevels > MAX_INDIRECT_LEVELS {
             bail!(
                 "unsupported dnode indirection level {} (supported 1..={MAX_INDIRECT_LEVELS})",
@@ -1060,7 +1313,7 @@ impl PoolMember {
         let top_level = dnode.dn_nlevels - 1;
         let top_shift = u32::from(top_level) * shift;
         let top_index = usize::try_from(block_id >> top_shift).unwrap_or(usize::MAX);
-        let mut pointer = *dnode.blkptr(top_index).ok_or_else(|| {
+        let mut pointer = dnode.blkptr(top_index).cloned().ok_or_else(|| {
             anyhow!("logical block {block_id} selects absent top block pointer {top_index}")
         })?;
         let mut level = top_level;
@@ -1068,7 +1321,7 @@ impl PoolMember {
             if pointer.is_hole() {
                 return Ok(vec![0; dnode.data_block_size()]);
             }
-            let block = read_block_from(&self.source, 0, &pointer)?;
+            let block = read_pool_block_from(&self.source, 0, &pointer, key)?;
             level -= 1;
             let index_shift = u32::from(level) * shift;
             let child_index =
@@ -1078,12 +1331,12 @@ impl PoolMember {
             let child = block
                 .get(offset..offset.saturating_add(BLKPTR_SIZE))
                 .ok_or_else(|| anyhow!("indirect child pointer {child_index} is truncated"))?;
-            pointer = parse_blkptr(child, dnode.endian);
+            pointer = PoolBlockPointer::parse(child, dnode.endian)?;
         }
         if pointer.is_hole() {
             return Ok(vec![0; dnode.data_block_size()]);
         }
-        read_block_from(&self.source, 0, &pointer)
+        read_pool_block_from(&self.source, 0, &pointer, key)
     }
 }
 
@@ -1119,8 +1372,11 @@ impl ImageRead for PoolImageFile {
             let block = if block_id > self.resolved.dnode.dn_maxblkid {
                 Vec::new()
             } else {
-                self.member
-                    .read_dnode_data(&self.resolved.dnode, block_id)?
+                self.member.read_dnode_data_with_key(
+                    &self.resolved.dnode,
+                    block_id,
+                    self.key.as_ref(),
+                )?
             };
             let present = block.len().saturating_sub(within).min(wanted);
             if present != 0 {
@@ -1192,11 +1448,12 @@ fn correct_embedded_payload(pointer: &mut Blkptr, raw: &[u8], endian: Endian) {
 }
 
 struct DatasetView {
-    zpl: ObjsetPhys,
+    zpl: PoolObjset,
     registry: SaRegistry,
     layouts: SaLayouts,
     root_id: u64,
     snapshot_guid: Option<u64>,
+    key: Option<DatasetKey>,
 }
 
 struct ResolvedPoolPath {
@@ -1204,7 +1461,7 @@ struct ResolvedPoolPath {
     object_id: u64,
     dirent_type: u8,
     logical_size: u64,
-    dnode: Dnode,
+    dnode: PoolDnode,
 }
 
 fn read_block_from(source: &dyn ReadAt, expected_vdev: u32, pointer: &Blkptr) -> Result<Vec<u8>> {
@@ -1279,6 +1536,194 @@ fn read_block_from(source: &dyn ReadAt, expected_vdev: u32, pointer: &Blkptr) ->
         }
     }
     bail!("no readable copy of block pointer: {}", errors.join("; "))
+}
+
+fn read_pool_block_from(
+    source: &dyn ReadAt,
+    expected_vdev: u32,
+    pointer: &PoolBlockPointer,
+    key: Option<&DatasetKey>,
+) -> Result<Vec<u8>> {
+    if !pointer.uses_crypt() {
+        return read_block_from(source, expected_vdev, &pointer.pointer);
+    }
+    let key = key.ok_or_else(|| anyhow!("native-encrypted ZFS block requires a dataset key"))?;
+    let logical_size = pointer.lsize_bytes();
+    let physical_size = pointer.psize_bytes();
+    if logical_size == 0 || logical_size > MAX_BLOCK_SIZE {
+        bail!("encrypted block logical size {logical_size} is outside the safety limit");
+    }
+    if physical_size == 0 || physical_size > MAX_BLOCK_SIZE {
+        bail!("encrypted block physical size {physical_size} is outside the safety limit");
+    }
+    if pointer.embedded || pointer.is_hole() {
+        bail!("native-encrypted block pointer has an invalid embedded/hole layout");
+    }
+    let checksum = ChecksumType::from_raw(pointer.checksum);
+    if matches!(
+        checksum,
+        ChecksumType::Inherit
+            | ChecksumType::On
+            | ChecksumType::Other(_)
+            | ChecksumType::Label
+            | ChecksumType::GangHeader
+            | ChecksumType::Zilog
+    ) {
+        bail!("unsupported on-disk checksum function {}", pointer.checksum);
+    }
+
+    let body_encrypted =
+        pointer.level == 0 && is_encrypted_object_type(u32::from(pointer.object_type));
+    let raw_pointer = pointer.raw();
+    let mut errors = Vec::new();
+    let copies = if body_encrypted { 2 } else { 3 };
+    for (copy, dva) in pointer.dvas.iter().take(copies).enumerate() {
+        if dva.is_empty() {
+            continue;
+        }
+        if dva.vdev != expected_vdev {
+            errors.push(format!(
+                "DVA[{copy}] addresses unavailable top-level vdev {}",
+                dva.vdev
+            ));
+            continue;
+        }
+        if dva.gang {
+            errors.push(format!("DVA[{copy}] is an unsupported gang block"));
+            continue;
+        }
+        let offset = dva.physical_byte_offset();
+        let mut raw = vec![0_u8; physical_size];
+        if let Err(error) = source.read_exact_at(offset, &mut raw) {
+            errors.push(format!("DVA[{copy}] at {offset}: {error}"));
+            continue;
+        }
+        let mut physical_checksum = match checksum {
+            ChecksumType::Off => None,
+            ChecksumType::Fletcher2 => Some(zfs_core::checksum::fletcher2(&raw, pointer.byteorder)),
+            ChecksumType::Fletcher4 => Some(zfs_core::checksum::fletcher4(&raw, pointer.byteorder)),
+            ChecksumType::Sha256 => Some(zfs_core::checksum::sha256(&raw)),
+            _ => unreachable!("unsupported checksums were rejected above"),
+        };
+        if matches!(checksum, ChecksumType::Fletcher2 | ChecksumType::Fletcher4)
+            && pointer.object_type != DMU_OT_OBJSET
+            && let Some(computed) = physical_checksum.as_mut()
+        {
+            // Weak checksums do not distribute entropy evenly. OpenZFS folds
+            // the discarded half into the retained 128 bits before replacing
+            // words 2 and 3 with the encryption/authentication MAC.
+            computed[0] ^= computed[2];
+            computed[1] ^= computed[3];
+        }
+        if physical_checksum.is_some_and(|computed| {
+            if pointer.object_type == DMU_OT_OBJSET {
+                computed != pointer.checksum_words
+            } else {
+                computed[..2] != pointer.checksum_words[..2]
+            }
+        }) {
+            errors.push(format!("DVA[{copy}] at {offset}: checksum mismatch"));
+            continue;
+        }
+
+        let protected = if body_encrypted {
+            let (salt, iv, mac) = pool_crypt_params(raw_pointer)?;
+            if pointer.object_type == DMU_OT_DNODE {
+                key.decrypt_pool_dnode_block(&salt, &iv, &mac, &raw)
+            } else {
+                key.decrypt_block(&salt, &iv, &mac, &[], &raw)
+            }
+        } else if pointer.level == 0 && pointer.object_type != DMU_OT_OBJSET {
+            let mac: [u8; 16] = raw_pointer[112..128].try_into().unwrap();
+            key.authenticate_block(&raw, &mac)
+                .context("authenticating native-encrypted ZFS metadata")
+                .map(|()| raw)
+        } else {
+            Ok(raw)
+        };
+        let protected = match protected {
+            Ok(data) => data,
+            Err(error) => {
+                errors.push(format!("DVA[{copy}] at {offset}: {error:#}"));
+                continue;
+            }
+        };
+        let decoded = match decompress_block(pointer.compression, &protected, logical_size as u64) {
+            Ok(data) => data,
+            Err(error) => {
+                errors.push(format!("DVA[{copy}] at {offset}: {error}"));
+                continue;
+            }
+        };
+        if pointer.level > 0 {
+            let digest = indirect_mac(&decoded, key.crypto_version())?;
+            if digest != raw_pointer[112..128] {
+                errors.push(format!("DVA[{copy}] at {offset}: indirect MAC mismatch"));
+                continue;
+            }
+        }
+        return Ok(decoded);
+    }
+    bail!(
+        "no readable copy of native-encrypted block pointer: {}",
+        errors.join("; ")
+    )
+}
+
+fn pool_crypt_params(raw: &[u8; BLKPTR_SIZE]) -> Result<([u8; 8], [u8; 12], [u8; 16])> {
+    let salt = raw[32..40].try_into().unwrap();
+    let mut iv = [0_u8; 12];
+    iv[..8].copy_from_slice(&raw[40..48]);
+    iv[8..].copy_from_slice(&raw[92..96]);
+    let mac = raw[112..128].try_into().unwrap();
+    Ok((salt, iv, mac))
+}
+
+fn indirect_mac(block: &[u8], crypto_version: u64) -> Result<[u8; 16]> {
+    if !block.len().is_multiple_of(BLKPTR_SIZE) {
+        bail!("encrypted indirect block is not a block-pointer array");
+    }
+    let mut digest = Sha512::new();
+    for pointer in block.chunks_exact(BLKPTR_SIZE) {
+        digest.update(pool_block_pointer_auth(pointer, crypto_version)?);
+    }
+    let digest = digest.finalize();
+    Ok(digest[..16].try_into().unwrap())
+}
+
+fn verify_objset_mac(raw: &[u8], endian: Endian, key: &DatasetKey) -> Result<()> {
+    if endian != Endian::Little {
+        bail!("native-encrypted big-endian objset authentication is unsupported");
+    }
+    if raw.len() < 752 {
+        bail!("encrypted objset is too short to contain its portable MAC");
+    }
+    let pointer_count = usize::from(raw[3]);
+    let pointer_end = 64usize
+        .checked_add(pointer_count.saturating_mul(BLKPTR_SIZE))
+        .filter(|end| *end <= 512)
+        .ok_or_else(|| anyhow!("encrypted objset meta-dnode has invalid block pointers"))?;
+    let mut authenticated = Vec::new();
+    // OpenZFS canonicalizes os_type to big-endian bytes before folding it
+    // into the portable objset HMAC (the surrounding dnode fields retain
+    // their canonical little-endian representation).
+    authenticated.extend_from_slice(&Reader::new(endian).u64(raw, 704).to_be_bytes());
+    authenticated.extend_from_slice(&0_u64.to_le_bytes());
+    let mut core = raw[..64].to_vec();
+    core[7] &= 0x04;
+    core[24..32].fill(0);
+    authenticated.extend_from_slice(&core);
+    for pointer in raw[64..pointer_end].chunks_exact(BLKPTR_SIZE) {
+        authenticated.extend_from_slice(&pool_block_pointer_auth(pointer, key.crypto_version())?);
+    }
+    if raw[7] & 0x04 != 0 {
+        authenticated.extend_from_slice(&pool_block_pointer_auth(
+            &raw[512 - BLKPTR_SIZE..512],
+            key.crypto_version(),
+        )?);
+    }
+    key.authenticate_bytes(&authenticated, &raw[720..752])
+        .context("encrypted objset portable MAC mismatch")
 }
 
 fn attrs(dnode: &Dnode, registry: &SaRegistry, layouts: &SaLayouts) -> Option<zfs_core::ZplAttrs> {

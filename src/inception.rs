@@ -171,6 +171,15 @@ impl InceptionSession {
         Self::from_pool_at(member, dataset, image_path, 0, None)
     }
 
+    pub fn from_pool_with_key(
+        member: &Path,
+        dataset: &str,
+        image_path: &str,
+        key_material: Option<&[u8]>,
+    ) -> Result<Self> {
+        Self::from_pool_at_with_key(member, dataset, image_path, key_material, 0, None)
+    }
+
     pub fn from_pool_at(
         member: &Path,
         dataset: &str,
@@ -178,7 +187,29 @@ impl InceptionSession {
         image_offset: u64,
         image_length: Option<u64>,
     ) -> Result<Self> {
-        let source = PoolMember::open(member)?.into_image_file(dataset, image_path)?;
+        Self::from_pool_at_with_key(
+            member,
+            dataset,
+            image_path,
+            None,
+            image_offset,
+            image_length,
+        )
+    }
+
+    pub fn from_pool_at_with_key(
+        member: &Path,
+        dataset: &str,
+        image_path: &str,
+        key_material: Option<&[u8]>,
+        image_offset: u64,
+        image_length: Option<u64>,
+    ) -> Result<Self> {
+        let source = PoolMember::open(member)?.into_image_file_with_key(
+            dataset,
+            image_path,
+            key_material,
+        )?;
         Self::inspect_source_at(
             Arc::new(source),
             image_path.to_owned(),
