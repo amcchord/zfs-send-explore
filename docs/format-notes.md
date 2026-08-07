@@ -50,6 +50,8 @@ Path lookup starts at ZPL object 1 (the master node), reads its `ROOT` entry, th
 
 ## Pool-member reads
 
+Before vdev parsing, a whole-disk source gets one conservative partition-discovery pass if it has no labels at disk-relative offsets. The reader recognizes primary GPT headers at LBA 1 for 512-byte and 4096-byte logical sectors, validates the header and complete partition-array CRC-32 values, caps the table at 64 MiB, bounds each LBA conversion against the source, and probes non-empty partitions as offset read-only views. It proceeds only when exactly one view has ZFS vdev labels.
+
 The direct backend starts at each of the four 256 KiB vdev labels and uses the highest valid uberblock transaction group found there. A DVA is translated to a member-relative byte offset as `(offset << 9) + 4 MiB`; this release accepts only top-level vdev id 0 and rejects any pool whose label reports more than one top-level vdev. Mirror replication happens below that top-level address, so the same offset can be read from either healthy leaf of a one-mirror pool.
 
 Blocks are fetched with positioned reads and never cached as a whole-vdev buffer. Every Fletcher-2, Fletcher-4, or SHA-256 checksum present is checked before decompression; a mismatch is fatal for that DVA, and alternate DVA copies are tried before extraction fails. A block explicitly configured with checksum `off` has no checksum to validate. Inherit/default sentinels, unsupported checksum algorithms, gang blocks, and DVAs naming unavailable top-level vdevs fail explicitly.

@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  linux-cli:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked --bin zfs-send-extract
+      - name: Package Linux CLI
+        run: |
+          mkdir -p dist
+          cp target/release/zfs-send-extract dist/zfs-send-extract
+          tar -czf dist/zfs-send-extract-linux-x86_64.tar.gz -C dist zfs-send-extract
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-release
+          path: dist/zfs-send-extract-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  windows-clients:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - shell: pwsh
+        run: .\scripts\package-windows.ps1
+      - name: Collect Windows release assets
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\release\zfs-send-extract.exe dist\zfs-send-extract-windows-x86_64.exe
+          Copy-Item target\release\zfs-send-explore-windows.exe dist\zfs-send-explore-windows-x86_64.exe
+          Copy-Item target\windows-package\zfs-send-explore-windows-x86_64.zip dist\zfs-send-explore-windows-x86_64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: dist
+          if-no-files-found: error
+
+  publish:
+    needs:
+      - linux-cli
+      - windows-clients
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create checksum manifest
+        working-directory: dist
+        run: sha256sum ./* > SHA256SUMS.txt
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "ZFS Send Explore $GITHUB_REF_NAME" \
+            --generate-notes

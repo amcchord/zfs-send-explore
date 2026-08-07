@@ -83,7 +83,7 @@ enum Command {
 enum PoolCommand {
     /// Validate a member and summarize its active pool state.
     Inspect {
-        /// Exact ZFS vdev partition, file vdev, or image (opened read-only).
+        /// ZFS vdev partition, file vdev, or supported GPT whole disk/image (read-only).
         member: PathBuf,
         /// Print machine-readable JSON.
         #[arg(long)]
@@ -91,19 +91,19 @@ enum PoolCommand {
     },
     /// List filesystem datasets reachable from the member.
     Datasets {
-        /// Exact ZFS vdev partition, file vdev, or image.
+        /// ZFS vdev partition, file vdev, or supported GPT whole disk/image.
         member: PathBuf,
     },
     /// List named snapshots stored in the pool.
     Snapshots {
-        /// Exact ZFS vdev partition, file vdev, or image.
+        /// ZFS vdev partition, file vdev, or supported GPT whole disk/image.
         member: PathBuf,
         /// Restrict output to one full dataset name.
         dataset: Option<String>,
     },
     /// List one directory from a current dataset or named snapshot.
     List {
-        /// Exact ZFS vdev partition, file vdev, or image.
+        /// ZFS vdev partition, file vdev, or supported GPT whole disk/image.
         member: PathBuf,
         /// Full dataset name, optionally followed by @snapshot.
         dataset: String,
@@ -113,7 +113,7 @@ enum PoolCommand {
     },
     /// Extract one regular file directly from a dataset or snapshot.
     Extract {
-        /// Exact ZFS vdev partition, file vdev, or image.
+        /// ZFS vdev partition, file vdev, or supported GPT whole disk/image.
         member: PathBuf,
         /// Full dataset name, optionally followed by @snapshot.
         dataset: String,

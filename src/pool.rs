@@ -7,12 +7,13 @@
 use crate::compression::decompress_block;
 use crate::filesystem::DirectoryEntry;
 use crate::operations::{SIDECAR_VERSION, Sidecar, guid_string, save_sidecar, sidecar_path};
+use crate::sparse;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, VecDeque};
 use std::fs::{self, File};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 use zfs_core::{
@@ -86,7 +87,9 @@ trait ReadAt {
 #[derive(Debug)]
 struct FileSource {
     path: PathBuf,
+    description: String,
     file: File,
+    base_offset: u64,
     len: u64,
 }
 
@@ -94,21 +97,25 @@ impl FileSource {
     fn open(path: &Path) -> Result<Self> {
         let file = File::open(path)
             .with_context(|| format!("opening pool member {} read-only", path.display()))?;
-        let metadata_len = file
-            .metadata()
-            .with_context(|| format!("reading metadata for {}", path.display()))?
-            .len();
+        let metadata_len = match file.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(metadata_error) => device_length(&file).with_context(|| {
+                format!(
+                    "reading metadata for {} failed ({metadata_error}); querying the device length",
+                    path.display()
+                )
+            })?,
+        };
         let len = if metadata_len != 0 {
             metadata_len
         } else {
-            // Linux block devices commonly report st_size == 0 but support
-            // lseek(SEEK_END), which yields the actual device size.
-            let mut size_probe = file.try_clone()?;
-            size_probe.seek(SeekFrom::End(0)).with_context(|| {
-                format!(
-                    "determining the size of block device {}; pass the ZFS vdev partition rather than a whole-disk container",
-                    path.display()
-                )
+            device_length(&file).or_else(|_| {
+                // Linux block devices commonly report st_size == 0 but support
+                // lseek(SEEK_END), which yields the actual device size.
+                let mut size_probe = file.try_clone()?;
+                size_probe.seek(SeekFrom::End(0)).with_context(|| {
+                    format!("determining the size of block device {}", path.display())
+                })
             })?
         };
         if len < (4 * LABEL_SIZE) as u64 {
@@ -119,7 +126,31 @@ impl FileSource {
         }
         Ok(Self {
             path: path.to_owned(),
+            description: path.display().to_string(),
             file,
+            base_offset: 0,
+            len,
+        })
+    }
+
+    fn slice(&self, number: usize, offset: u64, len: u64) -> Result<Self> {
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| anyhow!("GPT partition {number} byte range overflows"))?;
+        if len < (4 * LABEL_SIZE) as u64 || end > self.len {
+            bail!("GPT partition {number} is outside the source bounds");
+        }
+        Ok(Self {
+            path: self.path.clone(),
+            description: format!(
+                "{} (GPT partition {number}, bytes {offset}..{end})",
+                self.path.display()
+            ),
+            file: self.file.try_clone()?,
+            base_offset: self
+                .base_offset
+                .checked_add(offset)
+                .ok_or_else(|| anyhow!("GPT partition base offset overflows"))?,
             len,
         })
     }
@@ -143,9 +174,13 @@ impl ReadAt for FileSource {
             );
         }
 
+        let physical_offset = self
+            .base_offset
+            .checked_add(offset)
+            .ok_or_else(|| anyhow!("pool-member physical read offset overflow"))?;
         let mut filled = 0usize;
         while filled < buffer.len() {
-            let position = offset + filled as u64;
+            let position = physical_offset + filled as u64;
             #[cfg(unix)]
             let count = {
                 use std::os::unix::fs::FileExt;
@@ -163,19 +198,187 @@ impl ReadAt for FileSource {
                 format!(
                     "reading {} bytes at offset {position} from {}",
                     buffer.len() - filled,
-                    self.path.display()
+                    self.description
                 )
             })?;
             if count == 0 {
-                bail!(
-                    "short read at offset {position} from {}",
-                    self.path.display()
-                );
+                bail!("short read at offset {position} from {}", self.description);
             }
             filled += count;
         }
         Ok(())
     }
+}
+
+fn read_labels(source: &FileSource) -> (Vec<(u64, VdevLabel)>, Vec<String>) {
+    let (front, back) = label_offsets(source.len());
+    let offsets = front.into_iter().chain(back.into_iter().flatten());
+    let mut parsed = Vec::new();
+    let mut failures = Vec::new();
+    for offset in offsets {
+        let mut bytes = vec![0u8; LABEL_SIZE];
+        if let Err(error) = source.read_exact_at(offset, &mut bytes) {
+            failures.push(format!("label at {offset}: {error}"));
+            continue;
+        }
+        match VdevLabel::parse(&bytes) {
+            Ok(label) => parsed.push((offset, label)),
+            Err(error) => failures.push(format!("label at {offset}: {error}")),
+        }
+    }
+    (parsed, failures)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GptPartition {
+    number: usize,
+    offset: u64,
+    length: u64,
+}
+
+fn gpt_partitions(source: &FileSource) -> Result<Vec<GptPartition>> {
+    const MAX_GPT_TABLE_BYTES: usize = 64 * 1024 * 1024;
+    let mut errors = Vec::new();
+    for sector_size in [512_u64, 4096] {
+        if source.len() < sector_size.saturating_mul(3) {
+            continue;
+        }
+        let mut sector = vec![0_u8; sector_size as usize];
+        if let Err(error) = source.read_exact_at(sector_size, &mut sector) {
+            errors.push(format!("{sector_size}-byte sectors: {error}"));
+            continue;
+        }
+        if sector.get(..8) != Some(b"EFI PART") {
+            errors.push(format!("{sector_size}-byte sectors: GPT signature absent"));
+            continue;
+        }
+        let header_size = little_u32(&sector, 12)? as usize;
+        if !(92..=sector.len()).contains(&header_size) {
+            errors.push(format!(
+                "{sector_size}-byte sectors: invalid GPT header size {header_size}"
+            ));
+            continue;
+        }
+        let expected_header_crc = little_u32(&sector, 16)?;
+        let mut header = sector[..header_size].to_vec();
+        header[16..20].fill(0);
+        if crc32fast::hash(&header) != expected_header_crc {
+            errors.push(format!(
+                "{sector_size}-byte sectors: GPT header CRC mismatch"
+            ));
+            continue;
+        }
+        let entries_lba = little_u64(&sector, 72)?;
+        let entry_count = little_u32(&sector, 80)? as usize;
+        let entry_size = little_u32(&sector, 84)? as usize;
+        let expected_entries_crc = little_u32(&sector, 88)?;
+        if entry_count == 0 || !(128..=4096).contains(&entry_size) || entry_size & 7 != 0 {
+            errors.push(format!(
+                "{sector_size}-byte sectors: invalid GPT entry geometry {entry_count} × {entry_size}"
+            ));
+            continue;
+        }
+        let table_size = entry_count
+            .checked_mul(entry_size)
+            .filter(|size| *size <= MAX_GPT_TABLE_BYTES)
+            .ok_or_else(|| anyhow!("GPT partition table exceeds the 64 MiB safety limit"))?;
+        let table_offset = entries_lba
+            .checked_mul(sector_size)
+            .ok_or_else(|| anyhow!("GPT partition table offset overflows"))?;
+        let mut table = vec![0_u8; table_size];
+        source
+            .read_exact_at(table_offset, &mut table)
+            .context("reading GPT partition entries")?;
+        if crc32fast::hash(&table) != expected_entries_crc {
+            errors.push(format!(
+                "{sector_size}-byte sectors: GPT partition-array CRC mismatch"
+            ));
+            continue;
+        }
+
+        let mut partitions = Vec::new();
+        for (index, entry) in table.chunks_exact(entry_size).enumerate() {
+            if entry[..16].iter().all(|byte| *byte == 0) {
+                continue;
+            }
+            let first_lba = little_u64(entry, 32)?;
+            let last_lba = little_u64(entry, 40)?;
+            if first_lba == 0 || last_lba < first_lba {
+                continue;
+            }
+            let offset = first_lba
+                .checked_mul(sector_size)
+                .ok_or_else(|| anyhow!("GPT partition {} offset overflows", index + 1))?;
+            let sectors = last_lba
+                .checked_sub(first_lba)
+                .and_then(|span| span.checked_add(1))
+                .ok_or_else(|| anyhow!("GPT partition {} length overflows", index + 1))?;
+            let length = sectors
+                .checked_mul(sector_size)
+                .ok_or_else(|| anyhow!("GPT partition {} byte length overflows", index + 1))?;
+            let end = offset
+                .checked_add(length)
+                .ok_or_else(|| anyhow!("GPT partition {} end overflows", index + 1))?;
+            if end <= source.len() {
+                partitions.push(GptPartition {
+                    number: index + 1,
+                    offset,
+                    length,
+                });
+            }
+        }
+        return Ok(partitions);
+    }
+    bail!("no valid GPT header was found ({})", errors.join("; "))
+}
+
+fn little_u32(bytes: &[u8], offset: usize) -> Result<u32> {
+    let value = bytes
+        .get(offset..offset + 4)
+        .ok_or_else(|| anyhow!("truncated GPT u32 at byte {offset}"))?;
+    Ok(u32::from_le_bytes(value.try_into().unwrap()))
+}
+
+fn little_u64(bytes: &[u8], offset: usize) -> Result<u64> {
+    let value = bytes
+        .get(offset..offset + 8)
+        .ok_or_else(|| anyhow!("truncated GPT u64 at byte {offset}"))?;
+    Ok(u64::from_le_bytes(value.try_into().unwrap()))
+}
+
+#[cfg(windows)]
+fn device_length(file: &File) -> Result<u64> {
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::{GET_LENGTH_INFORMATION, IOCTL_DISK_GET_LENGTH_INFO};
+
+    let mut length = GET_LENGTH_INFORMATION::default();
+    let mut returned = 0_u32;
+    // SAFETY: the output is a correctly sized POD structure and the call is
+    // synchronous, so neither the handle nor output pointer can outlive scope.
+    let ok = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle(),
+            IOCTL_DISK_GET_LENGTH_INFO,
+            ptr::null(),
+            0,
+            (&mut length as *mut GET_LENGTH_INFORMATION).cast(),
+            size_of::<GET_LENGTH_INFORMATION>() as u32,
+            &mut returned,
+            ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error()).context("querying physical drive length");
+    }
+    u64::try_from(length.Length).context("physical drive reported a negative length")
+}
+
+#[cfg(not(windows))]
+fn device_length(_file: &File) -> Result<u64> {
+    bail!("platform has no block-device length control")
 }
 
 /// An opened offline vdev member. All methods are read-only with respect to the
@@ -194,29 +397,57 @@ pub struct PoolMember {
 
 impl PoolMember {
     /// Open an exact ZFS vdev partition, a file-backed vdev, or an image of one.
-    /// Whole disks containing a partition table are not auto-sliced yet.
+    /// GPT whole disks are auto-sliced only when one partition has ZFS labels.
     pub fn open(path: &Path) -> Result<Self> {
-        let source = FileSource::open(path)?;
-        let (front, back) = label_offsets(source.len());
-        let offsets = front.into_iter().chain(back.into_iter().flatten());
-        let mut parsed = Vec::new();
-        let mut failures = Vec::new();
+        let mut source = FileSource::open(path)?;
+        let (mut parsed, mut failures) = read_labels(&source);
 
-        for offset in offsets {
-            let mut bytes = vec![0u8; LABEL_SIZE];
-            if let Err(error) = source.read_exact_at(offset, &mut bytes) {
-                failures.push(format!("label at {offset}: {error}"));
-                continue;
-            }
-            match VdevLabel::parse(&bytes) {
-                Ok(label) => parsed.push((offset, label)),
-                Err(error) => failures.push(format!("label at {offset}: {error}")),
+        if parsed.is_empty() {
+            match gpt_partitions(&source) {
+                Ok(partitions) if !partitions.is_empty() => {
+                    let mut candidates = Vec::new();
+                    for partition in partitions {
+                        let candidate = match source.slice(
+                            partition.number,
+                            partition.offset,
+                            partition.length,
+                        ) {
+                            Ok(candidate) => candidate,
+                            Err(error) => {
+                                failures.push(error.to_string());
+                                continue;
+                            }
+                        };
+                        let (candidate_labels, candidate_failures) = read_labels(&candidate);
+                        if candidate_labels.is_empty() {
+                            failures.extend(candidate_failures.into_iter().map(|failure| {
+                                format!("GPT partition {}: {failure}", partition.number)
+                            }));
+                        } else {
+                            candidates.push((candidate, candidate_labels));
+                        }
+                    }
+                    match candidates.len() {
+                        0 => {}
+                        1 => {
+                            let (candidate, candidate_labels) = candidates.pop().unwrap();
+                            source = candidate;
+                            parsed = candidate_labels;
+                        }
+                        count => bail!(
+                            "{} contains {count} GPT partitions with ZFS vdev labels; open the intended partition device or image explicitly",
+                            path.display()
+                        ),
+                    }
+                }
+                Ok(_) => failures.push("no non-empty GPT partitions were found".to_owned()),
+                Err(error) => failures.push(format!("GPT scan: {error}")),
             }
         }
 
         if parsed.is_empty() {
             bail!(
-                "{} has no readable ZFS vdev label; pass the exact ZFS partition or vdev image, not a GPT whole-disk image ({})",
+                "{} has no readable ZFS vdev label in the source or its GPT partitions ({})",
                 path.display(),
                 failures.join("; ")
             );
@@ -453,6 +684,7 @@ impl PoolMember {
         }
 
         let mut temporary = temporary_for(output)?;
+        sparse::prepare(temporary.as_file())?;
         let mut digest = Sha256::new();
         self.write_file(&resolved, temporary.as_file_mut(), &mut digest)?;
         temporary.as_file_mut().set_len(resolved.logical_size)?;
@@ -725,15 +957,10 @@ impl PoolMember {
                 })?;
             let count = usize::try_from(remaining.min(block_size as u64))
                 .context("file block length exceeds usize")?;
-            let bytes = block.get(..count).ok_or_else(|| {
-                anyhow!(
-                    "file object {} block {block_id} decoded to {} bytes, expected at least {count}",
-                    resolved.object_id,
-                    block.len()
-                )
-            })?;
-            output.write_all(bytes)?;
-            digest.update(bytes);
+            let offset = block_id
+                .checked_mul(block_size as u64)
+                .context("file block offset overflow")?;
+            write_file_record(output, digest, offset, &block, count)?;
             remaining -= count as u64;
         }
         Ok(())
@@ -817,6 +1044,9 @@ impl PoolMember {
         })?;
         let mut level = top_level;
         while level > 0 {
+            if pointer.is_hole() {
+                return Ok(vec![0; dnode.data_block_size()]);
+            }
             let block = read_block_from(&self.source, 0, &pointer)?;
             level -= 1;
             let index_shift = u32::from(level) * shift;
@@ -829,8 +1059,39 @@ impl PoolMember {
                 .ok_or_else(|| anyhow!("indirect child pointer {child_index} is truncated"))?;
             pointer = parse_blkptr(child, dnode.endian);
         }
+        if pointer.is_hole() {
+            return Ok(vec![0; dnode.data_block_size()]);
+        }
         read_block_from(&self.source, 0, &pointer)
     }
+}
+
+fn digest_zeroes(digest: &mut Sha256, mut count: usize) {
+    let zeroes = [0_u8; 64 * 1024];
+    while count != 0 {
+        let chunk = count.min(zeroes.len());
+        digest.update(&zeroes[..chunk]);
+        count -= chunk;
+    }
+}
+
+fn write_file_record(
+    output: &mut File,
+    digest: &mut Sha256,
+    offset: u64,
+    block: &[u8],
+    logical_count: usize,
+) -> Result<()> {
+    // A ZFS leaf may legitimately have a smaller logical size than
+    // dn_datablkszsec (for example, a 512-byte allocation at the edge of an
+    // otherwise sparse 128 KiB record). The remainder of that file record is
+    // a hole and must hash and read back as zero.
+    let present = block.len().min(logical_count);
+    let bytes = &block[..present];
+    sparse::write_extent(output, offset, bytes)?;
+    digest.update(bytes);
+    digest_zeroes(digest, logical_count - present);
+    Ok(())
 }
 
 fn parse_blkptr(raw: &[u8], endian: Endian) -> Blkptr {
@@ -1031,9 +1292,12 @@ fn persist_replace(temporary: NamedTempFile, path: &Path, force: bool) -> Result
 #[cfg(test)]
 mod tests {
     use super::{
-        FileSource, ReadAt, blkptr_uses_crypt, normalize_path, parse_blkptr, read_block_from,
+        FileSource, ReadAt, blkptr_uses_crypt, gpt_partitions, normalize_path, parse_blkptr,
+        read_block_from, write_file_record,
     };
+    use sha2::{Digest, Sha256};
     use std::fs;
+    use std::io::{Read, Seek, SeekFrom};
     use zfs_core::{Blkptr, ChecksumType, CompressType, Endian};
 
     #[test]
@@ -1050,6 +1314,69 @@ mod tests {
         source.read_exact_at(17, &mut second).unwrap();
         assert_eq!(&first, b"test");
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn short_file_leaf_is_zero_extended_to_the_record_size() {
+        const RECORD_SIZE: usize = 128 * 1024;
+        let mut output = tempfile::NamedTempFile::new().unwrap();
+        let mut block = vec![0_u8; 512];
+        block[..16].copy_from_slice(b"ZFS-SPARSE-START");
+        let mut digest = Sha256::new();
+
+        write_file_record(output.as_file_mut(), &mut digest, 0, &block, RECORD_SIZE).unwrap();
+        output.as_file_mut().set_len(RECORD_SIZE as u64).unwrap();
+
+        let mut expected = vec![0_u8; RECORD_SIZE];
+        expected[..block.len()].copy_from_slice(&block);
+        assert_eq!(
+            digest.finalize().as_slice(),
+            Sha256::digest(&expected).as_slice()
+        );
+
+        output.as_file_mut().seek(SeekFrom::Start(0)).unwrap();
+        let mut actual = Vec::new();
+        output.as_file_mut().read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn valid_gpt_partitions_are_discovered_in_whole_disk_images() {
+        const SECTOR: usize = 512;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("whole-disk.img");
+        let mut image = vec![0_u8; 16 * 1024 * 1024];
+        let entries_offset = 2 * SECTOR;
+        let entries_len = 128 * 128;
+        let entries = &mut image[entries_offset..entries_offset + entries_len];
+        entries[0] = 0x6a;
+        entries[16] = 1;
+        entries[32..40].copy_from_slice(&2048_u64.to_le_bytes());
+        entries[40..48].copy_from_slice(&8191_u64.to_le_bytes());
+        let entries_crc = crc32fast::hash(entries);
+
+        let header = &mut image[SECTOR..2 * SECTOR];
+        header[..8].copy_from_slice(b"EFI PART");
+        header[8..12].copy_from_slice(&0x0001_0000_u32.to_le_bytes());
+        header[12..16].copy_from_slice(&92_u32.to_le_bytes());
+        header[24..32].copy_from_slice(&1_u64.to_le_bytes());
+        header[32..40].copy_from_slice(&32767_u64.to_le_bytes());
+        header[40..48].copy_from_slice(&34_u64.to_le_bytes());
+        header[48..56].copy_from_slice(&32734_u64.to_le_bytes());
+        header[72..80].copy_from_slice(&2_u64.to_le_bytes());
+        header[80..84].copy_from_slice(&128_u32.to_le_bytes());
+        header[84..88].copy_from_slice(&128_u32.to_le_bytes());
+        header[88..92].copy_from_slice(&entries_crc.to_le_bytes());
+        let header_crc = crc32fast::hash(&header[..92]);
+        header[16..20].copy_from_slice(&header_crc.to_le_bytes());
+        fs::write(&path, image).unwrap();
+
+        let source = FileSource::open(&path).unwrap();
+        let partitions = gpt_partitions(&source).unwrap();
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0].number, 1);
+        assert_eq!(partitions[0].offset, 2048 * 512);
+        assert_eq!(partitions[0].length, (8192 - 2048) * 512);
     }
 
     #[test]

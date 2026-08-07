@@ -1,16 +1,17 @@
 # zfs-send-extract
 
-`zfs-send-extract` is an experimental, pure-userspace CLI for browsing and extracting individual files from ZFS backups without importing or mounting a pool. It works with ZFS send files and, within a deliberately narrow pool layout, exported ZFS vdev members or images.
+`zfs-send-extract` is an experimental, pure-userspace toolkit for browsing and extracting individual files from ZFS backups without importing or mounting a pool. It includes the cross-platform CLI and an additional native Windows desktop client. Both work with ZFS send files and, within a deliberately narrow pool layout, exported ZFS vdev members or images.
 
 The extraction machine does **not** need ZFS, `libzfs`, or a ZFS kernel module. The tool never invokes `zfs` or `zpool`, and pool members are opened read-only.
 
 > [!IMPORTANT]
-> This is an early `0.1.0` implementation. The CLI, sidecar format, and supported on-disk profile may change. Current builds and end-to-end testing target Linux x86-64 and streams produced on little-endian OpenZFS systems. macOS and Windows support remain project goals, not currently validated release targets.
+> This is an early `0.1.0` implementation. The CLI, Windows UI, sidecar format, and supported on-disk profile may change. Stream fixtures are produced on little-endian OpenZFS systems. Linux validates the core end to end, and CI builds and tests the native Windows target.
 
 Detailed implementation and validation material lives in:
 
 - [`docs/format-notes.md`](docs/format-notes.md), which maps the supported send and on-disk formats to the reader; and
 - [`docs/test-evidence.md`](docs/test-evidence.md), which records the real OpenZFS fixtures, lab scenarios, sizes, and hashes.
+- [`docs/windows-client.md`](docs/windows-client.md), which covers the Windows UI, attached-drive access, updates, sparse files, and packaging.
 
 ## What works today
 
@@ -29,11 +30,41 @@ Detailed implementation and validation material lives in:
 | Read embedded-data replay records from `zfs send -e` | Supported |
 | Browse a single exported disk/file vdev or one leaf of a single top-level mirror | Supported |
 | Browse current datasets and named snapshots directly from a pool member | Supported |
+| Native Windows snapshot browser and extractor | Supported as `zfs-send-explore-windows.exe` |
+| Open a GPT whole-disk image or `\\.\PhysicalDriveN` | Supported when exactly one partition has a supported ZFS vdev label |
+| Preserve sparse holes during extraction and incremental updates | Supported; zero ranges are deallocated when the destination filesystem permits it |
 | Read compressed and embedded blocks from a pool member | LZJB, LZ4, gzip, ZLE, and Zstandard |
 | Extract from a native-encrypted pool dataset | Not yet supported |
 | Read RAIDZ/dRAID or pools with several top-level vdevs | Not yet supported |
 
 The tool extracts regular files only. It can list directories and report symlinks, but it does not recreate directory trees, symlinks, ownership, permissions, ACLs, or other filesystem metadata.
+
+## Downloads
+
+Portable release builds are available from the [GitHub Releases page](https://github.com/amcchord/zfs-send-explore/releases/latest). No installer is required.
+
+| Asset | Contents |
+| --- | --- |
+| `zfs-send-extract-linux-x86_64.tar.gz` | Linux x86-64 command-line client |
+| `zfs-send-extract-windows-x86_64.exe` | Windows x86-64 command-line client |
+| `zfs-send-explore-windows-x86_64.exe` | Native Windows x86-64 desktop client |
+| `zfs-send-explore-windows-x86_64.zip` | Both Windows executables, the illustrated Windows guide, screenshots, README, and license |
+| `SHA256SUMS.txt` | SHA-256 checksums for every downloadable program and archive |
+
+Verify a Windows download before running it:
+
+```powershell
+Get-FileHash .\zfs-send-explore-windows-x86_64.exe -Algorithm SHA256
+```
+
+On Linux, extract the CLI archive and run it directly:
+
+```sh
+tar -xzf zfs-send-extract-linux-x86_64.tar.gz
+./zfs-send-extract --help
+```
+
+The Windows executables are currently unsigned, so Microsoft Defender SmartScreen may display an unrecognized-app warning. Check the release checksum and repository source before choosing to run the program.
 
 ## Build
 
@@ -51,6 +82,21 @@ The executable is written to `target/release/zfs-send-extract`. ZFS is needed on
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```
+
+### Native Windows client
+
+![The native Windows client selecting a snapshot from a compound send](docs/screenshots/windows/snapshot-selector.jpg)
+
+On Windows 10 or 11, build the GUI with the stable MSVC Rust toolchain and the Windows SDK:
+
+```powershell
+cargo build --release --bin zfs-send-explore-windows
+.\scripts\package-windows.ps1
+```
+
+The GUI binary is `target\release\zfs-send-explore-windows.exe`; the packaging script also builds `zfs-send-extract.exe` and creates a distributable ZIP containing both clients and the illustrated documentation. It uses Win32 common controls, Windows file dialogs, the Segoe UI system typeface, per-monitor DPI scaling, and background workers so long stream scans do not block the window.
+
+Open a send file or vdev image with **Browse**, or type a raw device path such as `\\.\PhysicalDrive3` and choose **Open pool / drive**. Physical-drive access normally requires starting the client as Administrator. The reader opens the source read-only, validates GPT metadata when auto-selecting a partition, and never imports or mounts the pool. See [the Windows client guide](docs/windows-client.md) for the complete workflow and safety constraints.
 
 ## Browse and extract from a send file
 
@@ -146,7 +192,7 @@ A raw extraction sidecar additionally stores the portable dnode and block-MAC st
 
 ## Browse an offline pool member
 
-The `pool` command family reads an exported vdev using positioned I/O. Pass the exact ZFS partition, file vdev, or image; whole disks containing GPT partitions are not automatically sliced.
+The `pool` command family reads an exported vdev using positioned I/O. Pass an exact ZFS partition, file vdev, or image. A GPT whole-disk image is also accepted when exactly one partition contains readable ZFS vdev labels; the Windows client uses the same discovery for `\\.\PhysicalDriveN`.
 
 Export a live pool first. This keeps the selected uberblock stable and prevents blocks from being freed and reused during traversal:
 
@@ -202,6 +248,8 @@ The CLI treats stream and pool metadata as untrusted input and fails closed when
 - extraction and incremental updates are built in a temporary file beside the destination, synchronized, and atomically renamed only after validation completes.
 
 The `.zfse.json` sidecar is part of an extracted file's update state. Keep it beside the file and do not edit it. Raw sidecars contain portable block-authentication metadata but never the encryption key; they may still reveal path, object, size, and snapshot information. Passphrases committed under `tests/fixtures` are intentionally public test credentials and must never be reused for real datasets.
+
+Extraction marks Windows destination files sparse and replays ZFS holes without materializing their zero bytes. Incremental updates copy only allocated source ranges when the host filesystem provides that information, and FREE records deallocate ranges on NTFS/ReFS, Linux filesystems with hole punching, and APFS. On filesystems without sparse controls, the logical content remains correct but zero ranges may consume physical space.
 
 This remains experimental software, not a replacement for maintaining independently verified backups. Preserve the original send file or pool member until the extracted result has been checked for the intended recovery use.
 
