@@ -11,6 +11,7 @@ use ccm::{
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use pbkdf2::pbkdf2_hmac;
+use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::{Digest, Sha512};
 use std::collections::{BTreeMap, BTreeSet};
@@ -44,7 +45,7 @@ pub struct DatasetKey {
     hmac_key: [u8; 64],
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawBlockPointer {
     pub block_id: u64,
     pub object_type: u32,
@@ -55,7 +56,7 @@ pub struct RawBlockPointer {
     pub mac: [u8; 16],
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawDnode {
     pub object: u64,
     pub object_type: u32,
@@ -72,6 +73,20 @@ pub struct RawDnode {
     pub max_block_id: u64,
     pub bonus_ciphertext: Vec<u8>,
     pub blocks: Vec<RawBlockPointer>,
+    pub spill: Option<RawBlockPointer>,
+}
+
+/// Portable raw-send state needed to authenticate the next incremental
+/// OBJECT_RANGE containing an extracted file. No key material is stored here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawSidecarState {
+    pub crypto_guid: u64,
+    pub crypto_version: u64,
+    pub first_object: u64,
+    pub object_slots: u64,
+    pub dnodes: Vec<RawDnode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_spill: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -82,6 +97,7 @@ pub struct RawDnodeRange {
     pub iv: [u8; 12],
     pub mac: [u8; 16],
     pub flags: u8,
+    pub crypto_version: u64,
 }
 
 #[derive(Debug)]
@@ -273,11 +289,21 @@ impl DatasetKey {
             visited.insert(dnode.object);
             validate_dnode(range, dnode, range_end)?;
             aad.extend_from_slice(&dnode_core(dnode)?);
-            for pointer in root_block_pointers(dnode)? {
-                aad.extend_from_slice(&pointer.encode());
+            for pointer in root_block_pointers(dnode, range.crypto_version)? {
+                aad.extend_from_slice(&pointer.encode(range.crypto_version)?);
             }
             if dnode.flags & 0x04 != 0 {
-                bail!("raw encrypted dnodes with spill blocks are unsupported");
+                let spill = dnode.spill.as_ref().ok_or_else(|| {
+                    anyhow!(
+                        "raw object {} is missing its spill block pointer",
+                        dnode.object
+                    )
+                })?;
+                let pointer = BlockPointerAuth {
+                    prop: leaf_prop(spill, range.crypto_version)?,
+                    mac: spill.mac,
+                };
+                aad.extend_from_slice(&pointer.encode(range.crypto_version)?);
             }
 
             let max_bonus = dnode_max_bonus(dnode)?;
@@ -343,11 +369,16 @@ impl BlockPointerAuth {
         mac: [0; 16],
     };
 
-    fn encode(self) -> [u8; 32] {
+    fn encode(self, crypto_version: u64) -> Result<Vec<u8>> {
         let mut bytes = [0_u8; 32];
         bytes[..8].copy_from_slice(&self.prop.to_le_bytes());
         bytes[8..24].copy_from_slice(&self.mac);
-        bytes
+        let length = match crypto_version {
+            0 => 24,
+            1 => 32,
+            value => bail!("unsupported ZFS encryption key version {value}"),
+        };
+        Ok(bytes[..length].to_vec())
     }
 }
 
@@ -406,7 +437,7 @@ fn dnode_max_bonus(dnode: &RawDnode) -> Result<usize> {
         .ok_or_else(|| anyhow!("object {} has an impossible bonus layout", dnode.object))
 }
 
-fn root_block_pointers(dnode: &RawDnode) -> Result<Vec<BlockPointerAuth>> {
+fn root_block_pointers(dnode: &RawDnode, crypto_version: u64) -> Result<Vec<BlockPointerAuth>> {
     if dnode.indirect_block_shift < 9 || dnode.indirect_block_shift > 24 {
         bail!(
             "object {} has an unsupported indirect block shift",
@@ -434,7 +465,7 @@ fn root_block_pointers(dnode: &RawDnode) -> Result<Vec<BlockPointerAuth>> {
             bail!("object {} has duplicate raw WRITE blocks", dnode.object);
         }
         level[block_id] = BlockPointerAuth {
-            prop: leaf_prop(block)?,
+            prop: leaf_prop(block, crypto_version)?,
             mac: block.mac,
         };
     }
@@ -444,10 +475,10 @@ fn root_block_pointers(dnode: &RawDnode) -> Result<Vec<BlockPointerAuth>> {
         for children in level.chunks(epb) {
             let mut digest = Sha512::new();
             for child in children {
-                digest.update(child.encode());
+                digest.update(child.encode(crypto_version)?);
             }
             for _ in children.len()..epb {
-                digest.update(BlockPointerAuth::HOLE.encode());
+                digest.update(BlockPointerAuth::HOLE.encode(crypto_version)?);
             }
             let digest = digest.finalize();
             let mut mac = [0_u8; 16];
@@ -472,10 +503,14 @@ fn root_block_pointers(dnode: &RawDnode) -> Result<Vec<BlockPointerAuth>> {
     Ok(level)
 }
 
-fn leaf_prop(block: &RawBlockPointer) -> Result<u64> {
+fn leaf_prop(block: &RawBlockPointer, crypto_version: u64) -> Result<u64> {
     block_prop(
         block.logical_size,
-        block.physical_size,
+        if crypto_version == 0 {
+            512
+        } else {
+            block.physical_size
+        },
         block.compression,
         block.object_type,
         0,
@@ -526,36 +561,10 @@ fn size_field(size: u64) -> Result<u64> {
 }
 
 pub fn decompress_block(compression: u8, payload: &[u8], logical_size: u64) -> Result<Vec<u8>> {
-    let logical_size = usize::try_from(logical_size).context("logical block size is too large")?;
-    match compression {
-        // Raw sends preserve the on-disk compression value even for uncompressed blocks.
-        0 | 2 => {
-            if payload.len() != logical_size {
-                bail!(
-                    "uncompressed ZFS block is {} bytes, expected {logical_size}",
-                    payload.len()
-                );
-            }
-            Ok(payload.to_vec())
-        }
-        15 => {
-            if payload.len() < 4 {
-                bail!("ZFS LZ4 block is missing its size prefix");
-            }
-            let encoded = u32::from_be_bytes(payload[..4].try_into().expect("four bytes")) as usize;
-            if encoded + 4 > payload.len() {
-                bail!("ZFS LZ4 block has an invalid compressed-size prefix");
-            }
-            let mut output = vec![0_u8; logical_size];
-            let written = lz4_flex::block::decompress_into(&payload[4..4 + encoded], &mut output)
-                .context("decompressing ZFS LZ4 block")?;
-            if written != logical_size {
-                bail!("ZFS LZ4 block expanded to {written} bytes, expected {logical_size}");
-            }
-            Ok(output)
-        }
-        value => bail!("ZFS compression type {value} in raw sends is unsupported"),
-    }
+    // Some raw-send producers use zero in DRR_WRITE to mean an uncompressed
+    // payload even though an on-disk blkptr stores ZIO_COMPRESS_OFF as two.
+    let compression = if compression == 0 { 2 } else { compression };
+    crate::compression::decompress_block(compression, payload, logical_size)
 }
 
 fn decrypt_aead(

@@ -116,7 +116,22 @@ pub struct EmbeddedWriteRecord {
     pub offset: u64,
     pub length: u64,
     pub compression_type: u8,
+    pub embedded_type: u8,
     pub logical_size: u32,
+    pub physical_size: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SpillRecord {
+    pub object: u64,
+    pub logical_size: u64,
+    pub flags: u8,
+    pub compression_type: u8,
+    pub compressed_size: u64,
+    pub salt: [u8; 8],
+    pub iv: [u8; 12],
+    pub mac: [u8; 16],
+    pub object_type: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -128,7 +143,7 @@ pub enum RecordKind {
     Free(FreeRecord),
     End,
     WriteByRef,
-    Spill,
+    Spill(SpillRecord),
     WriteEmbedded(EmbeddedWriteRecord),
     ObjectRange(ObjectRangeRecord),
     Redact,
@@ -145,7 +160,7 @@ impl RecordKind {
             Self::Free(_) => "FREE",
             Self::End => "END",
             Self::WriteByRef => "WRITE_BYREF",
-            Self::Spill => "SPILL",
+            Self::Spill(_) => "SPILL",
             Self::WriteEmbedded(_) => "WRITE_EMBEDDED",
             Self::ObjectRange(_) => "OBJECT_RANGE",
             Self::Redact => "REDACT",
@@ -485,13 +500,25 @@ fn decode_kind(header: &[u8; RECORD_SIZE], record_type: u32, offset: u64) -> Res
         }),
         DRR_END => RecordKind::End,
         DRR_WRITE_BYREF => RecordKind::WriteByRef,
-        DRR_SPILL => RecordKind::Spill,
+        DRR_SPILL => RecordKind::Spill(SpillRecord {
+            object: le_u64(header, 8),
+            logical_size: le_u64(header, 16),
+            flags: header[32],
+            compression_type: header[33],
+            compressed_size: le_u64(header, 40),
+            salt: header[48..56].try_into().expect("eight-byte salt"),
+            iv: header[56..68].try_into().expect("twelve-byte IV"),
+            mac: header[68..84].try_into().expect("sixteen-byte MAC"),
+            object_type: le_u32(header, 84),
+        }),
         DRR_WRITE_EMBEDDED => RecordKind::WriteEmbedded(EmbeddedWriteRecord {
             object: le_u64(header, 8),
             offset: le_u64(header, 16),
             length: le_u64(header, 24),
             compression_type: header[40],
+            embedded_type: header[41],
             logical_size: le_u32(header, 48),
+            physical_size: le_u32(header, 52),
         }),
         DRR_OBJECT_RANGE => RecordKind::ObjectRange(ObjectRangeRecord {
             first_object: le_u64(header, 8),
