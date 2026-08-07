@@ -41,6 +41,8 @@ pub struct EncryptionParams {
 pub struct DatasetKey {
     #[zeroize(skip)]
     suite: u64,
+    #[zeroize(skip)]
+    crypto_version: u64,
     master_key: Vec<u8>,
     hmac_key: [u8; 64],
 }
@@ -141,6 +143,31 @@ impl EncryptionParams {
         }
     }
 
+    /// Decode the byte-preserving entries from an on-disk DSL crypto-key ZAP.
+    /// Integer entries must already be normalized to little-endian bytes.
+    pub(crate) fn from_pool_zap(values: &BTreeMap<String, Vec<u8>>) -> Result<Self> {
+        let suite = pool_u64(values, "DSL_CRYPTO_SUITE")?;
+        let key_len = suite_key_len(suite)?;
+        let wrapped_master_key = pool_bytes(values, "DSL_CRYPTO_MASTER_KEY_1", 32)?;
+        Ok(Self {
+            suite,
+            guid: pool_u64(values, "DSL_CRYPTO_GUID")?,
+            version: pool_optional_u64(values, "DSL_CRYPTO_VERSION")?.unwrap_or(0),
+            key_format: pool_u64(values, "keyformat")?,
+            pbkdf2_iterations: pool_u64(values, "pbkdf2iters")?,
+            pbkdf2_salt: pool_u64(values, "pbkdf2salt")?,
+            // OpenZFS reserves MASTER_KEY_MAX_LEN bytes in the ZAP but only
+            // authenticates the prefix selected by the cipher suite.
+            wrapped_master_key: wrapped_master_key[..key_len].to_vec(),
+            wrapped_hmac_key: pool_bytes(values, "DSL_CRYPTO_HMAC_KEY_1", 64)?,
+            wrapping_iv: array::<12>(&pool_bytes(values, "DSL_CRYPTO_IV", 12)?, "DSL_CRYPTO_IV")?,
+            wrapping_mac: array::<16>(
+                &pool_bytes(values, "DSL_CRYPTO_MAC", 16)?,
+                "DSL_CRYPTO_MAC",
+            )?,
+        })
+    }
+
     pub fn unlock(&self, material: &[u8]) -> Result<DatasetKey> {
         let mut wrapping_key = Zeroizing::new([0_u8; 32]);
         match self.key_format {
@@ -212,6 +239,7 @@ impl EncryptionParams {
         ciphertext.zeroize();
         Ok(DatasetKey {
             suite: self.suite,
+            crypto_version: self.version,
             master_key,
             hmac_key,
         })
@@ -219,6 +247,10 @@ impl EncryptionParams {
 }
 
 impl DatasetKey {
+    pub fn crypto_version(&self) -> u64 {
+        self.crypto_version
+    }
+
     pub fn decrypt_block(
         &self,
         salt: &[u8; 8],
@@ -238,6 +270,13 @@ impl DatasetKey {
     }
 
     pub fn authenticate_block(&self, data: &[u8], expected: &[u8; 16]) -> Result<()> {
+        self.authenticate_bytes(data, expected)
+    }
+
+    pub fn authenticate_bytes(&self, data: &[u8], expected: &[u8]) -> Result<()> {
+        if expected.is_empty() || expected.len() > 64 {
+            bail!("invalid authenticated ZFS digest length {}", expected.len());
+        }
         let mut hmac = <Hmac<Sha512> as Mac>::new_from_slice(&self.hmac_key)
             .expect("SHA-512 HMAC accepts a 64-byte key");
         hmac.update(data);
@@ -246,6 +285,101 @@ impl DatasetKey {
             bail!("authenticated ZFS block failed HMAC verification");
         }
         Ok(())
+    }
+
+    /// Authenticate and decrypt the encrypted bonus regions in one native
+    /// on-disk dnode-array block. Dnode cores and block pointers remain in
+    /// plaintext so an exported pool can be scrubbed without loading keys;
+    /// OpenZFS binds those portable fields as AEAD additional data.
+    pub fn decrypt_pool_dnode_block(
+        &self,
+        salt: &[u8; 8],
+        iv: &[u8; 12],
+        mac: &[u8; 16],
+        block: &[u8],
+    ) -> Result<Vec<u8>> {
+        if !block.len().is_multiple_of(512) {
+            bail!("encrypted dnode block length is not a multiple of 512 bytes");
+        }
+        let mut output = block.to_vec();
+        let mut aad = Vec::with_capacity(block.len());
+        let mut ciphertext = Vec::new();
+        let mut regions = Vec::new();
+        let mut offset = 0usize;
+
+        while offset < block.len() {
+            let core = block
+                .get(offset..offset + 64)
+                .ok_or_else(|| anyhow!("encrypted dnode block has a truncated core"))?;
+            let slots = usize::from(core[12]) + 1;
+            let dnode_size = slots
+                .checked_mul(512)
+                .ok_or_else(|| anyhow!("encrypted dnode slot count overflows"))?;
+            let end = offset
+                .checked_add(dnode_size)
+                .filter(|end| *end <= block.len())
+                .ok_or_else(|| anyhow!("encrypted dnode extends past its block"))?;
+            let pointers = usize::from(core[3]);
+            let pointer_bytes = pointers
+                .checked_mul(128)
+                .ok_or_else(|| anyhow!("encrypted dnode pointer count overflows"))?;
+            let bonus_start = offset
+                .checked_add(64 + pointer_bytes)
+                .ok_or_else(|| anyhow!("encrypted dnode bonus offset overflows"))?;
+            let has_spill = core[7] & 0x04 != 0;
+            let bonus_end = end
+                .checked_sub(usize::from(has_spill) * 128)
+                .ok_or_else(|| anyhow!("encrypted dnode has an invalid spill pointer"))?;
+            if bonus_start > bonus_end {
+                bail!("encrypted dnode has an impossible pointer/bonus layout");
+            }
+
+            let mut portable_core = core.to_vec();
+            portable_core[7] &= 0x04;
+            portable_core[24..32].fill(0);
+            aad.extend_from_slice(&portable_core);
+            for index in 0..pointers {
+                let start = offset + 64 + index * 128;
+                aad.extend_from_slice(&pool_block_pointer_auth(
+                    &block[start..start + 128],
+                    self.crypto_version,
+                )?);
+            }
+            if has_spill {
+                aad.extend_from_slice(&pool_block_pointer_auth(
+                    &block[end - 128..end],
+                    self.crypto_version,
+                )?);
+            }
+
+            let bonus = &block[bonus_start..bonus_end];
+            let bonus_len = u16::from_le_bytes(core[10..12].try_into().unwrap());
+            if core[0] != 0 && bonus_len != 0 && is_encrypted_object_type(u32::from(core[4])) {
+                regions.push((bonus_start, bonus.len()));
+                ciphertext.extend_from_slice(bonus);
+            } else {
+                aad.extend_from_slice(bonus);
+            }
+            offset = end;
+        }
+
+        // OpenZFS's no_crypt path leaves an all-plaintext dnode block alone.
+        if ciphertext.is_empty() {
+            return Ok(output);
+        }
+        let plaintext = self
+            .decrypt_block(salt, iv, mac, &aad, &ciphertext)
+            .context("authenticating native-encrypted ZFS dnode metadata")?;
+        let mut cursor = 0usize;
+        for (start, length) in regions {
+            let end = cursor + length;
+            output[start..start + length].copy_from_slice(&plaintext[cursor..end]);
+            cursor = end;
+        }
+        if cursor != plaintext.len() {
+            bail!("decrypted dnode bonus data has an inconsistent length");
+        }
+        Ok(output)
     }
 
     pub fn decrypt_dnode_bonuses(
@@ -380,6 +514,45 @@ impl BlockPointerAuth {
         };
         Ok(bytes[..length].to_vec())
     }
+}
+
+pub(crate) fn pool_block_pointer_auth(raw: &[u8], crypto_version: u64) -> Result<Vec<u8>> {
+    if raw.len() != 128 {
+        bail!("encrypted dnode contains a truncated block pointer");
+    }
+    if !matches!(crypto_version, 0 | 1) {
+        bail!("unsupported ZFS encryption key version {crypto_version}");
+    }
+    let mut prop = u64::from_le_bytes(raw[48..56].try_into().unwrap());
+    let hole = raw[..16].iter().all(|byte| *byte == 0) && prop & (1 << 39) == 0;
+    if crypto_version == 0 {
+        prop &= !(1_u64 << 62);
+        prop &= !(0xff_u64 << 40);
+        prop &= !(0xffff_u64 << 16);
+    } else if hole {
+        prop = 0;
+    } else {
+        if (prop >> 56) & 0x1f != 0 {
+            prop &= !(1_u64 << 63);
+            prop &= !(0x7f_u64 << 32);
+            prop &= !(0xffff_u64 << 16);
+        }
+        prop &= !(1_u64 << 62);
+        prop &= !(0xff_u64 << 40);
+    }
+
+    let object_type = ((u64::from_le_bytes(raw[48..56].try_into().unwrap()) >> 48) & 0xff) as u8;
+    let mut output = Vec::with_capacity(if crypto_version == 0 { 24 } else { 32 });
+    output.extend_from_slice(&prop.to_le_bytes());
+    if object_type == 11 || hole {
+        output.extend_from_slice(&[0_u8; 16]);
+    } else {
+        output.extend_from_slice(&raw[112..128]);
+    }
+    if crypto_version == 1 {
+        output.extend_from_slice(&[0_u8; 8]);
+    }
+    Ok(output)
 }
 
 fn validate_dnode(range: RawDnodeRange, dnode: &RawDnode, range_end: u64) -> Result<()> {
@@ -629,6 +802,35 @@ fn uint64(values: &BTreeMap<String, NvValue>, name: &str) -> Result<u64> {
     }
 }
 
+fn pool_u64(values: &BTreeMap<String, Vec<u8>>, name: &str) -> Result<u64> {
+    pool_optional_u64(values, name)?
+        .ok_or_else(|| anyhow!("DSL crypto-key ZAP has no {name} entry"))
+}
+
+fn pool_optional_u64(values: &BTreeMap<String, Vec<u8>>, name: &str) -> Result<Option<u64>> {
+    let Some(value) = values.get(name) else {
+        return Ok(None);
+    };
+    let bytes: [u8; 8] = value
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("DSL crypto-key ZAP {name} entry is not a uint64"))?;
+    Ok(Some(u64::from_le_bytes(bytes)))
+}
+
+fn pool_bytes(values: &BTreeMap<String, Vec<u8>>, name: &str, length: usize) -> Result<Vec<u8>> {
+    let value = values
+        .get(name)
+        .ok_or_else(|| anyhow!("DSL crypto-key ZAP has no {name} entry"))?;
+    if value.len() != length {
+        bail!(
+            "DSL crypto-key ZAP {name} entry is {} bytes, expected {length}",
+            value.len()
+        );
+    }
+    Ok(value.clone())
+}
+
 fn bytes<'a>(values: &'a BTreeMap<String, NvValue>, name: &str) -> Result<&'a [u8]> {
     match values.get(name) {
         Some(NvValue::Bytes(value)) => Ok(value),
@@ -859,7 +1061,8 @@ fn align_8(value: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_hex_key;
+    use super::{EncryptionParams, decode_hex_key, pool_block_pointer_auth};
+    use std::collections::BTreeMap;
 
     #[test]
     fn hex_key_requires_exactly_32_bytes() {
@@ -871,5 +1074,65 @@ mod tests {
         .unwrap();
         assert_eq!(output[0], 0);
         assert_eq!(output[31], 31);
+    }
+
+    #[test]
+    fn pool_zap_parser_preserves_byte_arrays_and_suite_key_length() {
+        let mut values = BTreeMap::new();
+        for (name, value) in [
+            ("DSL_CRYPTO_SUITE", 3_u64),
+            ("DSL_CRYPTO_GUID", 0x1234),
+            ("DSL_CRYPTO_VERSION", 1),
+            ("keyformat", 1),
+            ("pbkdf2iters", 0),
+            ("pbkdf2salt", 0),
+        ] {
+            values.insert(name.to_owned(), value.to_le_bytes().to_vec());
+        }
+        values.insert("DSL_CRYPTO_MASTER_KEY_1".to_owned(), vec![0x11; 32]);
+        values.insert("DSL_CRYPTO_HMAC_KEY_1".to_owned(), vec![0x22; 64]);
+        values.insert("DSL_CRYPTO_IV".to_owned(), vec![0x33; 12]);
+        values.insert("DSL_CRYPTO_MAC".to_owned(), vec![0x44; 16]);
+
+        let params = EncryptionParams::from_pool_zap(&values).unwrap();
+        assert_eq!(params.suite, 3);
+        assert_eq!(params.guid, 0x1234);
+        assert_eq!(params.version, 1);
+        assert_eq!(params.wrapped_master_key, vec![0x11; 16]);
+        assert_eq!(params.wrapped_hmac_key, vec![0x22; 64]);
+    }
+
+    #[test]
+    fn pool_block_pointer_auth_masks_nonportable_fields() {
+        let mut raw = [0_u8; 128];
+        raw[0] = 1;
+        let prop = 0x1234_u64
+            | (0x5678_u64 << 16)
+            | (0x22_u64 << 32)
+            | (0xaa_u64 << 40)
+            | (39_u64 << 48)
+            | (1_u64 << 56)
+            | (1_u64 << 61)
+            | (1_u64 << 62)
+            | (1_u64 << 63);
+        raw[48..56].copy_from_slice(&prop.to_le_bytes());
+        raw[112..128].copy_from_slice(&[0x5a; 16]);
+
+        let version_one = pool_block_pointer_auth(&raw, 1).unwrap();
+        assert_eq!(version_one.len(), 32);
+        let normalized = u64::from_le_bytes(version_one[..8].try_into().unwrap());
+        assert_eq!(normalized & (0xffff << 16), 0);
+        assert_eq!(normalized & (0x7f << 32), 0);
+        assert_eq!(normalized & (0xff << 40), 0);
+        assert_eq!(normalized & (1 << 62), 0);
+        assert_eq!(normalized & (1 << 63), 0);
+        assert_eq!(&version_one[8..24], &[0x5a; 16]);
+        assert_eq!(&version_one[24..], &[0; 8]);
+
+        let version_zero = pool_block_pointer_auth(&raw, 0).unwrap();
+        assert_eq!(version_zero.len(), 24);
+        let normalized = u64::from_le_bytes(version_zero[..8].try_into().unwrap());
+        assert_eq!(normalized & (0xffff << 16), 0);
+        assert_ne!(normalized & (0x7f << 32), 0);
     }
 }

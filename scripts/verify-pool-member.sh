@@ -2,11 +2,12 @@
 set -eu
 
 binary=${1:-target/release/zfs-send-extract}
-member=${2:?usage: verify-pool-member.sh BINARY MEMBER DATASET@SNAPSHOT PATH EXPECTED_SHA256 [OUTPUT_DIR]}
-snapshot=${3:?usage: verify-pool-member.sh BINARY MEMBER DATASET@SNAPSHOT PATH EXPECTED_SHA256 [OUTPUT_DIR]}
-path=${4:?usage: verify-pool-member.sh BINARY MEMBER DATASET@SNAPSHOT PATH EXPECTED_SHA256 [OUTPUT_DIR]}
-expected_sha256=${5:?usage: verify-pool-member.sh BINARY MEMBER DATASET@SNAPSHOT PATH EXPECTED_SHA256 [OUTPUT_DIR]}
+member=${2:?usage: verify-pool-member.sh BINARY MEMBER DATASET@SNAPSHOT PATH EXPECTED_SHA256 [OUTPUT_DIR] [KEY_FILE]}
+snapshot=${3:?usage: verify-pool-member.sh BINARY MEMBER DATASET@SNAPSHOT PATH EXPECTED_SHA256 [OUTPUT_DIR] [KEY_FILE]}
+path=${4:?usage: verify-pool-member.sh BINARY MEMBER DATASET@SNAPSHOT PATH EXPECTED_SHA256 [OUTPUT_DIR] [KEY_FILE]}
+expected_sha256=${5:?usage: verify-pool-member.sh BINARY MEMBER DATASET@SNAPSHOT PATH EXPECTED_SHA256 [OUTPUT_DIR] [KEY_FILE]}
 output_dir=${6:-.artifacts/pool-member}
+key_file=${7:-}
 
 case "$snapshot" in
     *@*) ;;
@@ -22,7 +23,12 @@ target="$output_dir/extracted.bin"
 "$binary" pool inspect "$member" --json > "$output_dir/inspection.json"
 "$binary" pool datasets "$member" > "$output_dir/datasets.txt"
 "$binary" pool snapshots "$member" "${snapshot%@*}" > "$output_dir/snapshots.txt"
-"$binary" pool extract "$member" "$snapshot" "$path" --output "$target" --force
+if [ -n "$key_file" ]; then
+    "$binary" pool extract "$member" "$snapshot" "$path" \
+        --key-file "$key_file" --output "$target" --force
+else
+    "$binary" pool extract "$member" "$snapshot" "$path" --output "$target" --force
+fi
 
 actual_sha256=$(sha256sum "$target" | awk '{print $1}')
 if [ "$actual_sha256" != "$expected_sha256" ]; then

@@ -1,8 +1,9 @@
 use sha2::{Digest, Sha256};
-use std::fs;
-use std::io::Cursor;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use zfs_send_extract::client::{SourceCatalog, SourceKind};
 use zfs_send_extract::stream::{RECORD_SIZE, RecordKind, StreamReader};
 
 fn fixture(name: &str) -> PathBuf {
@@ -20,6 +21,42 @@ fn run(arguments: &[&str]) -> Output {
 
 fn sha256(path: &Path) -> String {
     format!("{:x}", Sha256::digest(fs::read(path).unwrap()))
+}
+
+fn expand_native_encrypted_pool(target: &Path) {
+    let compressed = File::open(fixture("native-encrypted-pool.img.zst")).unwrap();
+    let mut decoder = ruzstd::decoding::StreamingDecoder::new(compressed).unwrap();
+    let mut output = File::create(target).unwrap();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut length = 0_u64;
+    loop {
+        let read = decoder.read(&mut buffer).unwrap();
+        if read == 0 {
+            break;
+        }
+        if buffer[..read].iter().all(|byte| *byte == 0) {
+            output.seek(SeekFrom::Current(read as i64)).unwrap();
+        } else {
+            output.write_all(&buffer[..read]).unwrap();
+        }
+        length += read as u64;
+    }
+    output.set_len(length).unwrap();
+    assert_eq!(length, 128 * 1024 * 1024);
+}
+
+fn flip_byte_at(path: &Path, offset: u64) {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    let mut byte = [0_u8; 1];
+    file.read_exact(&mut byte).unwrap();
+    byte[0] ^= 0x40;
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    file.write_all(&byte).unwrap();
 }
 
 #[test]
@@ -220,6 +257,169 @@ fn raw_encrypted_send_lists_and_extracts_with_an_authenticated_key() {
     assert!(
         String::from_utf8_lossy(&rejected.stderr).contains("supplied key did not authenticate")
     );
+}
+
+#[test]
+fn native_encrypted_pool_lists_and_extracts_with_an_authenticated_key() {
+    let temporary = tempfile::tempdir().unwrap();
+    let member = temporary.path().join("native-encrypted-pool.img");
+    expand_native_encrypted_pool(&member);
+
+    let key = temporary.path().join("passphrase");
+    fs::write(&key, b"hunter2!\n").unwrap();
+
+    let missing_key = run(&[
+        "pool",
+        "list",
+        member.to_str().unwrap(),
+        "encpool/secret",
+        "/",
+    ]);
+    assert!(!missing_key.status.success());
+    assert!(String::from_utf8_lossy(&missing_key.stderr).contains("--key-file"));
+
+    let wrong_key = temporary.path().join("wrong-passphrase");
+    fs::write(&wrong_key, b"definitely-wrong\n").unwrap();
+    let rejected = run(&[
+        "pool",
+        "list",
+        member.to_str().unwrap(),
+        "encpool/secret",
+        "/",
+        "--key-file",
+        wrong_key.to_str().unwrap(),
+    ]);
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("supplied key did not authenticate")
+    );
+
+    let list = run(&[
+        "pool",
+        "list",
+        member.to_str().unwrap(),
+        "encpool/secret",
+        "/",
+        "--key-file",
+        key.to_str().unwrap(),
+    ]);
+    assert!(
+        list.status.success(),
+        "{}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let directory = String::from_utf8_lossy(&list.stdout);
+    assert!(directory.contains("blob.bin"));
+    assert!(directory.contains("greeting.txt"));
+
+    let catalog = SourceCatalog::open_pool(&member).unwrap();
+    assert_eq!(catalog.kind, SourceKind::PoolMember);
+    let encrypted_view = catalog
+        .views
+        .iter()
+        .position(|view| view.selector == "encpool/secret")
+        .unwrap();
+    assert!(catalog.views[encrypted_view].encrypted);
+    assert!(
+        catalog
+            .list_directory(encrypted_view, "/", None)
+            .unwrap_err()
+            .to_string()
+            .contains("choose its passphrase key file")
+    );
+    assert!(
+        catalog
+            .list_directory(encrypted_view, "/", Some(&wrong_key))
+            .unwrap_err()
+            .to_string()
+            .contains("supplied key did not authenticate")
+    );
+    assert!(
+        catalog
+            .list_directory(encrypted_view, "/", Some(&key))
+            .unwrap()
+            .iter()
+            .any(|entry| entry.name == "greeting.txt")
+    );
+    let client_target = temporary.path().join("client-greeting.txt");
+    let client_extraction = catalog
+        .extract(
+            encrypted_view,
+            "/greeting.txt",
+            &client_target,
+            false,
+            Some(&key),
+        )
+        .unwrap();
+    assert_eq!(client_extraction.logical_size, 20);
+    assert_eq!(fs::read(&client_target).unwrap(), b"hello-encrypted-zfs\n");
+
+    for (source, name, expected_size, expected_sha256) in [
+        (
+            "/greeting.txt",
+            "greeting.txt",
+            20,
+            "fb13243e8d0033038d1740d8bb6cc0c9f34dd7087f9de133c6813530bb36d042",
+        ),
+        (
+            "/blob.bin",
+            "blob.bin",
+            8192,
+            "99b3de991bdff384c8489a793fb8698ba4002fbff01acb2c20dc0b79dc8cdf42",
+        ),
+    ] {
+        let target = temporary.path().join(name);
+        let extract = run(&[
+            "pool",
+            "extract",
+            member.to_str().unwrap(),
+            "encpool/secret",
+            source,
+            "--output",
+            target.to_str().unwrap(),
+            "--key-file",
+            key.to_str().unwrap(),
+        ]);
+        assert!(
+            extract.status.success(),
+            "{}",
+            String::from_utf8_lossy(&extract.stderr)
+        );
+        assert_eq!(fs::metadata(&target).unwrap().len(), expected_size);
+        assert_eq!(sha256(&target), expected_sha256);
+        assert!(!PathBuf::from(format!("{}.zfse.json", target.display())).exists());
+    }
+
+    // This fixture's encrypted dnode array has two DVAs. Corrupting the first
+    // verifies folded-checksum rejection and alternate-copy fallback; corrupting
+    // both proves unauthenticated metadata is never returned.
+    flip_byte_at(&member, 4_747_264);
+    let fallback = run(&[
+        "pool",
+        "list",
+        member.to_str().unwrap(),
+        "encpool/secret",
+        "/",
+        "--key-file",
+        key.to_str().unwrap(),
+    ]);
+    assert!(
+        fallback.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fallback.stderr)
+    );
+    flip_byte_at(&member, 21_516_288);
+    let corrupt = run(&[
+        "pool",
+        "list",
+        member.to_str().unwrap(),
+        "encpool/secret",
+        "/",
+        "--key-file",
+        key.to_str().unwrap(),
+    ]);
+    assert!(!corrupt.status.success());
+    assert!(String::from_utf8_lossy(&corrupt.stderr).contains("checksum mismatch"));
 }
 
 #[test]

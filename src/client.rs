@@ -10,6 +10,7 @@ use crate::operations::{self, EncryptionRequirement, Sidecar};
 use crate::pool::{PoolExtraction, PoolMember};
 use crate::stream::FEATURE_RAW;
 use anyhow::{Context, Result, anyhow, bail};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -33,7 +34,7 @@ pub struct SourceView {
     pub selector: String,
     /// True when extracting from this view writes incremental-update metadata.
     pub update_eligible: bool,
-    /// True when this send-stream view requires a ZFS key to browse.
+    /// True when this source view requires a ZFS key to browse.
     pub encrypted: bool,
 }
 
@@ -145,21 +146,36 @@ impl SourceCatalog {
         let inspection = pool.inspect()?;
         let datasets = pool.datasets()?;
         let snapshots = pool.snapshots(None)?;
+        let mut encrypted_datasets = BTreeMap::new();
+        for dataset in &datasets {
+            encrypted_datasets.insert(
+                dataset.name.clone(),
+                pool.encryption_requirement(&dataset.name)?.is_some(),
+            );
+        }
         let mut views = Vec::with_capacity(datasets.len() + snapshots.len());
         for snapshot in snapshots {
+            let encrypted = encrypted_datasets
+                .get(&snapshot.dataset)
+                .copied()
+                .unwrap_or(false);
             views.push(SourceView {
                 label: format!("{}  —  snapshot", snapshot.full_name),
                 selector: snapshot.full_name,
                 update_eligible: true,
-                encrypted: false,
+                encrypted,
             });
         }
         for dataset in datasets {
+            let encrypted = encrypted_datasets
+                .get(&dataset.name)
+                .copied()
+                .unwrap_or(false);
             views.push(SourceView {
                 label: format!("{}  —  current (read-only)", dataset.name),
                 selector: dataset.name,
                 update_eligible: false,
-                encrypted: false,
+                encrypted,
             });
         }
         if views.is_empty() {
@@ -191,8 +207,8 @@ impl SourceCatalog {
             .ok_or_else(|| anyhow!("selected source view {index} no longer exists"))
     }
 
-    /// List one directory. `key_file` is consulted only for a raw encrypted
-    /// send and is never retained in the catalog.
+    /// List one directory. `key_file` is consulted only for an encrypted
+    /// source and is never retained in the catalog.
     pub fn list_directory(
         &self,
         view_index: usize,
@@ -211,7 +227,13 @@ impl SourceCatalog {
                 )
             }
             SourceKind::PoolMember => {
-                PoolMember::open(&self.path)?.list_directory(&view.selector, path)
+                let pool = PoolMember::open(&self.path)?;
+                let key = key_for_pool(&pool, &view.selector, key_file)?;
+                pool.list_directory_with_key(
+                    &view.selector,
+                    path,
+                    key.as_deref().map(Vec::as_slice),
+                )
             }
         }
     }
@@ -240,11 +262,14 @@ impl SourceCatalog {
                 Ok(extraction_from_sidecar(sidecar))
             }
             SourceKind::PoolMember => {
-                let extraction = PoolMember::open(&self.path)?.extract(
+                let pool = PoolMember::open(&self.path)?;
+                let key = key_for_pool(&pool, &view.selector, key_file)?;
+                let extraction = pool.extract_with_key(
                     &view.selector,
                     source_path,
                     destination,
                     force,
+                    key.as_deref().map(Vec::as_slice),
                 )?;
                 Ok(extraction_from_pool(extraction))
             }
@@ -300,13 +325,18 @@ impl SourceCatalog {
                     image_length,
                 )
             }
-            SourceKind::PoolMember => InceptionSession::from_pool_at(
-                &self.path,
-                &view.selector,
-                image_path,
-                image_offset,
-                image_length,
-            ),
+            SourceKind::PoolMember => {
+                let pool = PoolMember::open(&self.path)?;
+                let key = key_for_pool(&pool, &view.selector, key_file)?;
+                InceptionSession::from_pool_at_with_key(
+                    &self.path,
+                    &view.selector,
+                    image_path,
+                    key.as_deref().map(Vec::as_slice),
+                    image_offset,
+                    image_length,
+                )
+            }
         }
     }
 }
@@ -349,6 +379,15 @@ fn key_for_snapshot(
     read_key_for_requirement(requirement, key_file)
 }
 
+fn key_for_pool(
+    pool: &PoolMember,
+    selector: &str,
+    key_file: Option<&Path>,
+) -> Result<Option<Zeroizing<Vec<u8>>>> {
+    let requirement = pool.encryption_requirement(selector)?;
+    read_key_for_requirement(requirement, key_file)
+}
+
 fn read_key_for_requirement(
     requirement: Option<EncryptionRequirement>,
     key_file: Option<&Path>,
@@ -358,7 +397,7 @@ fn read_key_for_requirement(
     };
     let path = key_file.ok_or_else(|| {
         anyhow!(
-            "{} uses a raw encrypted send; choose its {} key file first",
+            "{} is encrypted; choose its {} key file first",
             requirement.dataset_name,
             requirement.key_format
         )

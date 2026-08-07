@@ -115,6 +115,9 @@ enum PoolCommand {
         /// Absolute path inside the dataset or snapshot.
         #[arg(default_value = "/")]
         path: String,
+        /// File containing the ZFS passphrase, hex key, or 32-byte raw key.
+        #[arg(long, value_name = "FILE")]
+        key_file: Option<PathBuf>,
     },
     /// Extract one regular file directly from a dataset or snapshot.
     Extract {
@@ -130,6 +133,9 @@ enum PoolCommand {
         /// Replace an existing destination.
         #[arg(long)]
         force: bool,
+        /// File containing the ZFS passphrase, hex key, or 32-byte raw key.
+        #[arg(long, value_name = "FILE")]
+        key_file: Option<PathBuf>,
     },
     /// Explore a disk image stored as a regular file in a dataset or snapshot.
     Inception {
@@ -214,6 +220,8 @@ enum PoolInceptionCommand {
         member: PathBuf,
         dataset: String,
         image: String,
+        #[arg(long, value_name = "FILE")]
+        key_file: Option<PathBuf>,
         #[command(flatten)]
         window: ImageWindow,
         #[arg(long)]
@@ -226,6 +234,8 @@ enum PoolInceptionCommand {
         image: String,
         #[arg(default_value = "/")]
         path: String,
+        #[arg(long, value_name = "FILE")]
+        key_file: Option<PathBuf>,
         #[arg(long)]
         volume: Option<String>,
         #[command(flatten)]
@@ -241,6 +251,8 @@ enum PoolInceptionCommand {
         output: PathBuf,
         #[arg(long)]
         force: bool,
+        #[arg(long, value_name = "FILE")]
+        key_file: Option<PathBuf>,
         #[arg(long)]
         volume: Option<String>,
         #[command(flatten)]
@@ -410,9 +422,13 @@ fn run_pool(command: PoolCommand) -> Result<()> {
             member,
             dataset,
             path,
+            key_file,
         } => {
             let pool = PoolMember::open(&member)?;
-            for entry in pool.list_directory(&dataset, &path)? {
+            let key = load_pool_key_material(&pool, &dataset, key_file.as_ref())?;
+            for entry in
+                pool.list_directory_with_key(&dataset, &path, key.as_deref().map(Vec::as_slice))?
+            {
                 let kind = match entry.dirent_type {
                     4 => 'd',
                     8 => 'f',
@@ -431,9 +447,17 @@ fn run_pool(command: PoolCommand) -> Result<()> {
             path,
             output,
             force,
+            key_file,
         } => {
             let pool = PoolMember::open(&member)?;
-            let extraction = pool.extract(&dataset, &path, &output, force)?;
+            let key = load_pool_key_material(&pool, &dataset, key_file.as_ref())?;
+            let extraction = pool.extract_with_key(
+                &dataset,
+                &path,
+                &output,
+                force,
+                key.as_deref().map(Vec::as_slice),
+            )?;
             println!(
                 "extracted {} bytes from object {} to {} (sha256 {})",
                 extraction.logical_size,
@@ -533,13 +557,17 @@ fn run_pool_inception(command: PoolInceptionCommand) -> Result<()> {
             member,
             dataset,
             image,
+            key_file,
             window,
             json,
         } => {
-            let session = InceptionSession::from_pool_at(
+            let pool = PoolMember::open(&member)?;
+            let key = load_pool_key_material(&pool, &dataset, key_file.as_ref())?;
+            let session = InceptionSession::from_pool_at_with_key(
                 &member,
                 &dataset,
                 &image,
+                key.as_deref().map(Vec::as_slice),
                 window.image_offset,
                 window.image_length,
             )?;
@@ -550,13 +578,17 @@ fn run_pool_inception(command: PoolInceptionCommand) -> Result<()> {
             dataset,
             image,
             path,
+            key_file,
             volume,
             window,
         } => {
-            let session = InceptionSession::from_pool_at(
+            let pool = PoolMember::open(&member)?;
+            let key = load_pool_key_material(&pool, &dataset, key_file.as_ref())?;
+            let session = InceptionSession::from_pool_at_with_key(
                 &member,
                 &dataset,
                 &image,
+                key.as_deref().map(Vec::as_slice),
                 window.image_offset,
                 window.image_length,
             )?;
@@ -569,13 +601,17 @@ fn run_pool_inception(command: PoolInceptionCommand) -> Result<()> {
             path,
             output,
             force,
+            key_file,
             volume,
             window,
         } => {
-            let session = InceptionSession::from_pool_at(
+            let pool = PoolMember::open(&member)?;
+            let key = load_pool_key_material(&pool, &dataset, key_file.as_ref())?;
+            let session = InceptionSession::from_pool_at_with_key(
                 &member,
                 &dataset,
                 &image,
+                key.as_deref().map(Vec::as_slice),
                 window.image_offset,
                 window.image_length,
             )?;
@@ -680,13 +716,22 @@ fn load_apply_key_material(
     load_key_for_requirement(requirement, key_file)
 }
 
+fn load_pool_key_material(
+    pool: &PoolMember,
+    dataset: &str,
+    key_file: Option<&PathBuf>,
+) -> Result<Option<Zeroizing<Vec<u8>>>> {
+    let requirement = pool.encryption_requirement(dataset)?;
+    load_key_for_requirement(requirement, key_file)
+}
+
 fn load_key_for_requirement(
     requirement: Option<operations::EncryptionRequirement>,
     key_file: Option<&PathBuf>,
 ) -> Result<Option<Zeroizing<Vec<u8>>>> {
     let Some(requirement) = requirement else {
         if key_file.is_some() {
-            anyhow::bail!("--key-file is only valid for a raw encrypted send");
+            anyhow::bail!("--key-file is only valid for an encrypted source");
         }
         return Ok(None);
     };
@@ -722,7 +767,7 @@ fn load_key_for_requirement(
     }
     if !io::stdin().is_terminal() {
         anyhow::bail!(
-            "encrypted send requires --key-file when standard input is not an interactive terminal"
+            "encrypted source requires --key-file when standard input is not an interactive terminal"
         );
     }
     let prompt = format!(
@@ -836,6 +881,8 @@ mod tests {
             "report.docx",
             "--volume",
             "mbr1",
+            "--key-file",
+            "pool.key",
             "--image-offset",
             "4096",
         ])
@@ -847,6 +894,7 @@ mod tests {
                         PoolInceptionCommand::Extract {
                             dataset,
                             volume,
+                            key_file,
                             window,
                             ..
                         },
@@ -857,6 +905,7 @@ mod tests {
         };
         assert_eq!(dataset, "tank/vms@nightly");
         assert_eq!(volume.as_deref(), Some("mbr1"));
+        assert_eq!(key_file.as_deref(), Some(std::path::Path::new("pool.key")));
         assert_eq!(window.image_offset, 4096);
     }
 }

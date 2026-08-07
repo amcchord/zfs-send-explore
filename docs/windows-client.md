@@ -40,7 +40,7 @@ From top to bottom:
 4. **Open pool / drive** — reads ZFS labels and pool metadata directly from a member or image.
 5. **View selector** — chooses the exact send snapshot, pool snapshot, or current read-only dataset head.
 6. **Path, Up, and Go** — navigates an absolute path inside the selected filesystem view.
-7. **Decryption key** — selects a passphrase, hex-key, or 32-byte raw-key file for a raw encrypted send.
+7. **Decryption key** — selects a passphrase, hex-key, or 32-byte raw-key file for a raw encrypted send or native-encrypted pool dataset.
 8. **Inner volume selector** — chooses a detected partition while inception mode is active.
 9. **Image offset and length** — optionally bound a raw, QCOW2, or VMDK container inside the selected ZFS file; decimal and `0x` hexadecimal values are accepted.
 10. **Explore disk image / Leave disk image** — enters or leaves the subordinate filesystem without mounting it.
@@ -121,13 +121,13 @@ The sidecar records the source path, DMU object identity, base snapshot GUID, lo
 
 An extraction from a current pool dataset head deliberately has no update-eligible sidecar because a moving head is not a valid incremental-send base.
 
-## Browse a raw encrypted send
+## Browse an encrypted source
 
-Snapshot names and stream framing remain visible in a raw send created by `zfs send -w`, but paths and file contents require the dataset key. Opening the source before choosing a key produces an explicit prompt instead of displaying unauthenticated data.
+Snapshot names and stream framing remain visible in a raw send created by `zfs send -w`, but paths and file contents require the dataset key. A native-encrypted pool likewise exposes its dataset and snapshot catalog before requiring the key for filesystem traversal. Opening either encrypted view before choosing a key produces an explicit prompt instead of displaying unauthenticated data.
 
 ![The raw encrypted send asking for a dataset key](screenshots/windows/encrypted-key-required.jpg)
 
-1. Open the raw send file.
+1. Open the raw send file or exported pool member and select its encrypted view.
 2. Select **Decryption key**.
 3. Choose one of the supported key-file formats:
    - passphrase text, with one final newline ignored;
@@ -139,7 +139,7 @@ Snapshot names and stream framing remain visible in a raw send created by `zfs s
 
 ![A file inside an authenticated raw encrypted snapshot](screenshots/windows/encrypted-browse.jpg)
 
-Key-file reads are bounded. Key bytes are zeroized after the operation and are never saved in `.zfse.json`. Authentication tags, encrypted metadata, block tags, spill blocks, and supported indirect authentication state are verified before plaintext is used.
+Key-file reads are bounded. Key bytes are zeroized after the operation and are never saved in `.zfse.json`. Authentication tags, encrypted metadata, block tags, spill blocks, and supported indirect authentication state are verified before plaintext is used. For native-encrypted pools this also includes inherited encryption-root discovery, wrapped-key authentication, the objset portable MAC, encrypted dnode bonuses, and the folded physical checksum stored beside each MAC.
 
 ## Browse an attached drive or whole-disk image
 
@@ -176,10 +176,10 @@ Direct pool support is intentionally conservative:
 
 - one top-level disk or file vdev;
 - one healthy leaf from one top-level mirror;
-- plaintext ZFS filesystem datasets; and
+- plaintext or native-encrypted little-endian ZFS filesystem datasets; and
 - the checksum, compression, ZAP, System Attribute, and indirection profiles listed in the main README.
 
-RAIDZ/dRAID, several top-level vdevs, native-encrypted on-disk datasets, special/dedup allocation classes, device-removal maps, gang blocks, and ZVOL file browsing are rejected. A send file can still be used when the direct member reader cannot assemble the pool layout.
+RAIDZ/dRAID, several top-level vdevs, encrypted big-endian pools, special/dedup allocation classes, device-removal maps, gang blocks, and ZVOL file browsing are rejected. A send file can still be used when the direct member reader cannot assemble the pool layout.
 
 ## Sparse-file behavior
 
@@ -256,7 +256,7 @@ The target is copied into a same-directory sparse temporary file. Matching `OBJE
 | --- | --- |
 | **Access is denied** when opening `PhysicalDriveN` | Start the client with **Run as administrator**, confirm the disk number, and close utilities that hold the raw device exclusively. |
 | **No readable ZFS vdev label** | Confirm the pool was exported, the correct member or image was selected, and its layout is supported. For a whole disk, confirm that exactly one partition contains the intended vdev. |
-| **Choose its passphrase key file first** | Select **Decryption key** and use the key format configured for that dataset. |
+| **Choose its passphrase key file first** | Select **Decryption key** and use the key format configured for that raw send or native-encrypted pool dataset. |
 | The view is incremental but cannot be browsed | The send file is missing its full base or an earlier incremental in the ancestry chain. Use a self-contained history file. |
 | **Extraction metadata** cannot be opened | Keep `<file>.zfse.json` beside the extracted file, or re-extract from the named base snapshot. |
 | Target hash or size differs | The extracted file was changed locally. Preserve it and re-extract a clean base before applying the incremental. |
@@ -313,4 +313,4 @@ The run covered:
 - a read-only 1 GiB single-vdev pool member with two snapshots; and
 - a 256 MiB logical sparse file with 256 KiB allocated on NTFS.
 
-The repository test suite, native clippy pass, Windows-target clippy pass, and release cross-build were rerun after the Windows-only update, raw-device, and sparse-leaf fixes discovered during this validation.
+The v0.3.0 repository tests additionally exercise the same Windows service layer against a real OpenZFS 2.2.2 AES-256-GCM pool fixture, including encrypted-view detection, missing/wrong-key rejection, directory listing, and byte-exact extraction. The repository test suite, native clippy pass, Windows-target clippy pass, and release cross-build were rerun after the Windows-only update, raw-device, sparse-leaf, and native-pool encryption changes.

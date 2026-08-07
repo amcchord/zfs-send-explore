@@ -1,6 +1,6 @@
 # Validation evidence
 
-The committed integration fixtures and the larger lab scenarios below were produced with OpenZFS 2.3.2 on Debian 13 x86-64. Fixture tests run without ZFS; the lab runs independently compare extracted files with mounted source snapshots and record exact sizes and SHA-256 hashes.
+The committed send-stream fixtures and the larger lab scenarios below were produced with OpenZFS 2.3.2 on Debian 13 x86-64. The native-encrypted pool fixture is a separately licensed OpenZFS 2.2.2 image with provenance recorded below. Fixture tests run without ZFS; the lab runs independently compare extracted files with mounted source snapshots and record exact sizes and SHA-256 hashes.
 
 ## Native Windows client validation
 
@@ -101,7 +101,38 @@ The mirror pool was then extended with a `compression=zstd-3` filesystem. Two in
 
 All four Zstandard extractions matched their source hashes. The codec tests additionally cover off, LZJB, LZ4, gzip, ZLE, Zstandard framing, malformed Zstandard lengths, and rejection of invalid on-disk inherit/default sentinels.
 
-Guardrail checks used a two-top-level-vdev stripe, which was rejected from either incomplete member, and a native-encrypted dataset, which produced an explicit unsupported-profile error before any encrypted block was decoded. Current-head extraction was also checked independently: it returned the expected 19,922,944-byte file and removed a deliberately stale incremental-send sidecar.
+Guardrail checks used a two-top-level-vdev stripe, which was rejected from either incomplete member. Current-head extraction was also checked independently: it returned the expected 19,922,944-byte file and removed a deliberately stale incremental-send sidecar.
+
+## Native-encrypted pool dataset
+
+The v0.3.0 integration suite adds a real 128 MiB single-file vdev created by
+OpenZFS 2.2.2. It contains `encpool/secret`, an `aes-256-gcm` encryption root
+using `keyformat=passphrase`, `pbkdf2iters=100000`, and the intentionally public
+fixture passphrase `hunter2!`. The 117 KiB checked-in Zstandard frame expands
+sparsely during the test. Its compressed SHA-256 is
+`a385c16289cdaffe09b2ee8f77fa3d7b29ed1cf17b063e112b2f33c283f4decd`;
+the expanded image SHA-256 is
+`41c6c49389123d93824b8d2c94c8a3959116e8b007becb079daa9bcbf2e476d6`.
+
+The command-line and Windows service-layer paths both detect the encrypted
+view, reject a missing key, and reject a wrong passphrase during wrapped-key
+authentication. With the correct key they verify the objset portable HMAC,
+folded physical checksums, partially encrypted dnode metadata, directory ZAP
+blocks, and file-data AEAD tags. The test lists both root entries and extracts:
+
+| Path | Size | SHA-256 |
+| --- | ---: | --- |
+| `/greeting.txt` | 20 bytes | `fb13243e8d0033038d1740d8bb6cc0c9f34dd7087f9de133c6813530bb36d042` |
+| `/blob.bin` | 8192 bytes | `99b3de991bdff384c8489a793fb8698ba4002fbff01acb2c20dc0b79dc8cdf42` |
+
+Both hashes and the exact greeting bytes match the independent fixture
+oracles. A corruption check then flips one encrypted dnode DVA, confirms the
+folded-checksum failure falls back to the valid second copy, corrupts that copy
+as well, and confirms traversal fails instead of returning unauthenticated
+metadata. Current-head extraction intentionally produces no incremental sidecar.
+The source image, upstream commit, BSD 3-Clause redistribution text, key, and
+hashes are recorded in
+[`../tests/fixtures/native-encrypted-pool.README.md`](../tests/fixtures/native-encrypted-pool.README.md).
 
 ## Advanced send profiles
 

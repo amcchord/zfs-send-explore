@@ -56,6 +56,41 @@ The direct backend starts at each of the four 256 KiB vdev labels and uses the h
 
 Blocks are fetched with positioned reads and never cached as a whole-vdev buffer. Every Fletcher-2, Fletcher-4, or SHA-256 checksum present is checked before decompression; a mismatch is fatal for that DVA, and alternate DVA copies are tried before extraction fails. A block explicitly configured with checksum `off` has no checksum to validate. Inherit/default sentinels, unsupported checksum algorithms, gang blocks, and DVAs naming unavailable top-level vdevs fail explicitly.
 
+### Native-encrypted pool datasets
+
+The selected DSL dataset's `ds_bp` crypt bit determines whether a key is
+required. Key discovery starts at that dataset's DSL directory and follows
+`dd_parent_obj` until it finds `com.datto:crypto_key_obj`, matching OpenZFS key
+inheritance. The referenced fat ZAP supplies the cipher suite, crypto GUID and
+version, wrapped master/HMAC keys, wrapping IV/MAC, key format, and PBKDF2
+parameters. Integer ZAP arrays are converted from their on-disk big-endian
+element representation before the same bounded raw/hex/passphrase unwrap path
+used by encrypted sends is invoked.
+
+Native-encryption overloads block-pointer crypt bit 61 for three cases. An
+encrypted level-zero type carries ciphertext; an authenticated level-zero type
+keeps plaintext and carries a truncated HMAC-SHA512; and an indirect pointer
+carries a SHA-512 checksum of its children's portable property/MAC tuples.
+Before any of those checks, the ordinary physical checksum is verified. For
+Fletcher-2/4 protected pointers, OpenZFS XOR-folds checksum words 2/3 into words
+0/1 before replacing the discarded half with the MAC, so the reader reproduces
+that fold rather than comparing an unmodified checksum.
+
+The objset block is plaintext and has a special portable HMAC over its type,
+portable flags, and normalized meta-dnode. Dnode-array blocks are partially
+encrypted: each portable 64-byte core, normalized block-pointer tuple, spill
+pointer, and unencrypted bonus region becomes AEAD additional data, while
+encrypted bonus regions are gathered and decrypted as one stream. Directory
+ZAPs, SA data, and ordinary file blocks use whole-block AES-CCM/GCM after
+HKDF-SHA512 key derivation. Authentication always precedes decompression or ZPL
+parsing, and every failed DVA can fall back to another recorded copy.
+
+The implemented suites are AES-128/192/256-CCM and AES-128/192/256-GCM with
+crypto-key format versions 0 and 1. Native-encrypted big-endian pool datasets
+remain explicitly unsupported until byte-swapped objset, dnode, BP-MAC, and
+AEAD parameter vectors are available. Plaintext big-endian pool support is
+unchanged.
+
 OpenZFS Zstandard blocks start with a big-endian compressed length and version/level word, followed by a Zstandard frame written without the standard four-byte magic. The reader bounds the input using that compressed length, restores the standard magic for the pure-Rust decoder, and requires the result to match the block pointer's logical size exactly. This works for both ordinary DVA-backed blocks and compressed payloads in embedded block pointers.
 
 The MOS object directory's `root_dataset` entry opens the DSL directory tree. `dd_child_dir_zapobj` enumerates filesystem datasets, while the head dataset's `ds_snapnames_zapobj` maps snapshot names to snapshot dataset objects. Each chosen head or snapshot contributes its `ds_bp`, which roots a ZPL objset. Named snapshots use the permanent `ds_guid` at bonus offset 112 for send-compatible extraction sidecars.
@@ -64,7 +99,7 @@ Embedded block pointers store 14 payload words inline, excluding `blk_prop` (wor
 
 ## Inception-mode layered reads
 
-Inception mode converts one resolved regular ZPL file into the same finite positioned-read interface for both source backends. A pool source translates each requested range into dnode block ids, follows direct or indirect block pointers, verifies and decompresses only those blocks, and fills holes or short final blocks with zeroes. A send source scans the selected full/incremental chain once and builds a non-overlapping interval map whose leaves identify replay payload offsets and encodings. Later reads reopen payloads with positioned I/O, confirm the payload CRC captured during the checked scan, authenticate/decrypt raw records where necessary, decode only intersecting blocks, and retain one decoded block in a synchronized cache.
+Inception mode converts one resolved regular ZPL file into the same finite positioned-read interface for both source backends. A pool source translates each requested range into dnode block ids, follows direct or indirect block pointers, authenticates/decrypts a native-encrypted outer dataset when selected, verifies and decompresses only those blocks, and fills holes or short final blocks with zeroes. A send source scans the selected full/incremental chain once and builds a non-overlapping interval map whose leaves identify replay payload offsets and encodings. Later reads reopen payloads with positioned I/O, confirm the payload CRC captured during the checked scan, authenticate/decrypt raw records where necessary, decode only intersecting blocks, and retain one decoded block in a synchronized cache.
 
 An explicit image offset and length first create a hard-bounded view of the ZFS file. Container detection then recognizes QCOW2 by `QFI\xfb` and VMDK sparse extents by `KDMV`; an unrecognized prefix remains raw. QCOW2 v2/v3 cluster lookup handles unallocated/zero, ordinary, and DEFLATE-compressed clusters, but rejects backing files, encryption, and incompatible external/extended layouts. The VMDK reader accepts only an embedded-descriptor `monolithicSparse` extent and rejects descriptor-only, split, flat, and stream-optimized layouts rather than attempting to locate other files.
 
