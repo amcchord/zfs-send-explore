@@ -5,7 +5,7 @@
 The extraction machine does **not** need ZFS, `libzfs`, or a ZFS kernel module. The tool never invokes `zfs` or `zpool`, and pool members are opened read-only.
 
 > [!IMPORTANT]
-> This is an early `0.2.0` implementation. The CLI, Windows UI, sidecar format, and supported on-disk profile may change. Stream fixtures are produced on little-endian OpenZFS systems. Linux validates the core end to end, and CI builds and tests the native Windows target.
+> This is an early `0.2.1` implementation. The CLI, Windows UI, sidecar format, and supported on-disk profile may change. Stream fixtures are produced on little-endian OpenZFS systems. Linux validates the core end to end, and CI runs the full test suite and release packaging on native Windows.
 
 Detailed implementation and validation material lives in:
 
@@ -30,9 +30,9 @@ Detailed implementation and validation material lives in:
 | Read embedded-data replay records from `zfs send -e` | Supported |
 | Browse a single exported disk/file vdev or one leaf of a single top-level mirror | Supported |
 | Browse current datasets and named snapshots directly from a pool member | Supported |
-| Explore a raw or sparse disk image stored as a regular ZFS file | Supported, including explicit byte offset/length windows |
-| Explore self-contained QCOW2 and VMDK sparse containers stored on ZFS | QCOW2 v2/v3 and VMDK `monolithicSparse` |
-| Browse and extract from a subordinate filesystem (“inception mode”) | NTFS, FAT12/16/32, exFAT, ext4, and compatible ext2 |
+| Explore a raw or sparse disk image stored as a regular ZFS file | Supported, including explicit byte offset/length windows; validated across every subordinate filesystem below |
+| Explore self-contained QCOW2 and VMDK sparse containers stored on ZFS | QCOW2 v2/v3 and VMDK `monolithicSparse`; sparse QCOW2 v3 and VMDK are in the full matrix |
+| Browse and extract from a subordinate filesystem (“inception mode”) | NTFS, FAT12/16/32, exFAT, ext4, and compatible ext2; all seven are in the full matrix |
 | Native Windows snapshot browser and extractor | Supported as `zfs-send-explore-windows.exe` |
 | Open a GPT whole-disk image or `\\.\PhysicalDriveN` | Supported when exactly one partition has a supported ZFS vdev label |
 | Preserve sparse holes during extraction and incremental updates | Supported; zero ranges are deallocated when the destination filesystem permits it |
@@ -274,6 +274,14 @@ The layer support is deliberately explicit:
 | FAT | FAT12, FAT16, FAT32, and exFAT directory browsing and regular-file extraction |
 | ext | ext4 and compatible ext2 directory browsing and regular-file extraction |
 
+### What the inception release gate validates
+
+The v0.2.1 release gate runs a 63-case cross-product: FAT12, FAT16, FAT32, exFAT, NTFS, ext4, and compatible ext2 are each tested unpartitioned, in MBR, and in GPT; every resulting disk is then tested as raw, sparse QCOW2 v3, and VMDK `monolithicSparse`. Each case detects the layers, lists a real directory, resolves a nested path, extracts through an explicit volume selector, and compares exact bytes.
+
+Focused tests additionally validate resident, non-resident, and sparse NTFS data; a 512-entry NTFS directory index; FAT/exFAT long names, nested paths, and case-insensitive lookup; ext2/ext4 holes; and refusal to follow ext symlinks. Corruption tests cover QCOW1, QCOW2 backing files and encryption, external VMDK descriptors, invalid and backup GPT metadata, out-of-bounds MBR entries, looping EBR chains, unknown filesystems, unsafe paths, multiple-volume selection, and explicit container windows.
+
+QCOW2 v2, deflate-compressed QCOW2 clusters, and 4096-byte-sector GPT are implemented reader profiles but are not members of the 63-case cross-product. The Windows UI service layer has automated list/extract coverage and the complete suite runs on native Windows CI; this is distinct from a scripted interactive UI walkthrough for every matrix case. Fixture provenance and hashes are recorded in [`tests/fixtures/inception/README.md`](tests/fixtures/inception/README.md), with detailed results in [`docs/test-evidence.md`](docs/test-evidence.md).
+
 QCOW1, QCOW2 overlays that require a backing file, encrypted QCOW2, multi-file/split/flat/stream-optimized VMDK, NTFS-compressed or EFS-encrypted data, and non-UTF-8 ext names are reported rather than silently misread. ext symlinks are listed but never followed during extraction. Inception mode extracts one regular file and does not recreate inner ACLs, alternate NTFS streams, ownership, permissions, or directory trees.
 
 For send streams, the selected snapshot chain is scanned once when the image is opened to build a compact map from virtual ZFS-file ranges to replay payloads. Reads then decode only the blocks requested by the partition and filesystem readers, with a one-block cache. Pool-member reads similarly fetch only the addressed ZFS blocks. Sparse virtual disk capacity therefore does not become an equivalent RAM or temporary-disk requirement.
@@ -356,6 +364,8 @@ It deliberately rejects:
 ## Validation and fixtures
 
 The committed fixtures were produced by OpenZFS 2.3.2 and cover plaintext full and incremental streams, a three-snapshot archive, AES-256-GCM raw encrypted sends, raw incremental and spill records, Zstandard raw blocks, compressed replay records, and embedded-data records. Automated tests exercise stream inspection, snapshot selection, directory listing, extraction, key rejection, authentication failure, plaintext and raw incremental updates, positioned block reads, codec handling, and checksum-corruption rejection.
+
+Inception mode additionally has a 63-case matrix spanning FAT12/16/32, exFAT, NTFS, ext4, and compatible ext2 across unpartitioned, MBR, and GPT layouts in raw, sparse QCOW2, and `monolithicSparse` VMDK containers. The real-volume fixture loader verifies compressed and raw SHA-256 values; focused tests cover sparse files, long and nested names, case-insensitive lookup, ext holes and symlinks, offsets, volume selection, corrupt partition metadata, and unsupported container profiles.
 
 The larger Linux lab scenarios have validated:
 
