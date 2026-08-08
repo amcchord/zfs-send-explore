@@ -7,6 +7,8 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 $Executable = Join-Path $Root "target\release\zfs-send-explore-windows.exe"
 $Output = Join-Path $Root $OutputDirectory
+$Trace = Join-Path $env:RUNNER_TEMP "zfse-ui-startup.txt"
+$env:ZFSE_UI_TRACE = $Trace
 
 if (-not (Test-Path $Executable)) {
     throw "Build the release Windows client before capturing screenshots: $Executable"
@@ -21,6 +23,8 @@ using System;
 using System.Runtime.InteropServices;
 
 public static class ZfseWindowCapture {
+    public delegate bool EnumWindowsCallback(IntPtr hwnd, IntPtr lparam);
+
     [StructLayout(LayoutKind.Sequential)]
     public struct RECT {
         public int Left;
@@ -46,6 +50,26 @@ public static class ZfseWindowCapture {
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern int GetWindowText(IntPtr hwnd, System.Text.StringBuilder text, int count);
+
+    [DllImport("user32.dll")]
+    public static extern bool EnumWindows(EnumWindowsCallback callback, IntPtr lparam);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsWindowVisible(IntPtr hwnd);
+
+    public static IntPtr FindVisibleWindow(uint processId) {
+        IntPtr found = IntPtr.Zero;
+        EnumWindows(delegate(IntPtr hwnd, IntPtr lparam) {
+            uint candidate;
+            GetWindowThreadProcessId(hwnd, out candidate);
+            if (candidate == processId && IsWindowVisible(hwnd)) {
+                found = hwnd;
+                return false;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
 }
 "@
 
@@ -64,6 +88,11 @@ function Wait-MainWindow([System.Diagnostics.Process]$Process) {
         if ($Process.MainWindowHandle -ne [IntPtr]::Zero) {
             return $Process.MainWindowHandle
         }
+        $OwnedWindow = [ZfseWindowCapture]::FindVisibleWindow($Process.Id)
+        if ($OwnedWindow -ne [IntPtr]::Zero) {
+            Write-Host "Using process-owned visible window: $(Get-WindowTitle $OwnedWindow)"
+            return $OwnedWindow
+        }
         $Foreground = [ZfseWindowCapture]::GetForegroundWindow()
         $ForegroundProcess = [uint32]0
         if ($Foreground -ne [IntPtr]::Zero) {
@@ -75,7 +104,8 @@ function Wait-MainWindow([System.Diagnostics.Process]$Process) {
         }
         Start-Sleep -Milliseconds 250
     }
-    throw "The Windows client did not create a main window."
+    $Checkpoint = if (Test-Path $Trace) { Get-Content -Raw $Trace } else { "no startup checkpoint" }
+    throw "The Windows client did not create a main window. Last checkpoint: $Checkpoint"
 }
 
 function Save-Window([IntPtr]$Window, [string]$Path) {

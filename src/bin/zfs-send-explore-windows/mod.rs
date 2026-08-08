@@ -293,6 +293,7 @@ pub fn run() -> Result<()> {
 }
 
 unsafe fn run_ui() -> Result<()> {
+    trace_startup("run_ui: begin");
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     let common = INITCOMMONCONTROLSEX {
         dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
@@ -301,6 +302,7 @@ unsafe fn run_ui() -> Result<()> {
     if InitCommonControlsEx(&common) == 0 {
         bail!("Windows common controls could not be initialized");
     }
+    trace_startup("run_ui: common controls initialized");
 
     let instance = GetModuleHandleW(null());
     if instance.is_null() {
@@ -322,6 +324,7 @@ unsafe fn run_ui() -> Result<()> {
 
     let state = Box::into_raw(Box::new(AppState::default()));
     let title = wide(APP_TITLE);
+    trace_startup("run_ui: creating main window");
     let hwnd = CreateWindowExW(
         WS_EX_CONTROLPARENT,
         class_name.as_ptr(),
@@ -340,6 +343,7 @@ unsafe fn run_ui() -> Result<()> {
         drop(Box::from_raw(state));
         return Err(std::io::Error::last_os_error()).context("creating main window");
     }
+    trace_startup("run_ui: main window created");
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
 
@@ -393,6 +397,7 @@ unsafe extern "system" fn window_proc(
     let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState;
     match message {
         WM_CREATE if !state.is_null() => {
+            trace_startup("window: initializing controls");
             if let Err(error) = initialize_window(&mut *state) {
                 show_error(
                     hwnd,
@@ -401,6 +406,7 @@ unsafe extern "system" fn window_proc(
                 );
                 return -1;
             }
+            trace_startup("window: controls initialized");
             0
         }
         WM_SIZE if !state.is_null() => {
@@ -458,6 +464,7 @@ unsafe extern "system" fn window_proc(
 }
 
 unsafe fn initialize_window(state: &mut AppState) -> Result<()> {
+    trace_startup("initialize: begin");
     let instance = GetModuleHandleW(null());
     state.font = CreateFontW(
         -16,
@@ -638,6 +645,7 @@ unsafe fn initialize_window(state: &mut AppState) -> Result<()> {
     append_menu(menu, MF_POPUP, settings_menu as usize, "Settings");
     append_menu(menu, MF_POPUP, help_menu as usize, "Help");
     SetMenu(state.hwnd, menu);
+    trace_startup("initialize: menus created");
 
     let controls = &mut state.controls;
     controls.source_path = control(
@@ -782,6 +790,7 @@ unsafe fn initialize_window(state: &mut AppState) -> Result<()> {
         0,
         0,
     );
+    trace_startup("initialize: controls created");
 
     for hwnd in all_controls(controls) {
         if hwnd.is_null() {
@@ -789,6 +798,7 @@ unsafe fn initialize_window(state: &mut AppState) -> Result<()> {
         }
         SendMessageW(hwnd, WM_SETFONT, state.font as usize, 1);
     }
+    trace_startup("initialize: controls validated");
     let cue = wide("Backup, pool member, or standalone disk-image path");
     SendMessageW(
         controls.source_path,
@@ -822,8 +832,10 @@ unsafe fn initialize_window(state: &mut AppState) -> Result<()> {
     add_column(controls.list, 3, "Object", 120);
     update_settings_menu(state);
     refresh_physical_drives(state);
+    trace_startup("initialize: physical drives refreshed");
     update_credential_button(state);
     set_source_enabled(state, false);
+    trace_startup("initialize: initial enablement applied");
     EnableWindow(state.controls.open_send, 1);
     EnableWindow(state.controls.open_pool, 1);
     EnableWindow(state.controls.browse_source, 1);
@@ -834,6 +846,7 @@ unsafe fn initialize_window(state: &mut AppState) -> Result<()> {
     EnableWindow(state.controls.choose_key, 1);
     update_context_visibility(state);
     layout(state);
+    trace_startup("initialize: layout complete");
     Ok(())
 }
 
@@ -3498,6 +3511,12 @@ unsafe fn show_message(owner: HWND, title: &str, message: &str, flags: u32) {
     let title = wide(title);
     let message = wide(message);
     MessageBoxW(owner, message.as_ptr(), title.as_ptr(), flags);
+}
+
+fn trace_startup(message: &str) {
+    if let Some(path) = std::env::var_os("ZFSE_UI_TRACE") {
+        let _ = fs::write(path, message);
+    }
 }
 
 fn wide(value: &str) -> Vec<u16> {
