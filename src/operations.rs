@@ -260,6 +260,31 @@ pub fn encryption_requirement(
     bail!("selected encrypted snapshot disappeared while reading its key metadata")
 }
 
+/// Read the encryption metadata for every raw snapshot in one stream pass.
+/// UIs use this to present the correct credential choices before attempting
+/// filesystem traversal.
+pub fn encryption_requirements(stream: &Path) -> Result<BTreeMap<u64, EncryptionRequirement>> {
+    let file = File::open(stream).with_context(|| format!("opening {}", stream.display()))?;
+    let mut reader = StreamReader::new(file);
+    let mut requirements = BTreeMap::new();
+    while let Some(record) = reader.next_record()? {
+        if let RecordKind::Begin(header) = record.kind
+            && header.header_type == DMU_SUBSTREAM
+            && header.features & FEATURE_RAW != 0
+        {
+            let params = EncryptionParams::from_begin_payload(&record.payload)?;
+            requirements.insert(
+                header.to_guid,
+                EncryptionRequirement {
+                    dataset_name: header.dataset_name,
+                    key_format: params.key_format_name()?.to_owned(),
+                },
+            );
+        }
+    }
+    Ok(requirements)
+}
+
 pub fn snapshots(stream: &Path) -> Result<Vec<BeginRecord>> {
     snapshot_headers(stream)
 }

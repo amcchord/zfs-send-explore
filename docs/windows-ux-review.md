@@ -1,6 +1,21 @@
-# Windows UI/UX review and v0.5.0 design
+# Windows UI/UX review and v0.5.0–v0.5.1 design
 
 This pass treats the Windows client as a recovery tool for two audiences: an operator who has a backup or drive and wants the safest obvious next action, and a power user who needs exact source selection, nested-image control, and keyboard speed. The backend safety model remains unchanged: sources are read-only, untrusted structures are bounded and validated, and extraction publishes only after successful completion.
+
+## v0.5.1 contextual-action follow-up
+
+The follow-up review applies one rule throughout the UI: when the app knows the action needed to continue, that action is offered at that point instead of being described as something to find elsewhere.
+
+| Friction found after v0.5.0 | v0.5.1 response |
+| --- | --- |
+| The encrypted-view prompt said a binary raw key must be chosen from a file, but supplied no file action. | A native contextual action chooser reads the configured `raw`, `hex`, or `passphrase` key format and places direct entry and the appropriate file chooser together. Raw datasets explicitly distinguish Slide's 64-character representation from an original 32-byte binary file. |
+| A missing or incorrect LUKS pool passphrase, ZFS key, or `.detto` agent password ended as a generic operation error. | The relevant direct/file choice reopens and the interrupted source, browse, or image operation retries after replacement. |
+| One ZFS key could be reused accidentally when switching encrypted datasets. | Retained ZFS keys are keyed by source and view selector; unrelated datasets do not silently receive one another's key material. |
+| Starting a new source cleared the working source and its credentials before validation. | Source replacement is transactional: the current catalog and listing remain active until the new source opens successfully. Scoped credentials are committed or cleared only after success. |
+| **Ctrl+O** and **Ctrl+Shift+O** could reuse text already present in the source box instead of showing a chooser. | Both accelerators always open their documented picker. **Choose** selects and opens in one step; **Open path** is the explicit action for pasted/manual paths. |
+| The image row showed blank disabled controls outside inception mode, and two unlabeled number boxes inside it. | Image-only navigation appears only inside an image. The Open-image action moves beside Extract, while advanced range fields are hidden by default and labeled when enabled. |
+| The active image's offset and size were carried into the next selected child image. | Child range fields are cleared after every successful descent. They now describe only the next selected file. |
+| Clearing credentials closed an active source without first exposing that consequence. | A warning action explicitly says **Clear credentials and close source** before releasing the retained secrets and read session. |
 
 ## What changed
 
@@ -18,13 +33,17 @@ This pass treats the Windows client as a recovery tool for two audiences: an ope
 
 ## Primary workflow
 
-![The v0.5.0 source and snapshot browser](screenshots/windows/source-browser.png)
+![The v0.5.1 source and snapshot browser](screenshots/windows/source-browser.png)
 
-The first decision is now “file or physical drive,” not “send parser or pool parser.” A file goes through **Browse > Open**. A device is selected by observable hardware identity, then confirmed and opened. Once a source is recognized, the view selector, breadcrumb, path controls, and file list follow the same interaction model for streams, pools, and nested filesystems.
+The first decision is now “file or physical drive,” not “send parser or pool parser.” **Choose** selects and immediately opens a file; **Open path** handles a pasted/manual source. A device is selected by observable hardware identity, then confirmed and opened. Once a source is recognized, the view selector, breadcrumb, path controls, and file list follow the same interaction model for streams, pools, and nested filesystems.
 
-The app keeps advanced controls available without making them prerequisites. Image offset and length are empty for the normal whole-file case. Exact manual paths, format-specific open commands, volume selectors, and every legacy key-file format remain available.
+The app keeps advanced controls available without making them prerequisites. Image offset and length are hidden for the normal whole-file case and can be revealed from Settings or directly from an image-open failure. Exact manual paths, format-specific open commands, volume selectors, and every legacy key-file format remain available.
 
 ## Credential model
+
+![The format-aware credential method chooser](screenshots/windows/credential-method.png)
+
+The method chooser leads to either the relevant file dialog or the native secure credential prompt:
 
 ![The native secure credential prompt](screenshots/windows/credential-entry.png)
 
@@ -34,7 +53,7 @@ Three credentials have deliberately distinct roles:
 - **Datto pool passphrase** unlocks the outer LUKS1/LUKS2 Reverse RoundTrip partition.
 - **Datto agent password** authenticates an agent's `.encryptionKeyStash` and derives the `.detto` AES-XTS key.
 
-The native prompt disables Windows credential persistence. Direct UTF-16 input is converted to bytes, the temporary UTF-16 and string buffers are zeroized, and the retained bytes use `Zeroizing<Vec<u8>>`. Key-file reads are size-bounded before allocation. With the default setting, a secret is scoped to the source path shown when it is entered and unrelated credentials are dropped when another source opens. **Credentials > Clear all credentials** closes the active source as it releases every retained value, including an outer pool-unlock key owned by the open read session.
+The native prompt disables Windows credential persistence. Direct UTF-16 input is converted to bytes, the temporary UTF-16 and string buffers are zeroized, and the retained bytes use `Zeroizing<Vec<u8>>`. Key-file reads are size-bounded before allocation. ZFS keys are scoped to source plus view; pool and agent credentials are scoped to source. With the default setting, unrelated credentials are dropped only after another source opens successfully. **Credentials > Clear all credentials** first confirms that the active source will close, then releases every retained value, including an outer pool-unlock key owned by the open read session.
 
 ## Recursive inception model
 
@@ -48,15 +67,16 @@ Known format limits remain intentional: QCOW1, external/backing QCOW2, split/fla
 
 ## Keyboard model
 
-The full shortcut table is in the [Windows client guide](windows-client.md#keyboard-shortcuts-and-settings). Important conventions are **Ctrl+O** to open, **Ctrl+L** for location, **Alt+Up/Backspace** for a parent, **Enter** to open, **Esc** to leave one image, **Ctrl+E** to extract, and **F5** to refresh. Shortcuts are implemented as native accelerator-table commands; list Enter/Backspace use list-view key notifications so they do not hijack typing in edit fields.
+The full shortcut table is in the [Windows client guide](windows-client.md#keyboard-shortcuts-and-settings). Important conventions are **Ctrl+O** to choose and open, **Ctrl+K** for contextual credentials, **Ctrl+L** for location, **Alt+Up/Backspace** for a parent, **Enter** to open, **Esc** to leave one image, **Ctrl+E** to extract, and **F5** to refresh. Shortcuts are implemented as native accelerator-table commands; list Enter/Backspace use list-view key notifications so they do not hijack typing in edit fields.
 
 ## Validation and acceptance
 
-- Native unit/integration suite: 60 tests across library, CLI, encryption, and the Windows-facing service layer.
+- Native unit/integration suite: 61 tests across library, CLI, encryption, and the Windows-facing service layer.
+- Key-format regression: the Windows-facing catalog exposes `raw`, `hex`, or `passphrase` before encrypted traversal so the lock-point dialog can present exact actions.
 - New nested-image test: a FAT image containing a second complete FAT image is opened and listed without exporting either image.
 - Native clippy: all targets with warnings denied.
 - Windows x86-64 clippy: all targets with warnings denied.
 - Windows release build and packaging: performed by CI on a native Windows runner.
-- Screenshot capture: optimized executable, real Win32 controls, real Windows credential UI, committed send fixture, and committed ext4 fixture.
+- Screenshot capture: optimized executable, real Win32 controls, real Windows credential UI, committed send fixture, and committed ext4 fixture. The credential-method capture verifies both the chooser title and the transition into protected entry.
 
 Hardware acceptance is separate from UI correctness. The existing direct-member validation covers a physical exported vdev. A representative physical Slide Box and Datto Reverse RoundTrip drive are still recommended before broad operational deployment, especially for unsupported multi-vdev/RAIDZ layouts.

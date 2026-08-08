@@ -5,14 +5,14 @@
 The extraction machine does **not** need ZFS, `libzfs`, or a ZFS kernel module. The tool never invokes `zfs` or `zpool`, and pool members are opened read-only.
 
 > [!IMPORTANT]
-> This is an early `0.5.0` implementation. The CLI, Windows UI, sidecar format, and supported on-disk profile may change. Stream and native-encryption pool fixtures are produced on little-endian OpenZFS systems. Linux validates the core end to end, and CI runs the full test suite and release packaging on native Windows.
+> This is an early `0.5.1` implementation. The CLI, Windows UI, sidecar format, and supported on-disk profile may change. Stream and native-encryption pool fixtures are produced on little-endian OpenZFS systems. Linux validates the core end to end, and CI runs the full test suite and release packaging on native Windows.
 
 Detailed implementation and validation material lives in:
 
 - [`docs/format-notes.md`](docs/format-notes.md), which maps the supported send and on-disk formats to the reader; and
 - [`docs/test-evidence.md`](docs/test-evidence.md), which records the real OpenZFS fixtures, lab scenarios, sizes, and hashes.
 - [`docs/windows-client.md`](docs/windows-client.md), which covers the Windows UI, attached-drive access, updates, sparse files, and packaging; and
-- [`docs/windows-ux-review.md`](docs/windows-ux-review.md), which records the v0.5.0 usability audit, credential model, shortcuts, and recursive inception design.
+- [`docs/windows-ux-review.md`](docs/windows-ux-review.md), which records the v0.5.0–v0.5.1 usability audits, contextual credential model, shortcuts, and recursive inception design.
 
 ## What works today
 
@@ -107,7 +107,7 @@ cargo build --release --bin zfs-send-explore-windows
 
 The GUI binary is `target\release\zfs-send-explore-windows.exe`; the packaging script also builds `zfs-send-extract.exe` and creates a distributable ZIP containing both clients and the illustrated documentation. It uses Win32 common controls, Windows file dialogs, the Segoe UI system typeface, per-monitor DPI scaling, and background workers so long stream scans do not block the window.
 
-Use **Browse > Open** for automatic send, pool-member, and standalone-image detection. Attached disks appear in a physical-drive picker with disk number, model, capacity, and media type; the exact read-only choice is confirmed before opening. Physical-drive access may require starting the client as Administrator. Encrypted views request a key through the secure Windows prompt, while binary key files remain supported. See the [Windows client guide](docs/windows-client.md) and [UI/UX review](docs/windows-ux-review.md) for the complete workflow, shortcuts, settings, and safety constraints.
+Use **Choose** for one-step selection and automatic send, pool-member, or standalone-image detection; **Open path** handles pasted/manual paths. Attached disks appear in a physical-drive picker with disk number, model, capacity, and media type; the exact read-only choice is confirmed before opening. Physical-drive access may require starting the client as Administrator. Encrypted views present format-aware direct-entry and key-file actions together, including an explicit 32-byte raw-file path. See the [Windows client guide](docs/windows-client.md) and [UI/UX review](docs/windows-ux-review.md) for the complete workflow, shortcuts, settings, and safety constraints.
 
 ## Browse and extract from a send file
 

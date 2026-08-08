@@ -34,16 +34,16 @@ The client uses Win32 common controls, Windows open/save dialogs, Segoe UI, and 
 
 From top to bottom:
 
-1. **Source path, Browse, and Open** — one opening flow detects a send stream, pool member, whole-disk image, or standalone filesystem image automatically.
+1. **Source path, Choose, and Open path** — **Choose** selects and immediately opens a source; **Open path** handles a pasted or manually typed path. Either flow detects a send stream, pool member, whole-disk image, or standalone filesystem image automatically.
 2. **Physical-drive picker** — enumerates `PhysicalDriveN` devices with disk number, model, capacity, and fixed/removable type. Press **F5** after attaching or removing storage.
 3. **Open drive** — confirms the exact selected disk, then opens it read-only. Manual device-path entry remains available.
 4. **Credentials** — enters a ZFS key, Datto pool passphrase, or Datto agent password directly through the secure Windows credential prompt, loads one from a file, or clears all in-memory secrets.
 5. **View selector** — chooses an exact send snapshot, pool snapshot, or current read-only dataset head.
 6. **Path, Up, and Go** — navigates an absolute path. The line below shows the complete source, view, nested-image, and current-path breadcrumb.
-7. **Inner volume selector** — chooses a detected raw, GPT, or MBR filesystem while a disk image is active.
-8. **Image offset and length** — optionally bounds an embedded image. Values accept decimal or `0x` hexadecimal.
-9. **Explore disk image** — opens the selected regular file as another raw, QCOW2, or VMDK layer.
-10. **Back one image** — returns one layer at a time, preserving the parent directory and volume selection.
+7. **Inner volume selector** — appears only while a disk image is active and chooses a detected raw, GPT, or MBR filesystem.
+8. **Advanced selected-file range** — hidden by default. **Settings > Show advanced disk-image range fields** reveals a byte offset and optional length for an embedded child image. Values accept decimal or `0x` hexadecimal and reset after each successful descent.
+9. **Open disk image** — sits beside Extract and opens the selected regular file as another raw, QCOW2, or VMDK layer.
+10. **Back to ZFS files / Back one image / Close disk image** — changes with context and preserves the parent directory and volume selection.
 11. **File list** — shows name, type, logical size, and object/entry identifier. Folders and recognized images open with double-click or **Enter**.
 12. **Extract** and **Update** — recover the selected file/folder or apply a validated standalone incremental send.
 13. **Status bar** — reports scanning, directory reads, credential state changes, extraction, and errors.
@@ -52,10 +52,9 @@ Menus expose the same operations plus persisted usability and safety settings.
 
 ## Browse a send file and select a snapshot
 
-1. Select **Browse** and choose a `.zfs` or other send-stream file.
-2. Select **Open**. The app recognizes the send format automatically.
-3. Wait for the snapshot selector and root directory to become enabled.
-4. Open the view selector and choose the exact `dataset@snapshot` entry.
+1. Select **Choose** and choose a `.zfs` or other send-stream file. The app opens it and recognizes the format automatically.
+2. Wait for the snapshot selector and root directory to become enabled.
+3. Open the view selector and choose the exact `dataset@snapshot` entry.
 
 The label identifies whether the substream is full or incremental and whether it is plaintext or raw encrypted. The client does not silently choose among several snapshots.
 
@@ -76,17 +75,17 @@ Regular files and directories can be extracted. A directory is recovered recursi
 
 Inception mode now starts from either a local image file or a regular image file inside the active ZFS/inner filesystem. Every partition and filesystem read stays positioned back to the original source. The GUI does not export a full image, attach a virtual disk, install a filesystem driver, or mount anything.
 
-To open a standalone image, select **Browse**, choose the image, and select **Open**. **Ctrl+Shift+O** opens the image-specific picker directly.
+To open a standalone image, select **Choose** and choose the image. **Ctrl+Shift+O** opens the image-specific picker directly. **Open path** remains available for a pasted path.
 
 ![A standalone ext filesystem image opened read-only](screenshots/windows/standalone-image.png)
 
 1. Browse to any supported filesystem directory containing the image and select its regular-file row.
-2. If the container starts at byte zero and runs to the end of the ZFS file, leave **Image offset** and **Image length** unchanged. For an embedded image, enter the byte offset and optional length in decimal or `0x` hexadecimal.
-3. Select **Explore disk image…**. The scan validates the container and partition metadata before enabling inner navigation.
+2. Select **Open disk image…**. The normal whole-file case needs no offset or length. The scan validates the container and partition metadata before enabling inner navigation.
+3. If the image is embedded inside the selected file, enable **Settings > Show advanced disk-image range fields**, enter its byte offset and optional length, and try again. The app also offers this action directly after an image-open failure.
 4. Choose a supported item in the inner volume selector if the image has several partitions.
 5. Navigate and extract with the same controls used for ZFS browsing. A recognized image extension opens on double-click or **Enter**.
 6. Repeat from inside that filesystem to descend again, up to eight simultaneous layers.
-7. Select **Back one image** or press **Esc** to return exactly one layer. The parent path and volume selection are restored.
+7. Select the contextual Back/Close button or press **Esc** to return exactly one layer. The parent path and volume selection are restored.
 
 The GUI recognizes:
 
@@ -135,11 +134,15 @@ An extraction from a current pool dataset head deliberately has no update-eligib
 
 ## Browse an encrypted source
 
-Snapshot names and stream framing remain visible in a raw send created by `zfs send -w`, but paths and contents require the dataset key. A native-encrypted pool likewise exposes its catalog before filesystem traversal needs a key. Selecting an encrypted view automatically opens the secure Windows credential prompt.
+Snapshot names and stream framing remain visible in a raw send created by `zfs send -w`, but paths and contents require the dataset key. A native-encrypted pool likewise exposes its catalog before filesystem traversal needs a key. Selecting an encrypted view opens a format-aware choice at the lock point instead of sending the user to another menu.
+
+![Choosing how to provide the configured ZFS key](screenshots/windows/credential-method.png)
+
+For `keyformat=raw`, choose either **Paste a hexadecimal raw key** for Slide's 64-character representation or **Choose a raw key file** for the original 32 binary bytes (a 64-character text file is accepted too). `keyformat=hex` and `keyformat=passphrase` receive correspondingly specific actions. Choosing direct entry then opens the protected Windows prompt:
 
 ![Entering a key with the native Windows credential prompt](screenshots/windows/credential-entry.png)
 
-Use **Credentials** or **Ctrl+K** at any time. The menu supports:
+Use **Credentials** or **Ctrl+K** at any time. When the selected view or file identifies a required credential, this opens the same relevant choices; otherwise it opens the complete credential menu. It supports:
 
 - direct, masked entry of a ZFS passphrase or 64-character hexadecimal key;
 - a ZFS key file containing passphrase text, hexadecimal text, or exactly 32 raw binary bytes;
@@ -147,7 +150,9 @@ Use **Credentials** or **Ctrl+K** at any time. The menu supports:
 - direct or file-backed Datto agent passwords; and
 - immediate clearing of every in-memory credential.
 
-Directly entered secrets and loaded file bytes live only in zeroizing process memory. Windows credential persistence is disabled. Credentials are scoped to the selected source when the default clear-on-source-change setting is enabled and are never written to settings or `.zfse.json`. Clearing credentials also closes the current source so an outer pool-unlock key cannot remain retained by its read session.
+Directly entered secrets and loaded file bytes live only in zeroizing process memory. Windows credential persistence is disabled. ZFS keys are scoped to both the source and selected view, so several encrypted datasets may retain distinct keys without silently reusing one another. Pool and agent credentials are source-scoped. They are never written to settings or `.zfse.json`. Clearing credentials first explains that the current source must close, then releases every retained value, including an outer pool-unlock key owned by its read session.
+
+Missing or rejected ZFS, Datto pool, and Datto agent credentials reopen the relevant two-choice action and retry the interrupted browse/open operation after replacement. Canceling a failed new-source attempt preserves the previously working source and its directory listing.
 
 Authentication tags, encrypted metadata, block tags, spill blocks, and supported indirect authentication state are verified before plaintext is used. Native-encrypted pools additionally verify inherited encryption-root discovery, wrapped keys, the objset portable MAC, encrypted dnode bonuses, and folded physical checksums.
 
@@ -209,14 +214,12 @@ several top-level vdevs cannot yet be reconstructed from multiple members.
 ## Recover a Datto Reverse RoundTrip drive
 
 1. Attach the drive, press **F5**, and choose it by model, size, and disk number.
-2. Open **Credentials** and enter the pool passphrase from Datto Support, or
-   choose the passphrase file.
-3. Select **Open drive**. The app detects GPT or MBR, unlocks the LUKS
+2. Select **Open drive**. If the drive is LUKS-protected, choose direct pool-passphrase entry or its passphrase file in the contextual prompt. The app retries automatically after the credential is supplied.
+3. The app detects GPT or MBR, unlocks the LUKS
    payload internally, and labels a `revRT-*` pool as Datto Reverse RoundTrip.
 4. Select the protected-system dataset under `POOL/home/agents/AGENT_GUID`.
 5. For `.datto`, select the image and choose **Explore disk image** directly.
-6. For `.detto`, enter the protected system's **Datto agent password** through
-   **Credentials** (or choose its text file), then explore the image.
+6. For `.detto`, choose direct **Datto agent password** entry or its text file when the image is opened. A rejected password returns to the same choices and retries the image after replacement.
 
 For `.detto`, the app finds the single `config/*.encryptionKeyStash` file,
 authenticates it with the supplied password, derives the 64-byte AES-XTS key,
@@ -297,10 +300,10 @@ The target is copied into a same-directory sparse temporary file. Matching `OBJE
 
 | Shortcut | Action |
 | --- | --- |
-| **Ctrl+O** | Open and automatically detect a backup, pool member, or image |
-| **Ctrl+Shift+O** | Open a standalone disk image |
+| **Ctrl+O** | Choose, open, and automatically detect a backup, pool member, or image |
+| **Ctrl+Shift+O** | Choose and open a standalone disk image |
 | **Ctrl+D** | Open the selected physical drive |
-| **Ctrl+K** | Enter a ZFS key or passphrase |
+| **Ctrl+K** | Open credential choices for the current view or selected `.detto` image |
 | **Ctrl+L** | Focus the path box |
 | **Alt+Up** or **Backspace** | Go to the parent directory |
 | **Enter** | Open a folder or recognized disk image; extract another regular file |
@@ -310,7 +313,7 @@ The target is copied into a same-directory sparse temporary file. Matching `OBJE
 | **Ctrl+U** | Update a previously extracted file |
 | **F5** | Refresh the current directory and physical-drive inventory |
 
-The **Settings** menu persists to `%APPDATA%\ZFS Send Explorer\settings.json`. It controls recognized-image double-click behavior, source-scoped credential clearing, and physical-drive confirmation. Window dimensions are also restored. The settings file contains no keys, passwords, source contents, or recovery metadata.
+The **Settings** menu persists to `%APPDATA%\ZFS Send Explorer\settings.json`. It controls recognized-image double-click behavior, source-scoped credential clearing, physical-drive confirmation, and visibility of advanced disk-image range fields. Window dimensions are also restored. The settings file contains no keys, passwords, source contents, or recovery metadata.
 
 ## Troubleshooting
 
@@ -318,14 +321,14 @@ The **Settings** menu persists to `%APPDATA%\ZFS Send Explorer\settings.json`. I
 | --- | --- |
 | **Access is denied** when opening `PhysicalDriveN` | Start the client with **Run as administrator**, confirm the disk number, and close utilities that hold the raw device exclusively. |
 | **No readable ZFS vdev label** | Confirm the pool was exported, the correct member or image was selected, and its layout is supported. For a whole disk, confirm that exactly one partition contains the intended vdev. |
-| **Enter or choose its key first** | Open **Credentials** and enter the configured passphrase/hex key, or choose the raw/text key file. |
+| The encrypted view remains locked | Use **Credentials** or **Ctrl+K**. A raw dataset offers 64-character hexadecimal entry and a 32-byte raw-file chooser in the same dialog. |
 | The view is incremental but cannot be browsed | The send file is missing its full base or an earlier incremental in the ancestry chain. Use a self-contained history file. |
 | **Extraction metadata** cannot be opened | Keep `<file>.zfse.json` beside the extracted file, or re-extract from the named base snapshot. |
 | Target hash or size differs | The extracted file was changed locally. Preserve it and re-extract a clean base before applying the incremental. |
 | Incremental `fromguid` does not match | The chosen incremental starts from another snapshot. Select the send whose base is the sidecar's snapshot. |
 | A current pool head cannot be updated | Re-extract the file from a named snapshot so a stable base GUID and sidecar can be recorded. |
-| **No supported inner filesystem** | Run `inception inspect` in the CLI for per-volume diagnostics; confirm the image window, container variant, partition integrity, and filesystem type. |
-| A valid filesystem starts after an appliance header | Enter its exact byte offset before choosing **Explore disk image…**; optionally enter a length to prevent reads beyond the embedded image. |
+| **No supported inner filesystem** | Use the offered **Extract the image file instead** or **Set an advanced image range** action; CLI `inception inspect` provides per-volume diagnostics. |
+| A valid filesystem starts after an appliance header | Choose **Set an advanced image range**, enter its exact byte offset and optional length, then select **Open disk image…** again. |
 | QCOW or VMDK reports an unsupported feature | Use a self-contained QCOW2 v2/v3 or VMDK `monolithicSparse` image. Backing files and external/split VMDK extents are not guessed or searched for. |
 | An inner NTFS file cannot be extracted | NTFS compression and EFS encryption are currently rejected; select an ordinary unnamed `$DATA` file stream. |
 | Sparse extraction has the right length but consumes full space | The destination filesystem may not support Windows sparse controls, or a storage layer may materialize holes. Logical content remains authoritative. |
@@ -375,10 +378,12 @@ The run covered:
 - a read-only 1 GiB single-vdev pool member with two snapshots; and
 - a 256 MiB logical sparse file with 256 KiB allocated on NTFS.
 
-The v0.5.0 screenshots at the top of this guide are captured automatically from
+The v0.5.1 screenshots at the top of this guide are captured automatically from
 the optimized native executable on a GitHub-hosted Windows runner. The run opens
-the committed multi-snapshot send fixture, invokes the real Windows secure
-credential prompt, and opens the committed ext4 fixture as a standalone image.
+the committed multi-snapshot send fixture, captures the format-aware credential
+method chooser and real Windows secure prompt, and opens the committed ext4
+fixture as a standalone image. The final capture is recorded in
+[workflow run 31282726061](https://github.com/amcchord/zfs-send-explore/actions/runs/31282726061).
 The service test also descends through a FAT image stored inside another FAT
 image and reads its child directory without exporting either image.
 

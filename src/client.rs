@@ -37,6 +37,9 @@ pub struct SourceView {
     pub update_eligible: bool,
     /// True when this source view requires a ZFS key to browse.
     pub encrypted: bool,
+    /// Configured ZFS key format (`raw`, `hex`, or `passphrase`) when the view
+    /// is encrypted. UIs use this to offer the right input methods in place.
+    pub key_format: Option<String>,
 }
 
 /// Lightweight description retained by the UI after opening a source.
@@ -151,6 +154,15 @@ impl SourceCatalog {
     pub fn open_send(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let inspection = operations::inspect_stream(path)?;
+        let requirements = if inspection
+            .snapshots
+            .iter()
+            .any(|snapshot| snapshot.features & FEATURE_RAW != 0)
+        {
+            operations::encryption_requirements(path)?
+        } else {
+            BTreeMap::new()
+        };
         let views = inspection
             .snapshots
             .iter()
@@ -170,6 +182,9 @@ impl SourceCatalog {
                     selector: format!("0x{:016x}", snapshot.to_guid),
                     update_eligible: true,
                     encrypted: snapshot.features & FEATURE_RAW != 0,
+                    key_format: requirements
+                        .get(&snapshot.to_guid)
+                        .map(|requirement| requirement.key_format.clone()),
                 }
             })
             .collect::<Vec<_>>();
@@ -236,32 +251,28 @@ impl SourceCatalog {
         for dataset in &datasets {
             encrypted_datasets.insert(
                 dataset.name.clone(),
-                pool.encryption_requirement(&dataset.name)?.is_some(),
+                pool.encryption_requirement(&dataset.name)?,
             );
         }
         let mut views = Vec::with_capacity(datasets.len() + snapshots.len());
         for snapshot in snapshots {
-            let encrypted = encrypted_datasets
-                .get(&snapshot.dataset)
-                .copied()
-                .unwrap_or(false);
+            let requirement = encrypted_datasets.get(&snapshot.dataset).cloned().flatten();
             views.push(SourceView {
                 label: format!("{}  —  snapshot", snapshot.full_name),
                 selector: snapshot.full_name,
                 update_eligible: true,
-                encrypted,
+                encrypted: requirement.is_some(),
+                key_format: requirement.map(|value| value.key_format),
             });
         }
         for dataset in datasets {
-            let encrypted = encrypted_datasets
-                .get(&dataset.name)
-                .copied()
-                .unwrap_or(false);
+            let requirement = encrypted_datasets.get(&dataset.name).cloned().flatten();
             views.push(SourceView {
                 label: format!("{}  —  current (read-only)", dataset.name),
                 selector: dataset.name,
                 update_eligible: false,
-                encrypted,
+                encrypted: requirement.is_some(),
+                key_format: requirement.map(|value| value.key_format),
             });
         }
         if views.is_empty() {
@@ -886,6 +897,15 @@ mod tests {
             std::fs::read_to_string(target).unwrap(),
             "snapshot two has a longer value\n"
         );
+    }
+
+    #[test]
+    fn send_catalog_exposes_the_key_format_before_an_encrypted_view_is_browsed() {
+        let catalog =
+            SourceCatalog::open_send(Path::new("tests/fixtures/encrypted-raw-s1.zfs")).unwrap();
+        assert_eq!(catalog.views.len(), 1);
+        assert!(catalog.views[0].encrypted);
+        assert_eq!(catalog.views[0].key_format.as_deref(), Some("passphrase"));
     }
 
     #[test]

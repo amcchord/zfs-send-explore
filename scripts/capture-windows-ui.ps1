@@ -7,6 +7,8 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 $Executable = Join-Path $Root "target\release\zfs-send-explore-windows.exe"
 $Output = Join-Path $Root $OutputDirectory
+$Trace = Join-Path $env:RUNNER_TEMP "zfse-ui-startup.txt"
+$env:ZFSE_UI_TRACE = $Trace
 
 if (-not (Test-Path $Executable)) {
     throw "Build the release Windows client before capturing screenshots: $Executable"
@@ -21,6 +23,8 @@ using System;
 using System.Runtime.InteropServices;
 
 public static class ZfseWindowCapture {
+    public delegate bool EnumWindowsCallback(IntPtr hwnd, IntPtr lparam);
+
     [StructLayout(LayoutKind.Sequential)]
     public struct RECT {
         public int Left;
@@ -40,18 +44,68 @@ public static class ZfseWindowCapture {
 
     [DllImport("user32.dll")]
     public static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern int GetWindowText(IntPtr hwnd, System.Text.StringBuilder text, int count);
+
+    [DllImport("user32.dll")]
+    public static extern bool EnumWindows(EnumWindowsCallback callback, IntPtr lparam);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsWindowVisible(IntPtr hwnd);
+
+    public static IntPtr FindVisibleWindow(uint processId) {
+        IntPtr found = IntPtr.Zero;
+        EnumWindows(delegate(IntPtr hwnd, IntPtr lparam) {
+            uint candidate;
+            GetWindowThreadProcessId(hwnd, out candidate);
+            if (candidate == processId && IsWindowVisible(hwnd)) {
+                found = hwnd;
+                return false;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
 }
 "@
+
+function Get-WindowTitle([IntPtr]$Window) {
+    $Text = New-Object System.Text.StringBuilder 1024
+    [ZfseWindowCapture]::GetWindowText($Window, $Text, $Text.Capacity) | Out-Null
+    return $Text.ToString()
+}
 
 function Wait-MainWindow([System.Diagnostics.Process]$Process) {
     for ($Attempt = 0; $Attempt -lt 120; $Attempt++) {
         $Process.Refresh()
+        if ($Process.HasExited) {
+            throw "The Windows client exited before creating a main window (exit code $($Process.ExitCode))."
+        }
         if ($Process.MainWindowHandle -ne [IntPtr]::Zero) {
             return $Process.MainWindowHandle
         }
+        $OwnedWindow = [ZfseWindowCapture]::FindVisibleWindow($Process.Id)
+        if ($OwnedWindow -ne [IntPtr]::Zero) {
+            Write-Host "Using process-owned visible window: $(Get-WindowTitle $OwnedWindow)"
+            return $OwnedWindow
+        }
+        $Foreground = [ZfseWindowCapture]::GetForegroundWindow()
+        $ForegroundProcess = [uint32]0
+        if ($Foreground -ne [IntPtr]::Zero) {
+            [ZfseWindowCapture]::GetWindowThreadProcessId($Foreground, [ref]$ForegroundProcess) | Out-Null
+            if ($ForegroundProcess -eq $Process.Id) {
+                Write-Host "Using process-owned foreground window: $(Get-WindowTitle $Foreground)"
+                return $Foreground
+            }
+        }
         Start-Sleep -Milliseconds 250
     }
-    throw "The Windows client did not create a main window."
+    $Checkpoint = if (Test-Path $Trace) { Get-Content -Raw $Trace } else { "no startup checkpoint" }
+    throw "The Windows client did not create a main window. Last checkpoint: $Checkpoint"
 }
 
 function Save-Window([IntPtr]$Window, [string]$Path) {
@@ -88,21 +142,43 @@ function Stop-Client([System.Diagnostics.Process]$Process) {
 }
 
 $SendFixture = Join-Path $Root "tests\fixtures\multi-snapshot.zfs"
+Write-Host "Capturing the ordinary source browser"
 $Browser = Start-Process -FilePath $Executable -ArgumentList ('"' + $SendFixture + '"') -PassThru
 try {
     $BrowserWindow = Wait-MainWindow $Browser
     Start-Sleep -Seconds 5
     Save-Window $BrowserWindow (Join-Path $Output "source-browser.png")
+}
+finally {
+    Stop-Client $Browser
+}
 
-    [ZfseWindowCapture]::SetForegroundWindow($BrowserWindow) | Out-Null
-    [System.Windows.Forms.SendKeys]::SendWait("^k")
+$EncryptedFixture = Join-Path $Root "tests\fixtures\encrypted-raw-s1.zfs"
+Write-Host "Capturing the contextual credential flow"
+$CredentialFlow = Start-Process -FilePath $Executable -ArgumentList ('"' + $EncryptedFixture + '"') -PassThru
+try {
+    $CredentialMainWindow = Wait-MainWindow $CredentialFlow
+    Start-Sleep -Seconds 5
+    $CredentialMethodWindow = [ZfseWindowCapture]::GetForegroundWindow()
+    $CredentialMethodTitle = Get-WindowTitle $CredentialMethodWindow
+    if ($CredentialMethodTitle -ne "ZFS Send Explorer") {
+        throw "Expected the credential-method dialog, found '$CredentialMethodTitle'."
+    }
+    Save-Window $CredentialMethodWindow (Join-Path $Output "credential-method.png")
+
+    [ZfseWindowCapture]::SetForegroundWindow($CredentialMethodWindow) | Out-Null
+    [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
     Start-Sleep -Seconds 2
     $CredentialWindow = [ZfseWindowCapture]::GetForegroundWindow()
+    $CredentialTitle = Get-WindowTitle $CredentialWindow
+    if ($CredentialTitle -ne "ZFS dataset key") {
+        throw "Expected the secure ZFS credential prompt, found '$CredentialTitle'."
+    }
     Save-Window $CredentialWindow (Join-Path $Output "credential-entry.png")
     [System.Windows.Forms.SendKeys]::SendWait("{ESC}")
 }
 finally {
-    Stop-Client $Browser
+    Stop-Client $CredentialFlow
 }
 
 $Compressed = Join-Path $Root "tests\fixtures\inception\ext4.img.zst.b64"
@@ -124,6 +200,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $ImageBrowser = Start-Process -FilePath $Executable -ArgumentList ('"' + $StandaloneImage + '"') -PassThru
+Write-Host "Capturing the standalone image browser"
 try {
     $ImageWindow = Wait-MainWindow $ImageBrowser
     Start-Sleep -Seconds 5

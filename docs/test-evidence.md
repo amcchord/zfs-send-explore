@@ -18,6 +18,40 @@ opens the committed multi-snapshot send fixture, captures the optimized app and
 the real non-persisting Windows credential prompt, then opens the committed
 ext4 fixture as a standalone disk image.
 
+## Contextual Windows recovery in v0.5.1
+
+The follow-up audit covers every place where the UI could identify a next
+action but previously returned only prose or a generic error. Encrypted ZFS
+views now expose their configured key format before traversal and show direct
+entry plus file selection in one native contextual action chooser. Missing or rejected
+ZFS, Datto pool, and Datto agent credentials return to the relevant choices and
+retry the interrupted operation. ZFS values are scoped by source and view.
+
+Source replacement is now transactional: opening an invalid or inaccessible
+new path leaves the previous catalog, list, and credentials intact. The
+automated Windows capture separately exercises the ordinary source browser, the
+format-aware credential-method chooser, the non-persisting secure entry prompt,
+and a standalone ext filesystem image.
+
+The inception UI regression pass also found that the active parent's offset and
+stored length were being copied into the controls used for the next child. The
+fields now reset after every successful descent, are hidden by default, and are
+revealed with labels from Settings or directly from a failed image-open action.
+The native suite now contains 61 tests, including a catalog assertion that the
+credential format is available before an encrypted view is browsed.
+
+The final screenshots were captured from the optimized native executable by
+[Windows UI workflow run 31282726061](https://github.com/amcchord/zfs-send-explore/actions/runs/31282726061)
+at commit `ece29b43a960fef1bc5b5baffe5d45542ad365ff`, then inspected at original
+resolution before being committed:
+
+| Screenshot | SHA-256 |
+| --- | --- |
+| `source-browser.png` | `5fe5b1578f152d8287cae31825be710cf0a0d0822fe622d14c29e28566063cde` |
+| `credential-method.png` | `b2d89ac24e2e444c7558dc6f1b4a0b80dfab69cd4926603563f028dd7ac9b57e` |
+| `credential-entry.png` | `52d6c170c478dcc3d6cfb2e56566c6b01e9678f2129da24b9c3760ee5e737d1b` |
+| `standalone-image.png` | `6e156286ce01f00fe30180661d0f09afb5f84a23b8bd37a19ad87c6a3c44a07e` |
+
 ## Slide and Datto recovery paths
 
 The v0.4.0 automated coverage exercises the vendor-specific adapters without
