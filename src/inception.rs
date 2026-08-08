@@ -140,6 +140,19 @@ pub struct InceptionSession {
 }
 
 impl InceptionSession {
+    /// Open a standalone local disk image. This uses the same bounded,
+    /// read-only container, partition, and filesystem stack as images stored
+    /// inside ZFS; the file is never attached or mounted by the host.
+    pub fn from_file_at(path: &Path, image_offset: u64, image_length: Option<u64>) -> Result<Self> {
+        let source = Arc::new(FileImage::open(path)?) as Arc<dyn ImageRead>;
+        Self::inspect_source_at(
+            source,
+            path.display().to_string(),
+            image_offset,
+            image_length,
+        )
+    }
+
     pub fn from_send(
         stream: &Path,
         snapshot: Option<&str>,
@@ -436,6 +449,41 @@ impl InceptionSession {
         )
     }
 
+    /// Inspect a regular file inside the active subordinate filesystem as one
+    /// more virtual disk layer. Reads remain positioned all the way back to the
+    /// original source, so even a very large sparse child image is not staged
+    /// or materialized before it can be browsed.
+    pub fn inspect_child_image_at(
+        &self,
+        volume: Option<&str>,
+        image_path: &str,
+        image_offset: u64,
+        image_length: Option<u64>,
+    ) -> Result<Self> {
+        let volume = self.select_volume(volume)?;
+        let filesystem = volume.filesystem.ok_or_else(|| {
+            anyhow!(
+                "volume {} does not contain a supported filesystem",
+                volume.selector
+            )
+        })?;
+        let source = self.volume_source(volume)?;
+        let normalized = normalized_inner_path(image_path)?;
+        let length = inner_file_length(source.clone(), filesystem, &normalized)?;
+        let image = Arc::new(FilesystemFileImage {
+            source,
+            filesystem,
+            path: normalized.clone(),
+            len: length,
+        }) as Arc<dyn ImageRead>;
+        Self::inspect_source_at(
+            image,
+            format!("{}!{}:{}", self.image_path, volume.selector, normalized),
+            image_offset,
+            image_length,
+        )
+    }
+
     fn select_volume(&self, selector: Option<&str>) -> Result<&VolumeInfo> {
         if let Some(selector) = selector {
             return self
@@ -482,6 +530,83 @@ impl InceptionSession {
             volume.offset,
             volume.length,
         )?))
+    }
+}
+
+struct FileImage {
+    file: Mutex<File>,
+    len: u64,
+}
+
+impl FileImage {
+    fn open(path: &Path) -> Result<Self> {
+        let file = File::open(path)
+            .with_context(|| format!("opening standalone disk image {}", path.display()))?;
+        let len = file
+            .metadata()
+            .with_context(|| format!("reading disk-image size for {}", path.display()))?
+            .len();
+        Ok(Self {
+            file: Mutex::new(file),
+            len,
+        })
+    }
+}
+
+impl ImageRead for FileImage {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn read_exact_at(&self, offset: u64, buffer: &mut [u8]) -> Result<()> {
+        let end = offset
+            .checked_add(buffer.len() as u64)
+            .context("standalone image read offset overflows")?;
+        if end > self.len {
+            bail!(
+                "standalone image read [{offset}, {end}) exceeds {} bytes",
+                self.len
+            );
+        }
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| anyhow!("standalone image file lock was poisoned"))?;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(buffer)?;
+        Ok(())
+    }
+}
+
+struct FilesystemFileImage {
+    source: Arc<dyn ImageRead>,
+    filesystem: FilesystemKind,
+    path: String,
+    len: u64,
+}
+
+impl ImageRead for FilesystemFileImage {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn read_exact_at(&self, offset: u64, buffer: &mut [u8]) -> Result<()> {
+        let end = offset
+            .checked_add(buffer.len() as u64)
+            .context("inner image-file read offset overflows")?;
+        if end > self.len {
+            bail!(
+                "inner image-file read [{offset}, {end}) exceeds {} bytes",
+                self.len
+            );
+        }
+        read_inner_file_exact_at(
+            self.source.clone(),
+            self.filesystem,
+            &self.path,
+            offset,
+            buffer,
+        )
     }
 }
 
@@ -1051,6 +1176,112 @@ fn extract_ext4(
         target.write(&buffer[..count])?;
     }
     Ok(length)
+}
+
+fn inner_file_length(
+    source: Arc<dyn ImageRead>,
+    filesystem: FilesystemKind,
+    path: &str,
+) -> Result<u64> {
+    match filesystem {
+        FilesystemKind::Fat12
+        | FilesystemKind::Fat16
+        | FilesystemKind::Fat32
+        | FilesystemKind::Exfat => {
+            let fs =
+                FatFs::open(SourceCursor::new(source)).context("opening FAT-family filesystem")?;
+            let id = resolve_fat(&fs, path)?;
+            let metadata = fs.meta(id)?;
+            if metadata.is_dir {
+                bail!("{path} is not a regular file");
+            }
+            Ok(metadata.size)
+        }
+        FilesystemKind::Ntfs => {
+            let (ntfs, mut reader) = open_ntfs(source)?;
+            let file = resolve_ntfs(&ntfs, &mut reader, path)?;
+            if file.is_directory() {
+                bail!("{path} is not a regular file");
+            }
+            let item = file
+                .data(&mut reader, "")
+                .transpose()?
+                .ok_or_else(|| anyhow!("{path:?} has no unnamed NTFS $DATA stream"))?;
+            let attribute = item.to_attribute()?;
+            validate_ntfs_image_attribute(path, attribute.flags())?;
+            Ok(attribute.value_length())
+        }
+        FilesystemKind::Ext4 => {
+            let fs = open_ext4(source)?;
+            let metadata = fs
+                .symlink_metadata(path.as_bytes())
+                .map_err(|error| anyhow!(error))?;
+            if !metadata.file_type().is_regular_file() {
+                bail!("{path} is not a regular file (symlinks are not followed)");
+            }
+            Ok(metadata.len())
+        }
+    }
+}
+
+fn read_inner_file_exact_at(
+    source: Arc<dyn ImageRead>,
+    filesystem: FilesystemKind,
+    path: &str,
+    offset: u64,
+    buffer: &mut [u8],
+) -> Result<()> {
+    match filesystem {
+        FilesystemKind::Fat12
+        | FilesystemKind::Fat16
+        | FilesystemKind::Fat32
+        | FilesystemKind::Exfat => {
+            let fs =
+                FatFs::open(SourceCursor::new(source)).context("opening FAT-family filesystem")?;
+            let id = resolve_fat(&fs, path)?;
+            let mut complete = 0_usize;
+            while complete < buffer.len() {
+                let count = fs.read_at(id, offset + complete as u64, &mut buffer[complete..])?;
+                if count == 0 {
+                    bail!(
+                        "FAT image file ended before byte {}",
+                        offset + buffer.len() as u64
+                    );
+                }
+                complete += count;
+            }
+        }
+        FilesystemKind::Ntfs => {
+            let (ntfs, mut reader) = open_ntfs(source)?;
+            let file = resolve_ntfs(&ntfs, &mut reader, path)?;
+            let item = file
+                .data(&mut reader, "")
+                .transpose()?
+                .ok_or_else(|| anyhow!("{path:?} has no unnamed NTFS $DATA stream"))?;
+            let attribute = item.to_attribute()?;
+            validate_ntfs_image_attribute(path, attribute.flags())?;
+            let mut value = attribute.value(&mut reader)?;
+            value.seek(&mut reader, SeekFrom::Start(offset))?;
+            value.read_exact(&mut reader, buffer)?;
+        }
+        FilesystemKind::Ext4 => {
+            let fs = open_ext4(source)?;
+            let mut file = fs.open(path.as_bytes()).map_err(|error| anyhow!(error))?;
+            file.seek(SeekFrom::Start(offset))?;
+            file.read_exact(buffer)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_ntfs_image_attribute(path: &str, flags: NtfsAttributeFlags) -> Result<()> {
+    if flags.contains(NtfsAttributeFlags::COMPRESSED) {
+        bail!("{path:?} uses NTFS compression, which inception mode cannot decode yet");
+    }
+    if flags.contains(NtfsAttributeFlags::ENCRYPTED) {
+        bail!("{path:?} is EFS-encrypted; an unencrypted NTFS $DATA stream is required");
+    }
+    Ok(())
 }
 
 fn stable_path_id(path: &str) -> u64 {

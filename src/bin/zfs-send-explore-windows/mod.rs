@@ -1,15 +1,34 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString, c_void};
+use std::fs;
 use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::thread;
-use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_CANCELLED, HINSTANCE, HWND, INVALID_HANDLE_VALUE, LPARAM, LRESULT, RECT,
+    WPARAM,
+};
 use windows_sys::Win32::Graphics::Gdi::{
     COLOR_WINDOW, CreateFontW, DEFAULT_CHARSET, DeleteObject, FW_NORMAL, HFONT, UpdateWindow,
+};
+use windows_sys::Win32::Security::Credentials::{
+    CREDUI_FLAGS_ALWAYS_SHOW_UI, CREDUI_FLAGS_DO_NOT_PERSIST, CREDUI_FLAGS_EXCLUDE_CERTIFICATES,
+    CREDUI_FLAGS_GENERIC_CREDENTIALS, CREDUI_FLAGS_KEEP_USERNAME, CREDUI_INFOW,
+    CredUIPromptForCredentialsW,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+};
+use windows_sys::Win32::System::IO::DeviceIoControl;
+use windows_sys::Win32::System::Ioctl::{
+    GET_LENGTH_INFORMATION, IOCTL_DISK_GET_LENGTH_INFO, IOCTL_STORAGE_QUERY_PROPERTY,
+    PropertyStandardQuery, STORAGE_DEVICE_DESCRIPTOR, STORAGE_PROPERTY_QUERY,
+    StorageDeviceProperty,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::Dialogs::{
@@ -21,28 +40,34 @@ use windows_sys::Win32::UI::Controls::{
     InitCommonControlsEx, LVCF_FMT, LVCF_TEXT, LVCF_WIDTH, LVCFMT_LEFT, LVCOLUMNW, LVIF_TEXT,
     LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS, LVM_ENSUREVISIBLE, LVM_GETNEXTITEM,
     LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE,
-    LVM_SETITEMTEXTW, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP,
-    NM_DBLCLK, NMHDR, SB_SETTEXTW, STATUSCLASSNAMEW, WC_LISTVIEWW,
+    LVM_SETITEMTEXTW, LVN_KEYDOWN, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
+    LVS_EX_LABELTIP, NM_DBLCLK, NMHDR, NMLVKEYDOWN, SB_SETTEXTW, STATUSCLASSNAMEW, WC_LISTVIEWW,
 };
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus, VK_BACK, VK_RETURN};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, BN_CLICKED, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL,
+    ACCEL, AppendMenuW, BN_CLICKED, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL,
     CB_RESETCONTENT, CB_SETCURSEL, CBN_SELCHANGE, CBS_DROPDOWNLIST, CREATESTRUCTW, CS_HREDRAW,
-    CS_VREDRAW, CW_USEDEFAULT, CreateMenu, CreateWindowExW, DefWindowProcW, DestroyWindow,
-    DispatchMessageW, GWLP_USERDATA, GetClientRect, GetMessageW, GetWindowLongPtrW,
-    GetWindowTextLengthW, GetWindowTextW, HMENU, IDC_ARROW, IsDialogMessageW, LoadCursorW,
-    MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW,
-    MoveWindow, PostMessageW, PostQuitMessage, RegisterClassW, SW_SHOW, SendMessageW, SetMenu,
-    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
-    WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_NCCREATE, WM_NOTIFY,
-    WM_SETFONT, WM_SIZE, WNDCLASSW, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE,
-    WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    CS_VREDRAW, CW_USEDEFAULT, CheckMenuItem, CreateAcceleratorTableW, CreateMenu, CreatePopupMenu,
+    CreateWindowExW, DefWindowProcW, DestroyAcceleratorTable, DestroyMenu, DestroyWindow,
+    DispatchMessageW, FALT, FCONTROL, FSHIFT, FVIRTKEY, GWLP_USERDATA, GetClientRect, GetMenu,
+    GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, HACCEL,
+    HMENU, IDC_ARROW, IsDialogMessageW, LoadCursorW, MB_ICONERROR, MB_ICONINFORMATION,
+    MB_ICONWARNING, MB_OK, MB_OKCANCEL, MF_BYCOMMAND, MF_CHECKED, MF_POPUP, MF_SEPARATOR,
+    MF_STRING, MF_UNCHECKED, MSG, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage,
+    RegisterClassW, SW_SHOW, SendMessageW, SetMenu, SetWindowLongPtrW, SetWindowPos,
+    SetWindowTextW, ShowWindow, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN, TrackPopupMenu,
+    TranslateAcceleratorW, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_COMMAND,
+    WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_NCCREATE, WM_NOTIFY, WM_SETFONT, WM_SIZE, WNDCLASSW,
+    WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT,
+    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
+use zeroize::{Zeroize, Zeroizing};
 use zfs_send_extract::client::{
-    ClientExtraction, InceptionCatalog, SourceCatalog, apply_incremental, child_path, parent_path,
+    ClientExtraction, InceptionCatalog, SourceCatalog, apply_incremental_with_key_material,
+    child_path, parent_path,
 };
 use zfs_send_extract::filesystem::DirectoryEntry;
 use zfs_send_extract::operations::Sidecar;
@@ -72,6 +97,19 @@ const ID_IMAGE_OFFSET: u16 = 117;
 const ID_IMAGE_LENGTH: u16 = 118;
 const ID_CONTAINER_KEY: u16 = 119;
 const ID_AGENT_PASSWORD: u16 = 120;
+const ID_OPEN_AUTO: u16 = 121;
+const ID_OPEN_IMAGE: u16 = 122;
+const ID_REFRESH: u16 = 123;
+const ID_FOCUS_PATH: u16 = 124;
+const ID_ENTER_KEY: u16 = 125;
+const ID_ENTER_CONTAINER_KEY: u16 = 126;
+const ID_ENTER_AGENT_PASSWORD: u16 = 127;
+const ID_CLEAR_CREDENTIALS: u16 = 128;
+const ID_SETTING_AUTO_IMAGES: u16 = 129;
+const ID_SETTING_CLEAR_CREDENTIALS: u16 = 130;
+const ID_SETTING_CONFIRM_DRIVE: u16 = 131;
+const ID_SHORTCUTS: u16 = 132;
+const ID_OPEN_SELECTED: u16 = 133;
 
 const WM_JOB_COMPLETE: u32 = WM_APP + 1;
 
@@ -106,11 +144,69 @@ struct AppState {
     catalog: Option<SourceCatalog>,
     entries: Vec<DirectoryEntry>,
     current_path: String,
-    key_file: Option<PathBuf>,
-    container_key_file: Option<PathBuf>,
-    agent_password_file: Option<PathBuf>,
-    inception: Option<InceptionCatalog>,
+    key: Option<SecretValue>,
+    container_key: Option<SecretValue>,
+    agent_password: Option<SecretValue>,
+    inception: Vec<ImageFrame>,
+    physical_drives: Vec<PhysicalDrive>,
+    settings: UiSettings,
     busy: bool,
+}
+
+#[derive(Clone)]
+struct SecretValue {
+    material: std::sync::Arc<Zeroizing<Vec<u8>>>,
+    label: String,
+    source: Option<PathBuf>,
+}
+
+impl SecretValue {
+    fn new(material: Vec<u8>, label: impl Into<String>, source: Option<PathBuf>) -> Self {
+        Self {
+            material: std::sync::Arc::new(Zeroizing::new(material)),
+            label: label.into(),
+            source,
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        self.material.as_slice()
+    }
+}
+
+#[derive(Clone)]
+struct ImageFrame {
+    catalog: InceptionCatalog,
+    parent_path: Option<String>,
+    parent_volume: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct PhysicalDrive {
+    path: PathBuf,
+    label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct UiSettings {
+    auto_open_images: bool,
+    clear_credentials_on_source_change: bool,
+    confirm_physical_drive: bool,
+    window_width: i32,
+    window_height: i32,
+}
+
+impl Default for UiSettings {
+    fn default() -> Self {
+        Self {
+            auto_open_images: true,
+            clear_credentials_on_source_change: true,
+            confirm_physical_drive: true,
+            window_width: 1180,
+            window_height: 760,
+        }
+    }
 }
 
 impl Default for AppState {
@@ -122,10 +218,12 @@ impl Default for AppState {
             catalog: None,
             entries: Vec::new(),
             current_path: "/".to_owned(),
-            key_file: None,
-            container_key_file: None,
-            agent_password_file: None,
-            inception: None,
+            key: None,
+            container_key: None,
+            agent_password: None,
+            inception: Vec::new(),
+            physical_drives: Vec::new(),
+            settings: load_settings(),
             busy: false,
         }
     }
@@ -146,7 +244,12 @@ enum JobResult {
         destination: PathBuf,
         extraction: RecursiveExtraction,
     },
-    InceptionOpened(InceptionCatalog),
+    InceptionOpened {
+        catalog: InceptionCatalog,
+        parent_path: Option<String>,
+        parent_volume: Option<usize>,
+        standalone: bool,
+    },
     Updated {
         target: PathBuf,
         sidecar: Sidecar,
@@ -198,8 +301,8 @@ unsafe fn run_ui() -> Result<()> {
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
-        1120,
-        720,
+        (*state).settings.window_width.max(900),
+        (*state).settings.window_height.max(620),
         null_mut(),
         null_mut(),
         instance,
@@ -214,15 +317,20 @@ unsafe fn run_ui() -> Result<()> {
 
     if let Some(argument) = std::env::args_os().nth(1) {
         set_text((*state).controls.source_path, &argument.to_string_lossy());
+        PostMessageW(hwnd, WM_COMMAND, ID_OPEN_AUTO as usize, 0);
     }
 
+    let accelerators = create_accelerators()?;
     let mut message = MSG::default();
     while GetMessageW(&mut message, null_mut(), 0, 0) > 0 {
-        if IsDialogMessageW(hwnd, &message) == 0 {
+        if TranslateAcceleratorW(hwnd, accelerators, &message) == 0
+            && IsDialogMessageW(hwnd, &message) == 0
+        {
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
     }
+    DestroyAcceleratorTable(accelerators);
     drop(Box::from_raw(state));
     Ok(())
 }
@@ -302,9 +410,17 @@ unsafe extern "system" fn window_proc(
             0
         }
         WM_DESTROY => {
-            if !state.is_null() && !(*state).font.is_null() {
-                DeleteObject((*state).font);
-                (*state).font = null_mut();
+            if !state.is_null() {
+                let mut window = RECT::default();
+                if GetWindowRect(hwnd, &mut window) != 0 {
+                    (*state).settings.window_width = window.right - window.left;
+                    (*state).settings.window_height = window.bottom - window.top;
+                }
+                let _ = save_settings(&(*state).settings);
+                if !(*state).font.is_null() {
+                    DeleteObject((*state).font);
+                    (*state).font = null_mut();
+                }
             }
             PostQuitMessage(0);
             0
@@ -334,62 +450,134 @@ unsafe fn initialize_window(state: &mut AppState) -> Result<()> {
     let menu = CreateMenu();
     let file_menu = CreateMenu();
     let actions_menu = CreateMenu();
+    let credentials_menu = CreateMenu();
+    let settings_menu = CreateMenu();
     let help_menu = CreateMenu();
     append_menu(
         file_menu,
         MF_STRING,
-        ID_OPEN_SEND as usize,
-        "Open send file…",
+        ID_OPEN_AUTO as usize,
+        "Open backup or disk image…\tCtrl+O",
+    );
+    append_menu(
+        file_menu,
+        MF_STRING,
+        ID_OPEN_IMAGE as usize,
+        "Open standalone disk image…\tCtrl+Shift+O",
     );
     append_menu(
         file_menu,
         MF_STRING,
         ID_OPEN_POOL as usize,
-        "Open pool member / drive",
+        "Open selected physical drive\tCtrl+D",
+    );
+    AppendMenuW(file_menu, MF_SEPARATOR, 0, null());
+    append_menu(
+        file_menu,
+        MF_STRING,
+        ID_OPEN_SEND as usize,
+        "Open path as ZFS send stream",
     );
     append_menu(
         file_menu,
         MF_STRING,
-        ID_CHOOSE_KEY as usize,
-        "Choose ZFS dataset key…",
-    );
-    append_menu(
-        file_menu,
-        MF_STRING,
-        ID_CONTAINER_KEY as usize,
-        "Choose Datto pool passphrase…",
-    );
-    append_menu(
-        file_menu,
-        MF_STRING,
-        ID_AGENT_PASSWORD as usize,
-        "Choose Datto agent password…",
+        ID_REFRESH as usize,
+        "Refresh current view / drives\tF5",
     );
     AppendMenuW(file_menu, MF_SEPARATOR, 0, null());
     append_menu(file_menu, MF_STRING, ID_EXIT as usize, "Exit");
+
+    append_menu(
+        credentials_menu,
+        MF_STRING,
+        ID_ENTER_KEY as usize,
+        "Enter ZFS key or passphrase…\tCtrl+K",
+    );
+    append_menu(
+        credentials_menu,
+        MF_STRING,
+        ID_CHOOSE_KEY as usize,
+        "Choose ZFS key file…",
+    );
+    AppendMenuW(credentials_menu, MF_SEPARATOR, 0, null());
+    append_menu(
+        credentials_menu,
+        MF_STRING,
+        ID_ENTER_CONTAINER_KEY as usize,
+        "Enter Datto pool passphrase…",
+    );
+    append_menu(
+        credentials_menu,
+        MF_STRING,
+        ID_CONTAINER_KEY as usize,
+        "Choose Datto pool passphrase file…",
+    );
+    append_menu(
+        credentials_menu,
+        MF_STRING,
+        ID_ENTER_AGENT_PASSWORD as usize,
+        "Enter Datto agent password…",
+    );
+    append_menu(
+        credentials_menu,
+        MF_STRING,
+        ID_AGENT_PASSWORD as usize,
+        "Choose Datto agent password file…",
+    );
+    AppendMenuW(credentials_menu, MF_SEPARATOR, 0, null());
+    append_menu(
+        credentials_menu,
+        MF_STRING,
+        ID_CLEAR_CREDENTIALS as usize,
+        "Clear all credentials",
+    );
     append_menu(
         actions_menu,
         MF_STRING,
         ID_EXTRACT as usize,
-        "Extract selected file or folder…",
+        "Extract selected file or folder…\tCtrl+E",
     );
     append_menu(
         actions_menu,
         MF_STRING,
         ID_INCEPTION as usize,
-        "Explore selected disk image…",
+        "Explore selected disk image…\tCtrl+I",
     );
     append_menu(
         actions_menu,
         MF_STRING,
         ID_LEAVE_IMAGE as usize,
-        "Leave disk image",
+        "Go back one image layer\tEsc",
     );
     append_menu(
         actions_menu,
         MF_STRING,
         ID_UPDATE as usize,
-        "Update an extracted file…",
+        "Update an extracted file…\tCtrl+U",
+    );
+    append_menu(
+        settings_menu,
+        MF_STRING,
+        ID_SETTING_AUTO_IMAGES as usize,
+        "Open recognized disk images on double-click",
+    );
+    append_menu(
+        settings_menu,
+        MF_STRING,
+        ID_SETTING_CLEAR_CREDENTIALS as usize,
+        "Clear credentials when opening another source",
+    );
+    append_menu(
+        settings_menu,
+        MF_STRING,
+        ID_SETTING_CONFIRM_DRIVE as usize,
+        "Confirm physical-drive selection",
+    );
+    append_menu(
+        help_menu,
+        MF_STRING,
+        ID_SHORTCUTS as usize,
+        "Keyboard shortcuts",
     );
     append_menu(
         help_menu,
@@ -398,7 +586,9 @@ unsafe fn initialize_window(state: &mut AppState) -> Result<()> {
         "About ZFS Send Explorer",
     );
     append_menu(menu, MF_POPUP, file_menu as usize, "File");
+    append_menu(menu, MF_POPUP, credentials_menu as usize, "Credentials");
     append_menu(menu, MF_POPUP, actions_menu as usize, "Actions");
+    append_menu(menu, MF_POPUP, settings_menu as usize, "Settings");
     append_menu(menu, MF_POPUP, help_menu as usize, "Help");
     SetMenu(state.hwnd, menu);
 
@@ -413,14 +603,8 @@ unsafe fn initialize_window(state: &mut AppState) -> Result<()> {
         ID_SOURCE_PATH,
     );
     controls.browse_source = button(state.hwnd, instance, "Browse…", ID_BROWSE_SOURCE, false);
-    controls.open_send = button(state.hwnd, instance, "Open send file", ID_OPEN_SEND, true);
-    controls.open_pool = button(
-        state.hwnd,
-        instance,
-        "Open pool / drive",
-        ID_OPEN_POOL,
-        false,
-    );
+    controls.open_send = button(state.hwnd, instance, "Open", ID_OPEN_AUTO, true);
+    controls.open_pool = button(state.hwnd, instance, "Open drive", ID_OPEN_POOL, false);
     controls.view = control(
         state.hwnd,
         instance,
@@ -450,26 +634,24 @@ unsafe fn initialize_window(state: &mut AppState) -> Result<()> {
     );
     controls.up = button(state.hwnd, instance, "Up", ID_UP, false);
     controls.go = button(state.hwnd, instance, "Go", ID_GO, false);
-    controls.choose_key = button(
+    controls.choose_key = button(state.hwnd, instance, "Credentials…", ID_ENTER_KEY, false);
+    controls.container_key = control(
         state.hwnd,
         instance,
-        "Decryption key…",
-        ID_CHOOSE_KEY,
-        false,
-    );
-    controls.container_key = button(
-        state.hwnd,
-        instance,
-        "Datto pool key…",
+        windows_sys::core::w!("COMBOBOX"),
+        "",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST as u32,
+        0,
         ID_CONTAINER_KEY,
-        false,
     );
-    controls.agent_password = button(
+    controls.agent_password = control(
         state.hwnd,
         instance,
-        "Datto agent password…",
-        ID_AGENT_PASSWORD,
-        false,
+        windows_sys::core::w!("STATIC"),
+        "Source > choose a view > browse files",
+        WS_CHILD | WS_VISIBLE,
+        0,
+        0,
     );
     controls.list = control(
         state.hwnd,
@@ -497,7 +679,7 @@ unsafe fn initialize_window(state: &mut AppState) -> Result<()> {
     controls.leave_image = button(
         state.hwnd,
         instance,
-        "Leave disk image",
+        "Back one image",
         ID_LEAVE_IMAGE,
         false,
     );
@@ -530,7 +712,7 @@ unsafe fn initialize_window(state: &mut AppState) -> Result<()> {
         state.hwnd,
         instance,
         STATUSCLASSNAMEW,
-        "Ready — open a send file, vdev image, or type \\\\.\\PhysicalDriveN",
+        "Ready — open a backup, choose a physical drive, or open a disk image",
         WS_CHILD | WS_VISIBLE,
         0,
         0,
@@ -542,7 +724,7 @@ unsafe fn initialize_window(state: &mut AppState) -> Result<()> {
         }
         SendMessageW(hwnd, WM_SETFONT, state.font as usize, 1);
     }
-    let cue = wide("Send file, vdev image, partition path, or \\\\.\\PhysicalDriveN");
+    let cue = wide("Backup, pool member, or standalone disk-image path");
     SendMessageW(
         controls.source_path,
         EM_SETCUEBANNER,
@@ -573,6 +755,9 @@ unsafe fn initialize_window(state: &mut AppState) -> Result<()> {
     add_column(controls.list, 1, "Type", 130);
     add_column(controls.list, 2, "Size", 150);
     add_column(controls.list, 3, "Object", 120);
+    update_settings_menu(state);
+    refresh_physical_drives(state);
+    update_credential_button(state);
     set_source_enabled(state, false);
     EnableWindow(state.controls.open_send, 1);
     EnableWindow(state.controls.open_pool, 1);
@@ -593,28 +778,48 @@ unsafe fn handle_command(state: &mut AppState, wparam: WPARAM) {
     }
     match id {
         ID_BROWSE_SOURCE if notification == BN_CLICKED as u16 => {
-            if let Some(path) =
-                open_file_dialog(state.hwnd, "Choose a ZFS source", SourceFilter::All)
-            {
+            if let Some(path) = open_file_dialog(
+                state.hwnd,
+                "Choose a backup, pool member, or disk image",
+                SourceFilter::All,
+            ) {
                 set_text(state.controls.source_path, &path.display().to_string());
             }
         }
-        ID_OPEN_SEND => open_source(state, true),
-        ID_OPEN_POOL => open_source(state, false),
+        ID_OPEN_AUTO => open_source(state, OpenMode::Auto),
+        ID_OPEN_IMAGE => open_source(state, OpenMode::Image),
+        ID_OPEN_SEND => open_source(state, OpenMode::Send),
+        ID_OPEN_POOL => open_physical_drive(state),
         ID_VIEW if notification == CBN_SELCHANGE as u16 => {
-            leave_inception(state, false);
+            leave_all_images(state, false);
+            ensure_selected_view_key(state);
             browse(state, "/".to_owned());
         }
         ID_VOLUME if notification == CBN_SELCHANGE as u16 => browse(state, "/".to_owned()),
+        ID_CONTAINER_KEY if notification == CBN_SELCHANGE as u16 => select_physical_drive(state),
         ID_GO => browse(state, get_text(state.controls.path)),
         ID_UP => browse(state, parent_path(&state.current_path)),
-        ID_CHOOSE_KEY => choose_key(state),
-        ID_CONTAINER_KEY => choose_container_key(state),
-        ID_AGENT_PASSWORD => choose_agent_password(state),
+        ID_FOCUS_PATH => {
+            SetFocus(state.controls.path);
+        }
+        ID_REFRESH => refresh(state),
+        ID_ENTER_KEY if notification == BN_CLICKED as u16 => show_credentials_menu(state),
+        ID_ENTER_KEY => enter_key(state),
+        ID_CHOOSE_KEY => choose_key_file(state),
+        ID_ENTER_CONTAINER_KEY => enter_container_key(state),
+        ID_CONTAINER_KEY => choose_container_key_file(state),
+        ID_ENTER_AGENT_PASSWORD => enter_agent_password(state),
+        ID_AGENT_PASSWORD => choose_agent_password_file(state),
+        ID_CLEAR_CREDENTIALS => clear_credentials(state),
         ID_EXTRACT => extract_selected(state),
         ID_INCEPTION => explore_selected_image(state),
+        ID_OPEN_SELECTED => open_selected(state),
         ID_LEAVE_IMAGE => leave_inception(state, true),
         ID_UPDATE => update_extracted_file(state),
+        ID_SETTING_AUTO_IMAGES => toggle_setting(state, ID_SETTING_AUTO_IMAGES),
+        ID_SETTING_CLEAR_CREDENTIALS => toggle_setting(state, ID_SETTING_CLEAR_CREDENTIALS),
+        ID_SETTING_CONFIRM_DRIVE => toggle_setting(state, ID_SETTING_CONFIRM_DRIVE),
+        ID_SHORTCUTS => show_shortcuts(state.hwnd),
         ID_EXIT => {
             DestroyWindow(state.hwnd);
         }
@@ -626,72 +831,77 @@ unsafe fn handle_command(state: &mut AppState, wparam: WPARAM) {
 unsafe fn handle_notify(state: &mut AppState, lparam: LPARAM) {
     let header = &*(lparam as *const NMHDR);
     if header.hwndFrom == state.controls.list && header.code == NM_DBLCLK {
-        let Some(index) = selected_index(state.controls.list) else {
-            return;
-        };
-        let Some(entry) = state.entries.get(index) else {
-            return;
-        };
-        if entry.dirent_type == 4 {
-            match child_path(&state.current_path, &entry.name) {
-                Ok(path) => browse(state, path),
-                Err(error) => {
-                    show_error(state.hwnd, "Could not open directory", &error.to_string())
-                }
-            }
-        } else if entry.dirent_type == 8 {
-            extract_selected(state);
+        open_selected(state);
+    } else if header.hwndFrom == state.controls.list && header.code == LVN_KEYDOWN {
+        let key = lparam as *const NMLVKEYDOWN;
+        let virtual_key = std::ptr::addr_of!((*key).wVKey).read_unaligned();
+        match virtual_key {
+            value if value == VK_RETURN => open_selected(state),
+            value if value == VK_BACK => browse(state, parent_path(&state.current_path)),
+            _ => {}
         }
     }
 }
 
-unsafe fn open_source(state: &mut AppState, send: bool) {
+#[derive(Clone, Copy)]
+enum OpenMode {
+    Auto,
+    Send,
+    Pool,
+    Image,
+}
+
+unsafe fn open_source(state: &mut AppState, mode: OpenMode) {
     let path = PathBuf::from(get_text(state.controls.source_path));
     if path.as_os_str().is_empty() {
-        let title = if send {
-            "Choose a ZFS send file"
-        } else {
-            "Choose a pool member or image"
-        };
-        let filter = if send {
-            SourceFilter::Send
-        } else {
-            SourceFilter::All
+        let (title, filter) = match mode {
+            OpenMode::Send => ("Choose a ZFS send file", SourceFilter::Send),
+            OpenMode::Image => ("Choose a standalone disk image", SourceFilter::Image),
+            OpenMode::Pool => (
+                "Choose a pool member or whole-disk image",
+                SourceFilter::All,
+            ),
+            OpenMode::Auto => (
+                "Choose a backup, pool member, or disk image",
+                SourceFilter::All,
+            ),
         };
         let Some(selected) = open_file_dialog(state.hwnd, title, filter) else {
             return;
         };
         set_text(state.controls.source_path, &selected.display().to_string());
-        return open_source(state, send);
+        return open_source(state, mode);
+    }
+    if state.settings.clear_credentials_on_source_change && source_is_changing(state, &path) {
+        clear_credentials_for_source(state, &path);
     }
     set_busy(
         state,
         true,
-        if send {
-            "Inspecting send stream…"
-        } else {
-            "Reading pool labels and datasets…"
-        },
+        "Inspecting the source and detecting its format…",
     );
-    let container_key = state.container_key_file.clone();
+    let container_key = state.container_key.clone();
     spawn_job(state.hwnd, move || {
-        if send {
-            SourceCatalog::open_send(path).map(JobResult::Catalog)
-        } else {
-            SourceCatalog::open_pool_with_container_key_file(path, container_key.as_deref())
-                .map(JobResult::Catalog)
+        let pool_key = container_key.as_ref().map(SecretValue::bytes);
+        match mode {
+            OpenMode::Send => SourceCatalog::open_send(path).map(JobResult::Catalog),
+            OpenMode::Pool => SourceCatalog::open_pool_with_container_key_material(path, pool_key)
+                .map(JobResult::Catalog),
+            OpenMode::Image => InceptionCatalog::open_file(&path, 0, None).map(|catalog| {
+                JobResult::InceptionOpened {
+                    catalog,
+                    parent_path: None,
+                    parent_volume: None,
+                    standalone: true,
+                }
+            }),
+            OpenMode::Auto => open_automatically(path, pool_key),
         }
     });
 }
 
 unsafe fn browse(state: &mut AppState, path: String) {
-    let Some(catalog) = state.catalog.clone() else {
-        return;
-    };
-    let Some(view) = selected_view(state) else {
-        return;
-    };
-    let inception = state.inception.clone();
+    let inception = state.inception.last().map(|frame| frame.catalog.clone());
     let selected_volume_index = if inception.is_some() {
         let Some(index) = selected_volume_index(state) else {
             return;
@@ -700,7 +910,12 @@ unsafe fn browse(state: &mut AppState, path: String) {
     } else {
         0
     };
-    let key = state.key_file.clone();
+    let catalog = state.catalog.clone();
+    let view = selected_view(state);
+    if inception.is_none() && (catalog.is_none() || view.is_none()) {
+        return;
+    }
+    let key = state.key.clone();
     set_busy(state, true, "Reading directory…");
     spawn_job(state.hwnd, move || {
         let entries = if let Some(inception) = inception {
@@ -710,7 +925,13 @@ unsafe fn browse(state: &mut AppState, path: String) {
                 .ok_or_else(|| anyhow::anyhow!("selected inner volume no longer exists"))?;
             inception.list_directory(Some(&volume.selector), &path)
         } else {
-            catalog.list_directory(view, &path, key.as_deref())
+            catalog
+                .ok_or_else(|| anyhow::anyhow!("no source is open"))?
+                .list_directory_with_key_material(
+                    view.ok_or_else(|| anyhow::anyhow!("no source view is selected"))?,
+                    &path,
+                    key.as_ref().map(SecretValue::bytes),
+                )
         }?;
         Ok(JobResult::Directory { path, entries })
     });
@@ -740,12 +961,8 @@ unsafe fn extract_selected(state: &mut AppState) {
     let Some(destination) = save_extraction_dialog(state.hwnd, &entry.name, is_directory) else {
         return;
     };
-    let Some(catalog) = state.catalog.clone() else {
-        return;
-    };
-    let Some(view) = selected_view(state) else {
-        return;
-    };
+    let catalog = state.catalog.clone();
+    let view = selected_view(state);
     let source_path = match child_path(&state.current_path, &entry.name) {
         Ok(path) => path,
         Err(error) => {
@@ -753,8 +970,8 @@ unsafe fn extract_selected(state: &mut AppState) {
             return;
         }
     };
-    let key = state.key_file.clone();
-    let inception = state.inception.clone();
+    let key = state.key.clone();
+    let inception = state.inception.last().map(|frame| frame.catalog.clone());
     let volume_index = selected_volume_index(state);
     set_busy(
         state,
@@ -774,7 +991,16 @@ unsafe fn extract_selected(state: &mut AppState) {
                     .ok_or_else(|| anyhow::anyhow!("selected inner volume no longer exists"))?;
                 inception.extract_tree(Some(&volume.selector), &source_path, &destination, true)?
             } else {
-                catalog.extract_tree(view, &source_path, &destination, true, key.as_deref())?
+                catalog
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("no ZFS source is open"))?
+                    .extract_tree_with_key_material(
+                        view.ok_or_else(|| anyhow::anyhow!("no source view is selected"))?,
+                        &source_path,
+                        &destination,
+                        true,
+                        key.as_ref().map(SecretValue::bytes),
+                    )?
             };
             return Ok(JobResult::TreeExtracted {
                 destination,
@@ -792,7 +1018,16 @@ unsafe fn extract_selected(state: &mut AppState) {
             )
         } else {
             (
-                catalog.extract(view, &source_path, &destination, true, key.as_deref())?,
+                catalog
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("no ZFS source is open"))?
+                    .extract_with_key_material(
+                        view.ok_or_else(|| anyhow::anyhow!("no source view is selected"))?,
+                        &source_path,
+                        &destination,
+                        true,
+                        key.as_ref().map(SecretValue::bytes),
+                    )?,
                 false,
             )
         };
@@ -805,7 +1040,12 @@ unsafe fn extract_selected(state: &mut AppState) {
 }
 
 unsafe fn explore_selected_image(state: &mut AppState) {
-    if state.inception.is_some() {
+    if state.inception.len() >= 8 {
+        show_error(
+            state.hwnd,
+            "Image nesting limit reached",
+            "Eight nested disk-image layers are already open. Go back before opening another.",
+        );
         return;
     }
     let Some(index) = selected_index(state.controls.list) else {
@@ -849,49 +1089,78 @@ unsafe fn explore_selected_image(state: &mut AppState) {
             return;
         }
     };
-    let Some(catalog) = state.catalog.clone() else {
-        return;
-    };
-    let Some(view) = selected_view(state) else {
-        return;
-    };
-    let key = state.key_file.clone();
+    let catalog = state.catalog.clone();
+    let view = selected_view(state);
+    let parent_image = state.inception.last().map(|frame| frame.catalog.clone());
+    let parent_volume = selected_volume_index(state);
+    let key = state.key.clone();
     let agent_password = image_path
         .to_ascii_lowercase()
         .ends_with(".detto")
-        .then(|| state.agent_password_file.clone())
+        .then(|| state.agent_password.clone())
         .flatten();
+    let parent_path = state.current_path.clone();
     set_busy(
         state,
         true,
         "Opening disk container and detecting inner volumes…",
     );
     spawn_job(state.hwnd, move || {
-        catalog
-            .inspect_inception_with_datto(
-                view,
+        let child = if let Some(parent_image) = parent_image {
+            let volume = parent_image
+                .volumes
+                .get(parent_volume.ok_or_else(|| anyhow::anyhow!("no inner volume selected"))?)
+                .ok_or_else(|| anyhow::anyhow!("selected inner volume no longer exists"))?;
+            parent_image.inspect_child(
+                Some(&volume.selector),
                 &image_path,
-                key.as_deref(),
-                agent_password.as_deref(),
-                None,
                 image_offset,
                 image_length,
-            )
-            .map(JobResult::InceptionOpened)
+            )?
+        } else {
+            catalog
+                .ok_or_else(|| anyhow::anyhow!("no ZFS source is open"))?
+                .inspect_inception_with_key_material(
+                    view.ok_or_else(|| anyhow::anyhow!("no source view is selected"))?,
+                    &image_path,
+                    key.as_ref().map(SecretValue::bytes),
+                    agent_password.as_ref().map(SecretValue::bytes),
+                    None,
+                    image_offset,
+                    image_length,
+                )?
+        };
+        Ok(JobResult::InceptionOpened {
+            catalog: child,
+            parent_path: Some(parent_path),
+            parent_volume,
+            standalone: false,
+        })
     });
 }
 
 unsafe fn leave_inception(state: &mut AppState, browse_outer: bool) {
-    if state.inception.take().is_none() {
+    let Some(frame) = state.inception.pop() else {
         return;
-    }
+    };
     SendMessageW(state.controls.volume, CB_RESETCONTENT, 0, 0);
     set_text(state.controls.image_offset, "");
     set_text(state.controls.image_length, "");
-    state.current_path = "/".to_owned();
-    set_source_enabled(state, !state.busy && state.catalog.is_some());
+    let destination = frame.parent_path.unwrap_or_else(|| "/".to_owned());
+    if let Some(image) = state.inception.last() {
+        populate_volumes(state, &image.catalog, frame.parent_volume);
+    }
+    set_source_enabled(
+        state,
+        !state.busy && (state.catalog.is_some() || !state.inception.is_empty()),
+    );
+    update_breadcrumb(state);
     if browse_outer {
-        browse(state, "/".to_owned());
+        if state.catalog.is_none() && state.inception.is_empty() {
+            close_source_ui(state);
+        } else {
+            browse(state, destination);
+        }
     }
 }
 
@@ -910,59 +1179,107 @@ unsafe fn update_extracted_file(state: &mut AppState) {
     ) else {
         return;
     };
-    let key = state.key_file.clone();
+    let key = state.key.clone();
     set_busy(
         state,
         true,
         "Validating the base file and applying the incremental send…",
     );
     spawn_job(state.hwnd, move || {
-        apply_incremental(&stream, &target, key.as_deref())
+        apply_incremental_with_key_material(&stream, &target, key.as_ref().map(SecretValue::bytes))
             .map(|sidecar| JobResult::Updated { target, sidecar })
     });
 }
 
-unsafe fn choose_key(state: &mut AppState) {
-    if let Some(path) = open_file_dialog(
+unsafe fn enter_key(state: &mut AppState) {
+    if let Some(material) = prompt_secret(
         state.hwnd,
-        "Choose the ZFS dataset key file",
-        SourceFilter::All,
+        "ZFS dataset key",
+        "Enter the passphrase or hexadecimal key for the selected encrypted ZFS view. Binary raw keys must be chosen from a file.",
     ) {
-        state.key_file = Some(path.clone());
-        set_status(
-            state,
-            &format!("Decryption key selected: {}", file_label(&path)),
-        );
-        if state.catalog.is_some() {
+        state.key = Some(SecretValue::new(
+            material,
+            "entered in memory",
+            credential_scope(state),
+        ));
+        credential_changed(state, "ZFS key entered in protected memory");
+        if state.catalog.is_some() && state.inception.is_empty() {
             browse(state, state.current_path.clone());
         }
     }
 }
 
-unsafe fn choose_container_key(state: &mut AppState) {
-    if let Some(path) = open_file_dialog(
+unsafe fn enter_container_key(state: &mut AppState) {
+    if let Some(material) = prompt_secret(
+        state.hwnd,
+        "Datto pool passphrase",
+        "Enter the LUKS passphrase supplied for this Datto Reverse RoundTrip drive.",
+    ) {
+        state.container_key = Some(SecretValue::new(
+            material,
+            "entered in memory",
+            credential_scope(state),
+        ));
+        credential_changed(state, "Datto pool passphrase entered in protected memory");
+    }
+}
+
+unsafe fn enter_agent_password(state: &mut AppState) {
+    if let Some(material) = prompt_secret(
+        state.hwnd,
+        "Datto agent password",
+        "Enter the protected system's agent password used to authenticate its .detto key stash.",
+    ) {
+        state.agent_password = Some(SecretValue::new(
+            material,
+            "entered in memory",
+            credential_scope(state),
+        ));
+        credential_changed(state, "Datto agent password entered in protected memory");
+    }
+}
+
+unsafe fn choose_key_file(state: &mut AppState) {
+    if let Some(mut secret) =
+        choose_secret_file(state.hwnd, "Choose the ZFS dataset key file", 514, false)
+    {
+        secret.source = credential_scope(state);
+        state.key = Some(secret);
+        credential_changed(state, "ZFS key file loaded into protected memory");
+        if state.catalog.is_some() && state.inception.is_empty() {
+            browse(state, state.current_path.clone());
+        }
+    }
+}
+
+unsafe fn choose_container_key_file(state: &mut AppState) {
+    if let Some(mut secret) = choose_secret_file(
         state.hwnd,
         "Choose the Datto Reverse RoundTrip pool passphrase file",
-        SourceFilter::All,
+        4096,
+        true,
     ) {
-        state.container_key_file = Some(path.clone());
-        set_status(
+        secret.source = credential_scope(state);
+        state.container_key = Some(secret);
+        credential_changed(
             state,
-            &format!("Datto pool passphrase selected: {}", file_label(&path)),
+            "Datto pool passphrase file loaded into protected memory",
         );
     }
 }
 
-unsafe fn choose_agent_password(state: &mut AppState) {
-    if let Some(path) = open_file_dialog(
+unsafe fn choose_agent_password_file(state: &mut AppState) {
+    if let Some(mut secret) = choose_secret_file(
         state.hwnd,
         "Choose the Datto agent password file",
-        SourceFilter::All,
+        4096,
+        true,
     ) {
-        state.agent_password_file = Some(path.clone());
-        set_status(
+        secret.source = credential_scope(state);
+        state.agent_password = Some(secret);
+        credential_changed(
             state,
-            &format!("Datto agent password selected: {}", file_label(&path)),
+            "Datto agent password file loaded into protected memory",
         );
     }
 }
@@ -972,7 +1289,7 @@ unsafe fn finish_job(state: &mut AppState, result: JobMessage) {
     match result {
         Err(error) => show_error(state.hwnd, "The operation did not complete", &error),
         Ok(JobResult::Catalog(catalog)) => {
-            state.inception = None;
+            state.inception.clear();
             SendMessageW(state.controls.volume, CB_RESETCONTENT, 0, 0);
             SendMessageW(state.controls.view, CB_RESETCONTENT, 0, 0);
             for view in &catalog.views {
@@ -990,6 +1307,8 @@ unsafe fn finish_job(state: &mut AppState, result: JobMessage) {
             set_status(state, &catalog.summary);
             state.catalog = Some(catalog);
             set_source_enabled(state, true);
+            update_breadcrumb(state);
+            ensure_selected_view_key(state);
             browse(state, "/".to_owned());
         }
         Ok(JobResult::Directory { path, entries }) => {
@@ -1006,28 +1325,23 @@ unsafe fn finish_job(state: &mut AppState, result: JobMessage) {
                     state.current_path,
                     state
                         .inception
-                        .as_ref()
-                        .map_or_else(String::new, |image| format!(" inside {}", image.image_path))
+                        .last()
+                        .map_or_else(String::new, |frame| format!(
+                            " inside {}",
+                            frame.catalog.image_path
+                        ))
                 ),
             );
+            update_breadcrumb(state);
         }
-        Ok(JobResult::InceptionOpened(inception)) => {
-            SendMessageW(state.controls.volume, CB_RESETCONTENT, 0, 0);
-            let mut first_supported = None;
-            for (index, volume) in inception.volumes.iter().enumerate() {
-                let label = wide(&volume.label());
-                SendMessageW(
-                    state.controls.volume,
-                    CB_ADDSTRING,
-                    0,
-                    label.as_ptr() as isize,
-                );
-                if first_supported.is_none() && volume.filesystem.is_some() {
-                    first_supported = Some(index);
-                }
-            }
-            let Some(selected) = first_supported else {
-                let details = inception
+        Ok(JobResult::InceptionOpened {
+            catalog,
+            parent_path,
+            parent_volume,
+            standalone,
+        }) => {
+            let Some(selected) = first_supported_volume(&catalog) else {
+                let details = catalog
                     .volumes
                     .iter()
                     .filter_map(|volume| volume.diagnostic.as_deref())
@@ -1042,33 +1356,47 @@ unsafe fn finish_job(state: &mut AppState, result: JobMessage) {
                         &details
                     },
                 );
-                SendMessageW(state.controls.volume, CB_RESETCONTENT, 0, 0);
                 return;
             };
-            SendMessageW(state.controls.volume, CB_SETCURSEL, selected, 0);
+            if standalone {
+                state.catalog = None;
+                state.inception.clear();
+                SendMessageW(state.controls.view, CB_RESETCONTENT, 0, 0);
+                set_text(
+                    state.hwnd,
+                    &format!(
+                        "{} — {}",
+                        file_label(Path::new(&catalog.image_path)),
+                        APP_TITLE
+                    ),
+                );
+            }
+            populate_volumes(state, &catalog, Some(selected));
             set_text(
                 state.controls.image_offset,
-                &inception.image_offset.to_string(),
+                &catalog.image_offset.to_string(),
             );
             set_text(
                 state.controls.image_length,
-                &inception.stored_size.to_string(),
+                &catalog.stored_size.to_string(),
             );
             let status = format!(
-                "Inception mode · {} · {} virtual bytes · {} volume{}",
-                inception.container,
-                inception.disk_size,
-                inception.volumes.len(),
-                if inception.volumes.len() == 1 {
-                    ""
-                } else {
-                    "s"
-                }
+                "Disk image layer {} · {} · {} virtual bytes · {} volume{}",
+                state.inception.len() + 1,
+                catalog.container,
+                catalog.disk_size,
+                catalog.volumes.len(),
+                if catalog.volumes.len() == 1 { "" } else { "s" }
             );
-            state.inception = Some(inception);
+            state.inception.push(ImageFrame {
+                catalog,
+                parent_path,
+                parent_volume,
+            });
             state.current_path = "/".to_owned();
             set_source_enabled(state, true);
             set_status(state, &status);
+            update_breadcrumb(state);
             browse(state, "/".to_owned());
         }
         Ok(JobResult::Extracted {
@@ -1225,14 +1553,16 @@ unsafe fn set_busy(state: &mut AppState, busy: bool, message: &str) {
     ] {
         EnableWindow(control, enabled);
     }
-    set_source_enabled(state, !busy && state.catalog.is_some());
+    set_source_enabled(
+        state,
+        !busy && (state.catalog.is_some() || !state.inception.is_empty()),
+    );
     set_status(state, message);
 }
 
 unsafe fn set_source_enabled(state: &AppState, enabled: bool) {
     let enabled = enabled as i32;
     for control in [
-        state.controls.view,
         state.controls.path,
         state.controls.up,
         state.controls.go,
@@ -1246,24 +1576,16 @@ unsafe fn set_source_enabled(state: &AppState, enabled: bool) {
         EnableWindow(control, enabled);
     }
     EnableWindow(
+        state.controls.view,
+        (enabled != 0 && state.catalog.is_some() && state.inception.is_empty()) as i32,
+    );
+    EnableWindow(
         state.controls.volume,
-        (enabled != 0 && state.inception.is_some()) as i32,
+        (enabled != 0 && !state.inception.is_empty()) as i32,
     );
     EnableWindow(
         state.controls.leave_image,
-        (enabled != 0 && state.inception.is_some()) as i32,
-    );
-    EnableWindow(
-        state.controls.inception,
-        (enabled != 0 && state.inception.is_none()) as i32,
-    );
-    EnableWindow(
-        state.controls.image_offset,
-        (enabled != 0 && state.inception.is_none()) as i32,
-    );
-    EnableWindow(
-        state.controls.image_length,
-        (enabled != 0 && state.inception.is_none()) as i32,
+        (enabled != 0 && !state.inception.is_empty()) as i32,
     );
 }
 
@@ -1280,6 +1602,756 @@ unsafe fn selected_volume_index(state: &AppState) -> Option<usize> {
 unsafe fn selected_index(list: HWND) -> Option<usize> {
     let selected = SendMessageW(list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize);
     (selected >= 0).then_some(selected as usize)
+}
+
+unsafe fn open_selected(state: &mut AppState) {
+    let Some(index) = selected_index(state.controls.list) else {
+        return;
+    };
+    let Some(entry) = state.entries.get(index) else {
+        return;
+    };
+    if entry.dirent_type == 4 {
+        match child_path(&state.current_path, &entry.name) {
+            Ok(path) => browse(state, path),
+            Err(error) => show_error(state.hwnd, "Could not open directory", &error.to_string()),
+        }
+    } else if entry.dirent_type == 8
+        && state.settings.auto_open_images
+        && likely_disk_image(&entry.name)
+    {
+        explore_selected_image(state);
+    } else if entry.dirent_type == 8 {
+        extract_selected(state);
+    }
+}
+
+fn likely_disk_image(name: &str) -> bool {
+    let extension = Path::new(name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    [
+        "raw", "img", "dd", "qcow", "qcow2", "vmdk", "datto", "detto", "vhd", "vhdx",
+    ]
+    .iter()
+    .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+}
+
+fn open_automatically(path: PathBuf, container_key: Option<&[u8]>) -> Result<JobResult> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let send_first = matches!(extension.as_str(), "zfs" | "zstream" | "send");
+    let image_first = matches!(extension.as_str(), "qcow" | "qcow2" | "vmdk" | "dd");
+    let mut errors = Vec::new();
+
+    if image_first {
+        match InceptionCatalog::open_file(&path, 0, None) {
+            Ok(catalog) => {
+                return Ok(JobResult::InceptionOpened {
+                    catalog,
+                    parent_path: None,
+                    parent_volume: None,
+                    standalone: true,
+                });
+            }
+            Err(error) => errors.push(format!("disk image: {error:#}")),
+        }
+    }
+    if send_first {
+        match SourceCatalog::open_send(&path) {
+            Ok(catalog) => return Ok(JobResult::Catalog(catalog)),
+            Err(error) => errors.push(format!("ZFS send: {error:#}")),
+        }
+    }
+    match SourceCatalog::open_pool_with_container_key_material(&path, container_key) {
+        Ok(catalog) => return Ok(JobResult::Catalog(catalog)),
+        Err(error) => errors.push(format!("pool member: {error:#}")),
+    }
+    if !send_first {
+        match SourceCatalog::open_send(&path) {
+            Ok(catalog) => return Ok(JobResult::Catalog(catalog)),
+            Err(error) => errors.push(format!("ZFS send: {error:#}")),
+        }
+    }
+    if !image_first {
+        match InceptionCatalog::open_file(&path, 0, None) {
+            Ok(catalog) => {
+                return Ok(JobResult::InceptionOpened {
+                    catalog,
+                    parent_path: None,
+                    parent_volume: None,
+                    standalone: true,
+                });
+            }
+            Err(error) => errors.push(format!("disk image: {error:#}")),
+        }
+    }
+    bail!(
+        "The source was not recognized as a supported send stream, pool member, or disk image.\n\n{}",
+        errors.join("\n\n")
+    )
+}
+
+unsafe fn select_physical_drive(state: &mut AppState) {
+    let selected = SendMessageW(state.controls.container_key, CB_GETCURSEL, 0, 0);
+    if selected <= 0 {
+        return;
+    }
+    if let Some(drive) = state.physical_drives.get(selected as usize - 1) {
+        set_text(
+            state.controls.source_path,
+            &drive.path.display().to_string(),
+        );
+        set_status(state, &format!("Selected {}", drive.label));
+    }
+}
+
+unsafe fn open_physical_drive(state: &mut AppState) {
+    select_physical_drive(state);
+    let path = PathBuf::from(get_text(state.controls.source_path));
+    let Some(drive) = state
+        .physical_drives
+        .iter()
+        .find(|drive| drive.path == path)
+    else {
+        if path.as_os_str().is_empty() {
+            show_error(
+                state.hwnd,
+                "Choose a physical drive",
+                "Select a drive from the Physical drives list first. Press F5 after attaching a new drive.",
+            );
+        } else {
+            open_source(state, OpenMode::Pool);
+        }
+        return;
+    };
+    if state.settings.confirm_physical_drive {
+        let message = format!(
+            "Open this physical drive read-only?\n\n{}\n{}\n\nThe app will not initialize, mount, import, or write to it. Verify the disk number after every attach or removal.",
+            drive.label,
+            drive.path.display()
+        );
+        if !show_confirmation(state.hwnd, "Confirm physical drive", &message) {
+            return;
+        }
+    }
+    open_source(state, OpenMode::Pool);
+}
+
+unsafe fn refresh_physical_drives(state: &mut AppState) {
+    state.physical_drives = enumerate_physical_drives();
+    SendMessageW(state.controls.container_key, CB_RESETCONTENT, 0, 0);
+    let prompt = if state.physical_drives.is_empty() {
+        "No physical drives detected — press F5 to scan again"
+    } else {
+        "Physical drives — choose by model, size, and disk number"
+    };
+    let prompt = wide(prompt);
+    SendMessageW(
+        state.controls.container_key,
+        CB_ADDSTRING,
+        0,
+        prompt.as_ptr() as isize,
+    );
+    for drive in &state.physical_drives {
+        let label = wide(&drive.label);
+        SendMessageW(
+            state.controls.container_key,
+            CB_ADDSTRING,
+            0,
+            label.as_ptr() as isize,
+        );
+    }
+    SendMessageW(state.controls.container_key, CB_SETCURSEL, 0, 0);
+}
+
+fn enumerate_physical_drives() -> Vec<PhysicalDrive> {
+    (0..64).filter_map(inspect_physical_drive).collect()
+}
+
+fn inspect_physical_drive(number: u32) -> Option<PhysicalDrive> {
+    let path = format!(r"\\.\PhysicalDrive{number}");
+    let path_wide = wide(&path);
+    // SAFETY: the handle is opened with zero desired access and is closed on
+    // every successful path. IOCTL buffers have their documented layouts.
+    unsafe {
+        let handle = CreateFileW(
+            path_wide.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            null_mut(),
+        );
+        if handle == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut length = GET_LENGTH_INFORMATION::default();
+        let mut returned = 0_u32;
+        let size = (DeviceIoControl(
+            handle,
+            IOCTL_DISK_GET_LENGTH_INFO,
+            null(),
+            0,
+            (&mut length as *mut GET_LENGTH_INFORMATION).cast(),
+            size_of::<GET_LENGTH_INFORMATION>() as u32,
+            &mut returned,
+            null_mut(),
+        ) != 0)
+            .then_some(length.Length as u64);
+
+        let query = STORAGE_PROPERTY_QUERY {
+            PropertyId: StorageDeviceProperty,
+            QueryType: PropertyStandardQuery,
+            AdditionalParameters: [0],
+        };
+        let mut descriptor = vec![0_u8; 1024];
+        let descriptor_ok = DeviceIoControl(
+            handle,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            (&query as *const STORAGE_PROPERTY_QUERY).cast(),
+            size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+            descriptor.as_mut_ptr().cast(),
+            descriptor.len() as u32,
+            &mut returned,
+            null_mut(),
+        ) != 0;
+        let (model, removable) =
+            if descriptor_ok && returned as usize >= size_of::<STORAGE_DEVICE_DESCRIPTOR>() {
+                let header = &*(descriptor.as_ptr().cast::<STORAGE_DEVICE_DESCRIPTOR>());
+                let vendor = descriptor_string(&descriptor, header.VendorIdOffset);
+                let product = descriptor_string(&descriptor, header.ProductIdOffset);
+                let model = [vendor, product]
+                    .into_iter()
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (model, header.RemovableMedia)
+            } else {
+                (String::new(), false)
+            };
+        CloseHandle(handle);
+        let model = if model.is_empty() {
+            "Unknown device".to_owned()
+        } else {
+            model
+        };
+        let size_label = size.map_or_else(|| "unknown size".to_owned(), format_size);
+        let media = if removable { "removable" } else { "fixed" };
+        Some(PhysicalDrive {
+            path: PathBuf::from(&path),
+            label: format!("Disk {number} — {model} — {size_label} — {media}"),
+        })
+    }
+}
+
+fn descriptor_string(buffer: &[u8], offset: u32) -> String {
+    let start = offset as usize;
+    if start == 0 || start >= buffer.len() {
+        return String::new();
+    }
+    let end = buffer[start..]
+        .iter()
+        .position(|byte| *byte == 0)
+        .map_or(buffer.len(), |relative| start + relative);
+    String::from_utf8_lossy(&buffer[start..end])
+        .trim()
+        .to_owned()
+}
+
+unsafe fn refresh(state: &mut AppState) {
+    refresh_physical_drives(state);
+    if state.catalog.is_some() || !state.inception.is_empty() {
+        browse(state, state.current_path.clone());
+    } else {
+        set_status(
+            state,
+            &format!(
+                "Found {} physical drive{}",
+                state.physical_drives.len(),
+                if state.physical_drives.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ),
+        );
+    }
+}
+
+unsafe fn show_credentials_menu(state: &mut AppState) {
+    let menu = CreatePopupMenu();
+    append_menu(
+        menu,
+        MF_STRING,
+        ID_ENTER_KEY as usize,
+        "Enter ZFS key or passphrase…",
+    );
+    append_menu(
+        menu,
+        MF_STRING,
+        ID_CHOOSE_KEY as usize,
+        "Choose ZFS key file…",
+    );
+    AppendMenuW(menu, MF_SEPARATOR, 0, null());
+    append_menu(
+        menu,
+        MF_STRING,
+        ID_ENTER_CONTAINER_KEY as usize,
+        "Enter Datto pool passphrase…",
+    );
+    append_menu(
+        menu,
+        MF_STRING,
+        ID_CONTAINER_KEY as usize,
+        "Choose Datto pool key file…",
+    );
+    append_menu(
+        menu,
+        MF_STRING,
+        ID_ENTER_AGENT_PASSWORD as usize,
+        "Enter Datto agent password…",
+    );
+    append_menu(
+        menu,
+        MF_STRING,
+        ID_AGENT_PASSWORD as usize,
+        "Choose Datto agent password file…",
+    );
+    AppendMenuW(menu, MF_SEPARATOR, 0, null());
+    append_menu(
+        menu,
+        MF_STRING,
+        ID_CLEAR_CREDENTIALS as usize,
+        "Clear all credentials",
+    );
+    let mut rect = RECT::default();
+    GetWindowRect(state.controls.choose_key, &mut rect);
+    let command = TrackPopupMenu(
+        menu,
+        TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD,
+        rect.left,
+        rect.bottom,
+        0,
+        state.hwnd,
+        null(),
+    );
+    if command != 0 {
+        SendMessageW(state.hwnd, WM_COMMAND, command as usize, 0);
+    }
+    DestroyMenu(menu);
+}
+
+unsafe fn prompt_secret(owner: HWND, label: &str, message: &str) -> Option<Vec<u8>> {
+    let caption = wide(label);
+    let message = wide(message);
+    let target = wide("ZFS Send Explorer");
+    let mut username = wide(label);
+    username.resize(514, 0);
+    let mut password = vec![0_u16; 514];
+    let mut save = 0;
+    let info = CREDUI_INFOW {
+        cbSize: size_of::<CREDUI_INFOW>() as u32,
+        hwndParent: owner,
+        pszMessageText: message.as_ptr(),
+        pszCaptionText: caption.as_ptr(),
+        hbmBanner: null_mut(),
+    };
+    let result = CredUIPromptForCredentialsW(
+        &info,
+        target.as_ptr(),
+        null(),
+        0,
+        username.as_mut_ptr(),
+        username.len() as u32,
+        password.as_mut_ptr(),
+        password.len() as u32,
+        &mut save,
+        CREDUI_FLAGS_ALWAYS_SHOW_UI
+            | CREDUI_FLAGS_DO_NOT_PERSIST
+            | CREDUI_FLAGS_EXCLUDE_CERTIFICATES
+            | CREDUI_FLAGS_GENERIC_CREDENTIALS
+            | CREDUI_FLAGS_KEEP_USERNAME,
+    );
+    username.zeroize();
+    if result == ERROR_CANCELLED {
+        password.zeroize();
+        return None;
+    }
+    if result != 0 {
+        password.zeroize();
+        show_error(
+            owner,
+            "Could not open the secure credential prompt",
+            &format!("Windows returned error {result}."),
+        );
+        return None;
+    }
+    let length = password
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(password.len());
+    let mut value = String::from_utf16_lossy(&password[..length]);
+    password.zeroize();
+    let material = value.as_bytes().to_vec();
+    value.zeroize();
+    Some(material)
+}
+
+unsafe fn choose_secret_file(
+    owner: HWND,
+    title: &str,
+    maximum_size: u64,
+    trim_newline: bool,
+) -> Option<SecretValue> {
+    let path = open_file_dialog(owner, title, SourceFilter::All)?;
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            show_error(owner, "Could not read credential file", &error.to_string());
+            return None;
+        }
+    };
+    if metadata.len() > maximum_size {
+        show_error(
+            owner,
+            "Credential file is too large",
+            &format!("{} is larger than {maximum_size} bytes.", path.display()),
+        );
+        return None;
+    }
+    match fs::read(&path) {
+        Ok(mut material) => {
+            if trim_newline && material.last() == Some(&b'\n') {
+                material.pop();
+                if material.last() == Some(&b'\r') {
+                    material.pop();
+                }
+            }
+            Some(SecretValue::new(material, file_label(&path), None))
+        }
+        Err(error) => {
+            show_error(owner, "Could not read credential file", &error.to_string());
+            None
+        }
+    }
+}
+
+unsafe fn credential_changed(state: &mut AppState, status: &str) {
+    update_credential_button(state);
+    set_status(state, status);
+}
+
+unsafe fn update_credential_button(state: &AppState) {
+    let labels = [
+        state
+            .key
+            .as_ref()
+            .map(|value| format!("ZFS: {}", value.label)),
+        state
+            .container_key
+            .as_ref()
+            .map(|value| format!("pool: {}", value.label)),
+        state
+            .agent_password
+            .as_ref()
+            .map(|value| format!("agent: {}", value.label)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let label = if labels.is_empty() {
+        "Credentials…".to_owned()
+    } else {
+        format!("Credentials ({} set)…", labels.len())
+    };
+    set_text(state.controls.choose_key, &label);
+}
+
+unsafe fn clear_credentials(state: &mut AppState) {
+    clear_credentials_silent(state);
+    set_status(state, "All in-memory credentials were cleared");
+}
+
+unsafe fn clear_credentials_silent(state: &mut AppState) {
+    state.key = None;
+    state.container_key = None;
+    state.agent_password = None;
+    update_credential_button(state);
+}
+
+unsafe fn clear_credentials_for_source(state: &mut AppState, source: &Path) {
+    if state
+        .key
+        .as_ref()
+        .is_some_and(|value| value.source.as_deref() != Some(source))
+    {
+        state.key = None;
+    }
+    if state
+        .container_key
+        .as_ref()
+        .is_some_and(|value| value.source.as_deref() != Some(source))
+    {
+        state.container_key = None;
+    }
+    if state
+        .agent_password
+        .as_ref()
+        .is_some_and(|value| value.source.as_deref() != Some(source))
+    {
+        state.agent_password = None;
+    }
+    update_credential_button(state);
+}
+
+unsafe fn credential_scope(state: &AppState) -> Option<PathBuf> {
+    let path = PathBuf::from(get_text(state.controls.source_path));
+    (!path.as_os_str().is_empty()).then_some(path)
+}
+
+unsafe fn ensure_selected_view_key(state: &mut AppState) {
+    let Some(catalog) = &state.catalog else {
+        return;
+    };
+    let Some(index) = selected_view(state) else {
+        return;
+    };
+    if catalog.views.get(index).is_some_and(|view| view.encrypted) && state.key.is_none() {
+        if let Some(material) = prompt_secret(
+            state.hwnd,
+            "ZFS dataset key",
+            "This view is encrypted. Enter its passphrase or hexadecimal key, or cancel and choose a binary key file from Credentials.",
+        ) {
+            state.key = Some(SecretValue::new(
+                material,
+                "entered in memory",
+                credential_scope(state),
+            ));
+            credential_changed(state, "ZFS key entered in protected memory");
+        }
+    }
+}
+
+fn source_is_changing(state: &AppState, path: &Path) -> bool {
+    state
+        .catalog
+        .as_ref()
+        .is_some_and(|catalog| catalog.path != path)
+        || state.inception.first().is_some_and(|frame| {
+            frame.parent_path.is_none() && frame.catalog.image_path != path.display().to_string()
+        })
+}
+
+unsafe fn leave_all_images(state: &mut AppState, clear_list: bool) {
+    state.inception.clear();
+    SendMessageW(state.controls.volume, CB_RESETCONTENT, 0, 0);
+    set_text(state.controls.image_offset, "");
+    set_text(state.controls.image_length, "");
+    if clear_list {
+        state.entries.clear();
+        populate_list(state);
+    }
+    update_breadcrumb(state);
+}
+
+unsafe fn close_source_ui(state: &mut AppState) {
+    state.entries.clear();
+    populate_list(state);
+    state.current_path = "/".to_owned();
+    set_text(state.controls.path, "/");
+    set_text(state.hwnd, APP_TITLE);
+    set_source_enabled(state, false);
+    set_status(
+        state,
+        "Ready — open a backup, choose a physical drive, or open a disk image",
+    );
+    update_breadcrumb(state);
+}
+
+fn first_supported_volume(catalog: &InceptionCatalog) -> Option<usize> {
+    catalog
+        .volumes
+        .iter()
+        .position(|volume| volume.filesystem.is_some())
+}
+
+unsafe fn populate_volumes(state: &AppState, catalog: &InceptionCatalog, preferred: Option<usize>) {
+    SendMessageW(state.controls.volume, CB_RESETCONTENT, 0, 0);
+    for volume in &catalog.volumes {
+        let label = wide(&volume.label());
+        SendMessageW(
+            state.controls.volume,
+            CB_ADDSTRING,
+            0,
+            label.as_ptr() as isize,
+        );
+    }
+    if let Some(selected) = preferred.or_else(|| first_supported_volume(catalog)) {
+        SendMessageW(state.controls.volume, CB_SETCURSEL, selected, 0);
+    }
+}
+
+unsafe fn update_breadcrumb(state: &AppState) {
+    let mut parts = Vec::new();
+    if let Some(catalog) = &state.catalog {
+        parts.push(catalog.title.clone());
+        if let Some(view) = selected_view(state).and_then(|index| catalog.views.get(index)) {
+            parts.push(view.selector.clone());
+        }
+    }
+    for frame in &state.inception {
+        parts.push(
+            Path::new(&frame.catalog.image_path)
+                .file_name()
+                .map_or_else(
+                    || frame.catalog.image_path.clone(),
+                    |name| name.to_string_lossy().into_owned(),
+                ),
+        );
+    }
+    if !state.current_path.is_empty() {
+        parts.push(state.current_path.clone());
+    }
+    set_text(
+        state.controls.agent_password,
+        &if parts.is_empty() {
+            "Source > choose a view > browse files".to_owned()
+        } else {
+            parts.join("  ›  ")
+        },
+    );
+}
+
+unsafe fn toggle_setting(state: &mut AppState, id: u16) {
+    match id {
+        ID_SETTING_AUTO_IMAGES => state.settings.auto_open_images ^= true,
+        ID_SETTING_CLEAR_CREDENTIALS => state.settings.clear_credentials_on_source_change ^= true,
+        ID_SETTING_CONFIRM_DRIVE => state.settings.confirm_physical_drive ^= true,
+        _ => return,
+    }
+    update_settings_menu(state);
+    if let Err(error) = save_settings(&state.settings) {
+        show_error(state.hwnd, "Could not save settings", &error.to_string());
+    } else {
+        set_status(state, "Settings saved");
+    }
+}
+
+unsafe fn update_settings_menu(state: &AppState) {
+    let menu = GetMenu(state.hwnd);
+    for (id, checked) in [
+        (ID_SETTING_AUTO_IMAGES, state.settings.auto_open_images),
+        (
+            ID_SETTING_CLEAR_CREDENTIALS,
+            state.settings.clear_credentials_on_source_change,
+        ),
+        (
+            ID_SETTING_CONFIRM_DRIVE,
+            state.settings.confirm_physical_drive,
+        ),
+    ] {
+        CheckMenuItem(
+            menu,
+            id as u32,
+            MF_BYCOMMAND | if checked { MF_CHECKED } else { MF_UNCHECKED },
+        );
+    }
+}
+
+fn settings_path() -> Option<PathBuf> {
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .map(|path| path.join("ZFS Send Explorer").join("settings.json"))
+}
+
+fn load_settings() -> UiSettings {
+    settings_path()
+        .and_then(|path| fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn save_settings(settings: &UiSettings) -> Result<()> {
+    let Some(path) = settings_path() else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_vec_pretty(settings)?)?;
+    Ok(())
+}
+
+unsafe fn create_accelerators() -> Result<HACCEL> {
+    let mut entries = [
+        ACCEL {
+            fVirt: FVIRTKEY | FCONTROL,
+            key: b'O' as u16,
+            cmd: ID_OPEN_AUTO,
+        },
+        ACCEL {
+            fVirt: FVIRTKEY | FCONTROL | FSHIFT,
+            key: b'O' as u16,
+            cmd: ID_OPEN_IMAGE,
+        },
+        ACCEL {
+            fVirt: FVIRTKEY | FCONTROL,
+            key: b'D' as u16,
+            cmd: ID_OPEN_POOL,
+        },
+        ACCEL {
+            fVirt: FVIRTKEY | FCONTROL,
+            key: b'K' as u16,
+            cmd: ID_ENTER_KEY,
+        },
+        ACCEL {
+            fVirt: FVIRTKEY | FCONTROL,
+            key: b'E' as u16,
+            cmd: ID_EXTRACT,
+        },
+        ACCEL {
+            fVirt: FVIRTKEY | FCONTROL,
+            key: b'I' as u16,
+            cmd: ID_INCEPTION,
+        },
+        ACCEL {
+            fVirt: FVIRTKEY | FCONTROL,
+            key: b'U' as u16,
+            cmd: ID_UPDATE,
+        },
+        ACCEL {
+            fVirt: FVIRTKEY | FCONTROL,
+            key: b'L' as u16,
+            cmd: ID_FOCUS_PATH,
+        },
+        ACCEL {
+            fVirt: FVIRTKEY | FALT,
+            key: 0x26,
+            cmd: ID_UP,
+        },
+        ACCEL {
+            fVirt: FVIRTKEY,
+            key: 0x74,
+            cmd: ID_REFRESH,
+        },
+        ACCEL {
+            fVirt: FVIRTKEY,
+            key: 0x1b,
+            cmd: ID_LEAVE_IMAGE,
+        },
+    ];
+    let table = CreateAcceleratorTableW(entries.as_mut_ptr(), entries.len() as i32);
+    if table.is_null() {
+        Err(std::io::Error::last_os_error()).context("creating keyboard accelerators")
+    } else {
+        Ok(table)
+    }
 }
 
 unsafe fn layout(state: &AppState) {
@@ -1299,12 +2371,8 @@ unsafe fn layout(state: &AppState) {
     let status_height = scale(24);
 
     let browse_width = scale(84);
-    let send_width = scale(118);
-    let pool_width = scale(136);
-    let container_key_width = scale(124);
-    let source_edit_width =
-        (width - pad * 2 - gap * 4 - browse_width - send_width - pool_width - container_key_width)
-            .max(scale(180));
+    let send_width = scale(82);
+    let source_edit_width = (width - pad * 2 - gap * 2 - browse_width - send_width).max(scale(280));
     let mut x = pad;
     MoveWindow(
         state.controls.source_path,
@@ -1318,37 +2386,46 @@ unsafe fn layout(state: &AppState) {
     MoveWindow(state.controls.browse_source, x, pad, browse_width, row, 1);
     x += browse_width + gap;
     MoveWindow(state.controls.open_send, x, pad, send_width, row, 1);
-    x += send_width + gap;
-    MoveWindow(state.controls.open_pool, x, pad, pool_width, row, 1);
-    x += pool_width + gap;
+    let second_y = pad + row + gap;
+    let drive_width = (width * 55 / 100).max(scale(360));
     MoveWindow(
         state.controls.container_key,
-        x,
         pad,
-        container_key_width,
-        row,
+        second_y,
+        drive_width,
+        scale(260),
+        1,
+    );
+    x = pad + drive_width + gap;
+    MoveWindow(state.controls.open_pool, x, second_y, scale(104), row, 1);
+    x += scale(104) + gap;
+    MoveWindow(state.controls.choose_key, x, second_y, scale(132), row, 1);
+
+    let third_y = second_y + row + gap;
+    let view_width = (width * 44 / 100).max(scale(300));
+    let up_width = scale(54);
+    let go_width = scale(54);
+    let path_width = (width - pad * 2 - gap * 3 - view_width - up_width - go_width).max(scale(160));
+    x = pad;
+    MoveWindow(state.controls.view, x, third_y, view_width, scale(240), 1);
+    x += view_width + gap;
+    MoveWindow(state.controls.up, x, third_y, up_width, row, 1);
+    x += up_width + gap;
+    MoveWindow(state.controls.path, x, third_y, path_width, row, 1);
+    x += path_width + gap;
+    MoveWindow(state.controls.go, x, third_y, go_width, row, 1);
+
+    let breadcrumb_y = third_y + row + scale(4);
+    MoveWindow(
+        state.controls.agent_password,
+        pad,
+        breadcrumb_y,
+        width - pad * 2,
+        scale(22),
         1,
     );
 
-    let second_y = pad + row + gap;
-    let view_width = (width * 42 / 100).max(scale(260));
-    let up_width = scale(54);
-    let go_width = scale(54);
-    let key_width = scale(126);
-    let path_width =
-        (width - pad * 2 - gap * 4 - view_width - up_width - go_width - key_width).max(scale(120));
-    x = pad;
-    MoveWindow(state.controls.view, x, second_y, view_width, scale(240), 1);
-    x += view_width + gap;
-    MoveWindow(state.controls.up, x, second_y, up_width, row, 1);
-    x += up_width + gap;
-    MoveWindow(state.controls.path, x, second_y, path_width, row, 1);
-    x += path_width + gap;
-    MoveWindow(state.controls.go, x, second_y, go_width, row, 1);
-    x += go_width + gap;
-    MoveWindow(state.controls.choose_key, x, second_y, key_width, row, 1);
-
-    let third_y = second_y + row + gap;
+    let image_y = breadcrumb_y + scale(22) + scale(4);
     let volume_width = (width * 36 / 100).max(scale(260));
     let offset_width = scale(116);
     let length_width = scale(154);
@@ -1358,7 +2435,7 @@ unsafe fn layout(state: &AppState) {
     MoveWindow(
         state.controls.volume,
         x,
-        third_y,
+        image_y,
         volume_width,
         scale(240),
         1,
@@ -1367,7 +2444,7 @@ unsafe fn layout(state: &AppState) {
     MoveWindow(
         state.controls.image_offset,
         x,
-        third_y,
+        image_y,
         offset_width,
         row,
         1,
@@ -1376,7 +2453,7 @@ unsafe fn layout(state: &AppState) {
     MoveWindow(
         state.controls.image_length,
         x,
-        third_y,
+        image_y,
         length_width,
         row,
         1,
@@ -1385,26 +2462,16 @@ unsafe fn layout(state: &AppState) {
     MoveWindow(
         state.controls.inception,
         x,
-        third_y,
+        image_y,
         inception_width,
         row,
         1,
     );
     x += inception_width + gap;
-    MoveWindow(state.controls.leave_image, x, third_y, leave_width, row, 1);
-
-    let fourth_y = third_y + row + gap;
-    MoveWindow(
-        state.controls.agent_password,
-        pad,
-        fourth_y,
-        scale(172),
-        row,
-        1,
-    );
+    MoveWindow(state.controls.leave_image, x, image_y, leave_width, row, 1);
 
     let actions_y = height - status_height - pad - row;
-    let list_y = fourth_y + row + gap;
+    let list_y = image_y + row + gap;
     let list_height = (actions_y - gap - list_y).max(scale(80));
     MoveWindow(
         state.controls.list,
@@ -1577,6 +2644,7 @@ fn parse_byte_value(value: &str, empty_is_none: bool) -> std::result::Result<Opt
 #[derive(Clone, Copy)]
 enum SourceFilter {
     Send,
+    Image,
     All,
 }
 
@@ -1609,6 +2677,12 @@ unsafe fn file_dialog(
         SourceFilter::Send => wide_nul_groups(&[
             "ZFS send streams",
             "*.zfs;*.zstream;*.send",
+            "All files",
+            "*.*",
+        ]),
+        SourceFilter::Image => wide_nul_groups(&[
+            "Disk images",
+            "*.raw;*.img;*.dd;*.qcow;*.qcow2;*.vmdk;*.datto;*.detto",
             "All files",
             "*.*",
         ]),
@@ -1662,11 +2736,30 @@ unsafe fn show_information(owner: HWND, title: &str, message: &str) {
     show_message(owner, title, message, MB_OK | MB_ICONINFORMATION);
 }
 
+unsafe fn show_confirmation(owner: HWND, title: &str, message: &str) -> bool {
+    let title = wide(title);
+    let message = wide(message);
+    MessageBoxW(
+        owner,
+        message.as_ptr(),
+        title.as_ptr(),
+        MB_OKCANCEL | MB_ICONWARNING,
+    ) == 1
+}
+
+unsafe fn show_shortcuts(owner: HWND) {
+    show_information(
+        owner,
+        "Keyboard shortcuts",
+        "Ctrl+O  Open a backup or disk image\nCtrl+Shift+O  Open a standalone disk image\nCtrl+D  Open the selected physical drive\nCtrl+K  Enter a ZFS key or passphrase\nCtrl+L  Focus the path box\nAlt+Up  Go to the parent folder\nEnter  Open a folder or recognized disk image\nBackspace  Go to the parent folder\nCtrl+I  Explore the selected file as a disk image\nEsc  Go back one image layer\nCtrl+E  Extract the selected file or folder\nCtrl+U  Update a previously extracted file\nF5  Refresh the directory and physical-drive list",
+    );
+}
+
 unsafe fn show_about(owner: HWND) {
     show_information(
         owner,
         "About ZFS Send Explorer",
-        "Browse snapshots in ZFS send files, Slide Boxes, Datto Reverse RoundTrip drives, and exported pool members without importing or mounting them. Inception mode opens raw, .datto, authenticated .detto, QCOW2, and self-contained sparse VMDK files to explore NTFS, FAT, exFAT, and ext filesystems one layer deeper.\n\nSources are always opened read-only. File and staged folder extraction plus validated incremental updates preserve sparse file ranges when the destination filesystem supports them.",
+        "Browse snapshots in ZFS send files, Slide Boxes, Datto Reverse RoundTrip drives, exported pool members, and standalone disk images without importing or mounting them. Recursive inception mode follows raw, .datto, authenticated .detto, QCOW2, and self-contained sparse VMDK images through NTFS, FAT, exFAT, and ext filesystems.\n\nSources are always opened read-only. Entered credentials remain in zeroizing process memory and are never saved by the app. File and staged folder extraction plus validated incremental updates preserve sparse ranges when the destination filesystem supports them.",
     );
 }
 
