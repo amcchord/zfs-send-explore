@@ -1,0 +1,26 @@
+name: Windows UI screenshots
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the native client
+        run: cargo build --release --locked --bin zfs-send-explore-windows
+      - name: Install fixture decoder
+        run: python -m pip install --disable-pip-version-check zstandard
+      - name: Capture real Windows controls
+        shell: pwsh
+        run: .\scripts\capture-windows-ui.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-ui-screenshots
+          path: artifacts/windows-ui
+          if-no-files-found: error

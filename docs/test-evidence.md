@@ -2,6 +2,22 @@
 
 The committed send-stream fixtures and the larger lab scenarios below were produced with OpenZFS 2.3.2 on Debian 13 x86-64. The native-encrypted pool fixture is a separately licensed OpenZFS 2.2.2 image with provenance recorded below. Fixture tests run without ZFS; the lab runs independently compare extracted files with mounted source snapshots and record exact sizes and SHA-256 hashes.
 
+## Windows usability and recursive inception in v0.5.0
+
+The v0.5.0 pass adds a native physical-drive inventory, automatic source-format
+detection, in-memory credential entry, persisted UI settings, keyboard
+accelerators, standalone image opening, and recursive inception navigation.
+The new service test constructs a real FAT12 image containing another complete
+FAT12 image, opens the child through positioned filesystem reads, and lists the
+child's `HELLO.TXT` without exporting either image.
+
+The verification run passed 60 native tests, native clippy with warnings
+denied, Windows x86-64 GNU target clippy with warnings denied, and formatting.
+Native Windows CI builds and packages both executables. Its screenshot harness
+opens the committed multi-snapshot send fixture, captures the optimized app and
+the real non-persisting Windows credential prompt, then opens the committed
+ext4 fixture as a standalone disk image.
+
 ## Slide and Datto recovery paths
 
 The v0.4.0 automated coverage exercises the vendor-specific adapters without

@@ -48,6 +48,7 @@ pub struct SourceCatalog {
     pub summary: String,
     pub views: Vec<SourceView>,
     container_key_file: Option<PathBuf>,
+    container_key_material: Option<Arc<Zeroizing<Vec<u8>>>>,
 }
 
 /// Result of extracting one selected file.
@@ -71,6 +72,45 @@ pub struct InceptionCatalog {
 }
 
 impl InceptionCatalog {
+    /// Inspect a standalone raw, QCOW2, or VMDK image without attaching or
+    /// mounting it in Windows.
+    pub fn open_file(path: &Path, image_offset: u64, image_length: Option<u64>) -> Result<Self> {
+        Self::from_session(InceptionSession::from_file_at(
+            path,
+            image_offset,
+            image_length,
+        )?)
+    }
+
+    /// Descend into another disk-image file in the active inner filesystem.
+    pub fn inspect_child(
+        &self,
+        volume: Option<&str>,
+        image_path: &str,
+        image_offset: u64,
+        image_length: Option<u64>,
+    ) -> Result<Self> {
+        Self::from_session(self.session.inspect_child_image_at(
+            volume,
+            image_path,
+            image_offset,
+            image_length,
+        )?)
+    }
+
+    fn from_session(session: InceptionSession) -> Result<Self> {
+        let session = Arc::new(session);
+        Ok(Self {
+            image_path: session.image_path().to_owned(),
+            image_offset: session.image_offset(),
+            stored_size: session.stored_size(),
+            disk_size: session.image_size(),
+            container: session.container(),
+            volumes: session.volumes().to_vec(),
+            session,
+        })
+    }
+
     /// List a directory through the already-inspected virtual disk. Retaining
     /// the session avoids rescanning a large ZFS send stream on every click.
     pub fn list_directory(&self, volume: Option<&str>, path: &str) -> Result<Vec<DirectoryEntry>> {
@@ -149,6 +189,7 @@ impl SourceCatalog {
             ),
             views,
             container_key_file: None,
+            container_key_material: None,
         })
     }
 
@@ -163,11 +204,31 @@ impl SourceCatalog {
         path: impl AsRef<Path>,
         container_key_file: Option<&Path>,
     ) -> Result<Self> {
-        let path = path.as_ref();
         let container_key =
             read_secret_file(container_key_file, "LUKS container passphrase", 4096)?;
-        let pool =
-            PoolMember::open_with_container_key(path, container_key.as_deref().map(Vec::as_slice))?;
+        Self::open_pool_with_container_key(
+            path,
+            container_key.as_deref().map(Vec::as_slice),
+            container_key_file.map(Path::to_owned),
+        )
+    }
+
+    /// Open a pool using passphrase bytes supplied directly by an interactive
+    /// client. They remain in zeroizing memory for later positioned reads.
+    pub fn open_pool_with_container_key_material(
+        path: impl AsRef<Path>,
+        container_key: Option<&[u8]>,
+    ) -> Result<Self> {
+        Self::open_pool_with_container_key(path, container_key, None)
+    }
+
+    fn open_pool_with_container_key(
+        path: impl AsRef<Path>,
+        container_key: Option<&[u8]>,
+        container_key_file: Option<PathBuf>,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        let pool = PoolMember::open_with_container_key(path, container_key)?;
         let inspection = pool.inspect()?;
         let datasets = pool.datasets()?;
         let snapshots = pool.snapshots(None)?;
@@ -232,7 +293,9 @@ impl SourceCatalog {
                     .map_or_else(String::new, |value| format!(" · {value}")),
             ),
             views,
-            container_key_file: container_key_file.map(Path::to_owned),
+            container_key_file,
+            container_key_material: container_key
+                .map(|value| Arc::new(Zeroizing::new(value.to_vec()))),
         })
     }
 
@@ -264,6 +327,39 @@ impl SourceCatalog {
             SourceKind::PoolMember => {
                 let pool = self.open_pool_member()?;
                 let key = key_for_pool(&pool, &view.selector, key_file)?;
+                pool.list_directory_with_key(
+                    &view.selector,
+                    path,
+                    key.as_deref().map(Vec::as_slice),
+                )
+            }
+        }
+    }
+
+    /// List one directory using key/passphrase bytes entered directly in a UI.
+    pub fn list_directory_with_key_material(
+        &self,
+        view_index: usize,
+        path: &str,
+        key_material: Option<&[u8]>,
+    ) -> Result<Vec<DirectoryEntry>> {
+        let view = self.view(view_index)?;
+        match self.kind {
+            SourceKind::SendStream => {
+                let requirement =
+                    operations::encryption_requirement(&self.path, Some(&view.selector))?;
+                let key = key_material_for_requirement(requirement, key_material)?;
+                operations::list_directory_snapshot_with_key(
+                    &self.path,
+                    path,
+                    Some(&view.selector),
+                    key.as_deref().map(Vec::as_slice),
+                )
+            }
+            SourceKind::PoolMember => {
+                let pool = self.open_pool_member()?;
+                let requirement = pool.encryption_requirement(&view.selector)?;
+                let key = key_material_for_requirement(requirement, key_material)?;
                 pool.list_directory_with_key(
                     &view.selector,
                     path,
@@ -311,6 +407,46 @@ impl SourceCatalog {
         }
     }
 
+    pub fn extract_with_key_material(
+        &self,
+        view_index: usize,
+        source_path: &str,
+        destination: &Path,
+        force: bool,
+        key_material: Option<&[u8]>,
+    ) -> Result<ClientExtraction> {
+        let view = self.view(view_index)?;
+        match self.kind {
+            SourceKind::SendStream => {
+                let requirement =
+                    operations::encryption_requirement(&self.path, Some(&view.selector))?;
+                let key = key_material_for_requirement(requirement, key_material)?;
+                operations::extract_snapshot_with_key(
+                    &self.path,
+                    source_path,
+                    destination,
+                    force,
+                    Some(&view.selector),
+                    key.as_deref().map(Vec::as_slice),
+                )
+                .map(extraction_from_sidecar)
+            }
+            SourceKind::PoolMember => {
+                let pool = self.open_pool_member()?;
+                let requirement = pool.encryption_requirement(&view.selector)?;
+                let key = key_material_for_requirement(requirement, key_material)?;
+                pool.extract_with_key(
+                    &view.selector,
+                    source_path,
+                    destination,
+                    force,
+                    key.as_deref().map(Vec::as_slice),
+                )
+                .map(extraction_from_pool)
+            }
+        }
+    }
+
     /// Recursively extract one selected ZFS directory into a staged tree.
     pub fn extract_tree(
         &self,
@@ -336,6 +472,44 @@ impl SourceCatalog {
             SourceKind::PoolMember => {
                 let pool = self.open_pool_member()?;
                 let key = key_for_pool(&pool, &view.selector, key_file)?;
+                pool.extract_tree_with_key(
+                    &view.selector,
+                    source_path,
+                    destination,
+                    force,
+                    key.as_deref().map(Vec::as_slice),
+                )
+            }
+        }
+    }
+
+    pub fn extract_tree_with_key_material(
+        &self,
+        view_index: usize,
+        source_path: &str,
+        destination: &Path,
+        force: bool,
+        key_material: Option<&[u8]>,
+    ) -> Result<RecursiveExtraction> {
+        let view = self.view(view_index)?;
+        match self.kind {
+            SourceKind::SendStream => {
+                let requirement =
+                    operations::encryption_requirement(&self.path, Some(&view.selector))?;
+                let key = key_material_for_requirement(requirement, key_material)?;
+                operations::extract_tree_snapshot_with_key(
+                    &self.path,
+                    source_path,
+                    destination,
+                    force,
+                    Some(&view.selector),
+                    key.as_deref().map(Vec::as_slice),
+                )
+            }
+            SourceKind::PoolMember => {
+                let pool = self.open_pool_member()?;
+                let requirement = pool.encryption_requirement(&view.selector)?;
+                let key = key_material_for_requirement(requirement, key_material)?;
                 pool.extract_tree_with_key(
                     &view.selector,
                     source_path,
@@ -398,6 +572,55 @@ impl SourceCatalog {
         })
     }
 
+    /// Inspect a nested image with credentials entered directly by the UI.
+    #[allow(clippy::too_many_arguments)]
+    pub fn inspect_inception_with_key_material(
+        &self,
+        view_index: usize,
+        image_path: &str,
+        key_material: Option<&[u8]>,
+        agent_password: Option<&[u8]>,
+        key_stash_path: Option<&str>,
+        image_offset: u64,
+        image_length: Option<u64>,
+    ) -> Result<InceptionCatalog> {
+        let view = self.view(view_index)?;
+        let session = match self.kind {
+            SourceKind::SendStream => {
+                if agent_password.is_some() || key_stash_path.is_some() {
+                    bail!("Datto agent credentials are only valid for a pool member");
+                }
+                let requirement =
+                    operations::encryption_requirement(&self.path, Some(&view.selector))?;
+                let key = key_material_for_requirement(requirement, key_material)?;
+                InceptionSession::from_send_at(
+                    &self.path,
+                    Some(&view.selector),
+                    image_path,
+                    key.as_deref().map(Vec::as_slice),
+                    image_offset,
+                    image_length,
+                )?
+            }
+            SourceKind::PoolMember => {
+                let pool = self.open_pool_member()?;
+                let requirement = pool.encryption_requirement(&view.selector)?;
+                let key = key_material_for_requirement(requirement, key_material)?;
+                InceptionSession::from_pool_member_at_with_keys(
+                    pool,
+                    &view.selector,
+                    image_path,
+                    key.as_deref().map(Vec::as_slice),
+                    agent_password,
+                    key_stash_path,
+                    image_offset,
+                    image_length,
+                )?
+            }
+        };
+        InceptionCatalog::from_session(session)
+    }
+
     fn open_inception(
         &self,
         view_index: usize,
@@ -444,6 +667,9 @@ impl SourceCatalog {
     }
 
     fn open_pool_member(&self) -> Result<PoolMember> {
+        if let Some(key) = &self.container_key_material {
+            return PoolMember::open_with_container_key(&self.path, Some(key.as_slice()));
+        }
         let key = read_secret_file(
             self.container_key_file.as_deref(),
             "LUKS container passphrase",
@@ -458,6 +684,16 @@ impl SourceCatalog {
 pub fn apply_incremental(stream: &Path, target: &Path, key_file: Option<&Path>) -> Result<Sidecar> {
     let requirement = operations::apply_encryption_requirement(stream)?;
     let key = read_key_for_requirement(requirement, key_file)?;
+    operations::apply_incremental_with_key(stream, target, key.as_deref().map(Vec::as_slice))
+}
+
+pub fn apply_incremental_with_key_material(
+    stream: &Path,
+    target: &Path,
+    key_material: Option<&[u8]>,
+) -> Result<Sidecar> {
+    let requirement = operations::apply_encryption_requirement(stream)?;
+    let key = key_material_for_requirement(requirement, key_material)?;
     operations::apply_incremental_with_key(stream, target, key.as_deref().map(Vec::as_slice))
 }
 
@@ -534,6 +770,25 @@ fn read_key_for_requirement(
             path.display()
         );
     }
+    crate::encrypted::normalize_key_file_material(&requirement.key_format, &mut material)?;
+    Ok(Some(Zeroizing::new(material)))
+}
+
+fn key_material_for_requirement(
+    requirement: Option<EncryptionRequirement>,
+    key_material: Option<&[u8]>,
+) -> Result<Option<Zeroizing<Vec<u8>>>> {
+    let Some(requirement) = requirement else {
+        return Ok(None);
+    };
+    let material = key_material.ok_or_else(|| {
+        anyhow!(
+            "{} is encrypted; enter or choose its {} key first",
+            requirement.dataset_name,
+            requirement.key_format
+        )
+    })?;
+    let mut material = material.to_vec();
     crate::encrypted::normalize_key_file_material(&requirement.key_format, &mut material)?;
     Ok(Some(Zeroizing::new(material)))
 }
@@ -685,6 +940,33 @@ mod tests {
     }
 
     #[test]
+    fn windows_service_descends_into_a_second_disk_image_without_exporting_it() {
+        let inner = small_fat12_image();
+        let outer = fat12_image_with_file("INNER   IMG", &inner);
+        let session = Arc::new(
+            InceptionSession::inspect_source(Arc::new(Bytes(outer)), "/vms/outer.raw".to_owned())
+                .unwrap(),
+        );
+        let catalog = InceptionCatalog {
+            image_path: session.image_path().to_owned(),
+            image_offset: session.image_offset(),
+            stored_size: session.stored_size(),
+            disk_size: session.image_size(),
+            container: session.container(),
+            volumes: session.volumes().to_vec(),
+            session,
+        };
+        let child = catalog.inspect_child(None, "/INNER.IMG", 0, None).unwrap();
+        assert!(
+            child
+                .list_directory(None, "/")
+                .unwrap()
+                .iter()
+                .any(|entry| entry.name == "HELLO.TXT")
+        );
+    }
+
+    #[test]
     fn client_update_flow_advances_a_verified_extraction() {
         let catalog = SourceCatalog::open_send(Path::new("tests/fixtures/tiny-full.zfs")).unwrap();
         let temporary = tempfile::tempdir().unwrap();
@@ -752,5 +1034,61 @@ mod tests {
         entry[28..32].copy_from_slice(&5_u32.to_le_bytes());
         image[4 * SECTOR..4 * SECTOR + 5].copy_from_slice(b"hello");
         image
+    }
+
+    fn fat12_image_with_file(short_name: &str, contents: &[u8]) -> Vec<u8> {
+        const SECTOR: usize = 512;
+        let clusters = contents.len().div_ceil(SECTOR);
+        let sectors = 4 + clusters + 8;
+        let mut image = vec![0_u8; SECTOR * sectors];
+        let boot = &mut image[..SECTOR];
+        boot[0..3].copy_from_slice(&[0xeb, 0x3c, 0x90]);
+        boot[3..11].copy_from_slice(b"ZFSETEST");
+        boot[11..13].copy_from_slice(&512_u16.to_le_bytes());
+        boot[13] = 1;
+        boot[14..16].copy_from_slice(&1_u16.to_le_bytes());
+        boot[16] = 2;
+        boot[17..19].copy_from_slice(&16_u16.to_le_bytes());
+        boot[19..21].copy_from_slice(&(sectors as u16).to_le_bytes());
+        boot[21] = 0xf8;
+        boot[22..24].copy_from_slice(&1_u16.to_le_bytes());
+        boot[24..26].copy_from_slice(&1_u16.to_le_bytes());
+        boot[26..28].copy_from_slice(&1_u16.to_le_bytes());
+        boot[38] = 0x29;
+        boot[43..54].copy_from_slice(b"ZFSE NESTED");
+        boot[54..62].copy_from_slice(b"FAT12   ");
+        boot[510..512].copy_from_slice(&[0x55, 0xaa]);
+
+        for fat_sector in [1_usize, 2] {
+            let fat = &mut image[fat_sector * SECTOR..(fat_sector + 1) * SECTOR];
+            fat[..3].copy_from_slice(&[0xf8, 0xff, 0xff]);
+            for index in 0..clusters {
+                let cluster = 2 + index;
+                let next = if index + 1 == clusters {
+                    0x0fff
+                } else {
+                    cluster + 1
+                };
+                set_fat12_entry(fat, cluster, next);
+            }
+        }
+        let entry = &mut image[3 * SECTOR..3 * SECTOR + 32];
+        entry[..11].copy_from_slice(short_name.as_bytes());
+        entry[11] = 0x20;
+        entry[26..28].copy_from_slice(&2_u16.to_le_bytes());
+        entry[28..32].copy_from_slice(&(contents.len() as u32).to_le_bytes());
+        image[4 * SECTOR..4 * SECTOR + contents.len()].copy_from_slice(contents);
+        image
+    }
+
+    fn set_fat12_entry(fat: &mut [u8], cluster: usize, value: usize) {
+        let offset = cluster + cluster / 2;
+        if cluster.is_multiple_of(2) {
+            fat[offset] = value as u8;
+            fat[offset + 1] = (fat[offset + 1] & 0xf0) | ((value >> 8) as u8 & 0x0f);
+        } else {
+            fat[offset] = (fat[offset] & 0x0f) | ((value << 4) as u8 & 0xf0);
+            fat[offset + 1] = (value >> 4) as u8;
+        }
     }
 }
