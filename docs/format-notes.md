@@ -48,9 +48,36 @@ The starting snapshot named to `zfs send -I` is not itself present in the compou
 
 Path lookup starts at ZPL object 1 (the master node), reads its `ROOT` entry, then walks directory ZAP values. Directory values use the low 48 bits for the object number and the high nibble for the dirent type. Modern file sizes are decoded from the `DMU_OT_SA` bonus or spill using the dataset's `SA_ATTRS -> REGISTRY/LAYOUTS` objects. The exact byte offset and storage location of `ZPL_SIZE` are saved in the extraction sidecar so a later incremental OBJECT or SPILL record can update the output length without needing the full base stream again.
 
+## Backup-media containers
+
+Pool sources may be an exact ZFS member, a GPT/MBR whole disk with one supported
+member, or a ZFS member inside a LUKS partition. LUKS1/LUKS2 parsing, key-slot
+unlock, and sector decryption run in-process through the pure-Rust `luks-core`
+reader. The app exposes only positioned plaintext reads from the unlocked
+payload; it does not mount the volume, install a driver, invoke `cryptsetup`, or
+write to the container. A supplied container passphrase is rejected if the
+selected source is not LUKS, which catches accidental key/source mismatches.
+
+A pool named `slide` is reported as a Slide Box. Slide's downloaded raw dataset
+key may be represented as 64 hexadecimal characters even when OpenZFS metadata
+declares `keyformat=raw`; that representation is decoded in memory to the
+required 32 bytes before the existing wrapped-key authentication runs.
+
+A LUKS-backed pool whose name starts with `revRT-` is reported as Datto Reverse
+RoundTrip. Ordinary `.datto` images use the normal inception path. For a
+`.detto` image, the reader locates the sole `/config/*.encryptionKeyStash` file
+unless an explicit path is supplied, bounds its read, and authenticates the
+first compact `user_keys_jwe` entry. The agent password derives an AES-256-GCM
+key with PBKDF2-HMAC-SHA3-256 using the protected `p2s` and bounded `p2c`
+parameters; the compact protected header is authenticated as JWE additional
+data. The recovered 64-byte key supplies the two AES-256 keys for XTS
+decryption. Positioned reads expand to complete 512-byte sectors and use
+`plain64` sector numbers before returning only the requested plaintext range.
+Temporary key plaintext and application-owned key buffers are zeroized.
+
 ## Pool-member reads
 
-Before vdev parsing, a whole-disk source gets one conservative partition-discovery pass if it has no labels at disk-relative offsets. The reader recognizes primary GPT headers at LBA 1 for 512-byte and 4096-byte logical sectors, validates the header and complete partition-array CRC-32 values, caps the table at 64 MiB, bounds each LBA conversion against the source, and probes non-empty partitions as offset read-only views. It proceeds only when exactly one view has ZFS vdev labels.
+Before vdev parsing, a whole-disk source gets one conservative partition-discovery pass if it has no labels at disk-relative offsets. The reader recognizes primary GPT headers at LBA 1 for 512-byte and 4096-byte logical sectors, validates the header and complete partition-array CRC-32 values, caps the table at 64 MiB, bounds each LBA conversion against the source, and also bounds primary MBR partition entries. Each non-empty partition becomes an offset read-only view. Plain candidates are probed for ZFS labels; LUKS candidates are unlocked first when a container key is available. It proceeds only when exactly one view yields a supported ZFS member.
 
 The direct backend starts at each of the four 256 KiB vdev labels and uses the highest valid uberblock transaction group found there. A DVA is translated to a member-relative byte offset as `(offset << 9) + 4 MiB`; this release accepts only top-level vdev id 0 and rejects any pool whose label reports more than one top-level vdev. Mirror replication happens below that top-level address, so the same offset can be read from either healthy leaf of a one-mirror pool.
 
@@ -107,7 +134,7 @@ Partition discovery tries GPT before MBR. GPT candidates at primary and final LB
 
 Filesystem probes are signature-gated and then require the corresponding parser to open successfully. FAT BPB invariants are used instead of trusting the informational `FAT12`/`FAT16`/`FAT32` label. Directory resolution normalizes absolute paths and refuses `..` or NUL components. NTFS lookup uses the volume `$UpCase` table; extraction accepts the unnamed `$DATA` stream but refuses NTFS compression and EFS. FAT12/16/32 and exFAT use cluster-chain-bounded reads. ext4 and compatible ext2 lookup uses byte paths, exposes regular/directory/symlink types, refuses names the UTF-16 Windows UI cannot represent losslessly, and does not follow symlinks for extraction.
 
-The destination path is the only write target in this stack. File data passes through sparse extent writes and SHA-256 into a temporary file in the destination directory; length and byte count must match before synchronization and atomic persistence. No container, partition, filesystem, ZFS stream, or pool-member write API is exposed.
+The destination path is the only write target in this stack. File data passes through sparse extent writes and SHA-256 into a temporary file in the destination directory; length and byte count must match before synchronization and atomic persistence. Recursive extraction builds the entire requested tree in a sibling temporary directory, never follows symlinks or special entries, and publishes the directory only after every regular file succeeds. With forced replacement, the previous destination is staged for rollback until the new tree is renamed into place. No container, partition, filesystem, ZFS stream, or pool-member write API is exposed.
 
 Primary references:
 
@@ -122,3 +149,6 @@ Primary references:
 - [OpenZFS Zstandard block codec](https://github.com/openzfs/zfs/blob/master/module/zstd/zfs_zstd.c)
 - [OpenZFS Zstandard header](https://github.com/openzfs/zfs/blob/master/include/sys/zstd/zstd.h)
 - [zfs-forensic-core ZAP/SA/ZPL parser](https://github.com/SecurityRonin/zfs-forensic/tree/main/core/src)
+- [Slide Box manual-access guide](https://docs.slide.tech/guides/manually-accessing-slide-box-backups/)
+- [Datto Reverse RoundTrip manual-access guide](https://docs.slide.tech/guides/manually-accessing-datto-reverse-roundtrip-backups/)
+- [`luks-core` read-only LUKS library](https://docs.rs/luks-core/latest/luks/)

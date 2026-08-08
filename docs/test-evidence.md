@@ -2,6 +2,44 @@
 
 The committed send-stream fixtures and the larger lab scenarios below were produced with OpenZFS 2.3.2 on Debian 13 x86-64. The native-encrypted pool fixture is a separately licensed OpenZFS 2.2.2 image with provenance recorded below. Fixture tests run without ZFS; the lab runs independently compare extracted files with mounted source snapshots and record exact sizes and SHA-256 hashes.
 
+## Slide and Datto recovery paths
+
+The v0.4.0 automated coverage exercises the vendor-specific adapters without
+requiring ZFS, `cryptsetup`, or a host filesystem driver:
+
+- Slide's 64-character hexadecimal representation is normalized to the exact
+  32-byte raw ZFS key and passed through the existing authenticated native-pool
+  decryption path.
+- A synthetic MBR whole-disk image confirms that a LUKS partition is discovered
+  before ZFS probing. The production source uses `luks-core` for bounded,
+  positioned, read-only LUKS1/LUKS2 unlock and payload reads.
+- A generated Datto compact JWE is authenticated with AES-256-GCM after
+  PBKDF2-HMAC-SHA3-256 derivation. The test recovers the exact 64-byte agent key
+  and rejects the wrong agent password.
+- Generated AES-256-XTS ciphertext verifies byte-exact `.detto` reads across
+  unaligned 512-byte sector boundaries with `plain64` sector numbering.
+- Send-stream and subordinate-filesystem tests recursively recover real
+  directories into a sibling staging directory, publish the tree only after all
+  regular files succeed, skip rather than follow symlinks/special entries, and
+  do not create per-file incremental sidecars.
+
+These are deterministic format and cryptographic tests, not a substitute for a
+vendor-media acceptance run. No physical Slide Box or Datto Reverse RoundTrip
+drive was available for this repository run. Before shipping v0.4.0 broadly,
+validate one representative drive of each kind, including a `.datto` agent and
+an encrypted `.detto` agent, and compare recovered file hashes with a known-good
+restore.
+
+The pre-PR verification run passed 59 tests across all native targets, native
+clippy with warnings denied, Windows x86-64 GNU target clippy with warnings
+denied, formatting, and an optimized cross-build of both Windows binaries. The
+resulting local cross-build artifacts were:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `zfs-send-extract.exe` | `d3729efb2cca4d8fc7e4308f22cb83800317179606b0e818943a4fceda173c5f` |
+| `zfs-send-explore-windows.exe` | `a00d4f6311bfc3f4575c65270111e3255fdff792800ce02bd817f6705dbe88d0` |
+
 ## Native Windows client validation
 
 The x86-64 Windows GUI was exercised on Microsoft Windows 11 Pro build 26100 using the real native controls and file dialogs documented in [`windows-client.md`](windows-client.md). The final tested executable had SHA-256 `d5ced64ce03b607352309a1d6ca3443515dd2f7494ddc3de211451080fa21a9e`.

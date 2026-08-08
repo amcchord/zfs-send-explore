@@ -4,6 +4,7 @@
 mod compression;
 
 pub mod client;
+pub mod datto;
 pub mod encrypted;
 pub mod filesystem;
 pub mod inception;
@@ -11,3 +12,4 @@ pub mod operations;
 pub mod pool;
 pub mod sparse;
 pub mod stream;
+pub mod tree;

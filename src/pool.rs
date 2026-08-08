@@ -14,13 +14,16 @@ use crate::operations::{
     EncryptionRequirement, SIDECAR_VERSION, Sidecar, guid_string, save_sidecar, sidecar_path,
 };
 use crate::sparse;
+use crate::tree::{RecursiveExtraction, extract_directory_tree};
 use anyhow::{Context, Result, anyhow, bail};
+use luks::{DecryptedPayload, LuksVolume};
 use serde::Serialize;
 use sha2::{Digest, Sha256, Sha512};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
-use std::io::{Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use tempfile::NamedTempFile;
 use zfs_core::{
     BLKPTR_SIZE, Blkptr, ChecksumType, DMU_OST_META, DMU_OST_ZFS, DNODE_SIZE, Dnode, Endian,
@@ -44,6 +47,9 @@ const DMU_OT_OBJSET: u8 = 11;
 /// uberblock.
 #[derive(Debug, Clone, Serialize)]
 pub struct PoolInspection {
+    pub backup_format: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_encryption: Option<String>,
     pub pool_name: String,
     pub pool_guid: String,
     pub vdev_guid: String,
@@ -89,7 +95,7 @@ pub struct PoolExtraction {
     pub sidecar_written: bool,
 }
 
-trait ReadAt {
+trait ReadAt: Send + Sync {
     fn len(&self) -> u64;
     fn read_exact_at(&self, offset: u64, buffer: &mut [u8]) -> Result<()>;
 }
@@ -153,7 +159,7 @@ impl FileSource {
         Ok(Self {
             path: self.path.clone(),
             description: format!(
-                "{} (GPT partition {number}, bytes {offset}..{end})",
+                "{} (partition {number}, bytes {offset}..{end})",
                 self.path.display()
             ),
             file: self.file.try_clone()?,
@@ -220,7 +226,129 @@ impl ReadAt for FileSource {
     }
 }
 
-fn read_labels(source: &FileSource) -> (Vec<(u64, VdevLabel)>, Vec<String>) {
+struct FileSourceCursor {
+    source: FileSource,
+    position: u64,
+}
+
+impl FileSourceCursor {
+    fn new(source: FileSource) -> Self {
+        Self {
+            source,
+            position: 0,
+        }
+    }
+}
+
+impl Read for FileSourceCursor {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() || self.position >= self.source.len() {
+            return Ok(0);
+        }
+        let count = usize::try_from((self.source.len() - self.position).min(buffer.len() as u64))
+            .unwrap_or(buffer.len());
+        self.source
+            .read_exact_at(self.position, &mut buffer[..count])
+            .map_err(|error| std::io::Error::other(format!("{error:#}")))?;
+        self.position += count as u64;
+        Ok(count)
+    }
+}
+
+impl Seek for FileSourceCursor {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        let next = match position {
+            SeekFrom::Start(value) => i128::from(value),
+            SeekFrom::Current(value) => i128::from(self.position) + i128::from(value),
+            SeekFrom::End(value) => i128::from(self.source.len()) + i128::from(value),
+        };
+        if next < 0 || next > i128::from(self.source.len()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "seek is outside the bounded pool source",
+            ));
+        }
+        self.position = next as u64;
+        Ok(self.position)
+    }
+}
+
+struct LuksSource {
+    payload: Mutex<DecryptedPayload<FileSourceCursor>>,
+    len: u64,
+}
+
+impl ReadAt for LuksSource {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn read_exact_at(&self, offset: u64, buffer: &mut [u8]) -> Result<()> {
+        let end = offset
+            .checked_add(buffer.len() as u64)
+            .ok_or_else(|| anyhow!("LUKS payload read offset overflows"))?;
+        if end > self.len {
+            bail!(
+                "LUKS payload read [{offset}, {end}) exceeds {} bytes",
+                self.len
+            );
+        }
+        self.payload
+            .lock()
+            .map_err(|_| anyhow!("LUKS reader lock was poisoned"))?
+            .read_at(offset, buffer)
+            .map_err(|error| anyhow!("reading decrypted LUKS payload: {error}"))
+    }
+}
+
+enum PoolSource {
+    Plain(FileSource),
+    Luks(Box<LuksSource>),
+}
+
+impl ReadAt for PoolSource {
+    fn len(&self) -> u64 {
+        match self {
+            Self::Plain(source) => source.len(),
+            Self::Luks(source) => source.len(),
+        }
+    }
+
+    fn read_exact_at(&self, offset: u64, buffer: &mut [u8]) -> Result<()> {
+        match self {
+            Self::Plain(source) => source.read_exact_at(offset, buffer),
+            Self::Luks(source) => source.read_exact_at(offset, buffer),
+        }
+    }
+}
+
+fn is_luks(source: &FileSource) -> bool {
+    let mut magic = [0_u8; 6];
+    source.read_exact_at(0, &mut magic).is_ok() && magic == *b"LUKS\xba\xbe"
+}
+
+fn unlock_luks(source: FileSource, passphrase: &[u8]) -> Result<(PoolSource, String)> {
+    if passphrase.is_empty() {
+        bail!("the LUKS container passphrase is empty");
+    }
+    let payload = LuksVolume::unlock_with_passphrase(FileSourceCursor::new(source), passphrase)
+        .map_err(|error| anyhow!("unlocking LUKS container: {error}"))?;
+    let info = payload.info();
+    let description = format!(
+        "LUKS{} {}-{} ({}-byte key, {}-byte sectors)",
+        info.version, info.cipher_name, info.cipher_mode, info.key_bytes, info.sector_size
+    );
+    let len = payload.payload_size();
+    Ok((
+        PoolSource::Luks(Box::new(LuksSource {
+            payload: Mutex::new(payload),
+            len,
+        })),
+        description,
+    ))
+}
+
+fn read_labels(source: &dyn ReadAt) -> (Vec<(u64, VdevLabel)>, Vec<String>) {
     let (front, back) = label_offsets(source.len());
     let offsets = front.into_iter().chain(back.into_iter().flatten());
     let mut parsed = Vec::new();
@@ -244,6 +372,46 @@ struct GptPartition {
     number: usize,
     offset: u64,
     length: u64,
+}
+
+fn mbr_partitions(source: &FileSource) -> Result<Vec<GptPartition>> {
+    let mut sector = [0_u8; 512];
+    source
+        .read_exact_at(0, &mut sector)
+        .context("reading MBR sector")?;
+    if sector[510..512] != [0x55, 0xaa] {
+        bail!("MBR signature is absent");
+    }
+    let mut partitions = Vec::new();
+    for index in 0..4 {
+        let entry = &sector[446 + index * 16..446 + (index + 1) * 16];
+        let partition_type = entry[4];
+        if partition_type == 0 || partition_type == 0xee {
+            continue;
+        }
+        let first_lba = u32::from_le_bytes(entry[8..12].try_into().unwrap()) as u64;
+        let sectors = u32::from_le_bytes(entry[12..16].try_into().unwrap()) as u64;
+        if first_lba == 0 || sectors == 0 {
+            continue;
+        }
+        let offset = first_lba
+            .checked_mul(512)
+            .ok_or_else(|| anyhow!("MBR partition {} offset overflows", index + 1))?;
+        let length = sectors
+            .checked_mul(512)
+            .ok_or_else(|| anyhow!("MBR partition {} length overflows", index + 1))?;
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| anyhow!("MBR partition {} end overflows", index + 1))?;
+        if end <= source.len() {
+            partitions.push(GptPartition {
+                number: index + 1,
+                offset,
+                length,
+            });
+        }
+    }
+    Ok(partitions)
 }
 
 fn gpt_partitions(source: &FileSource) -> Result<Vec<GptPartition>> {
@@ -493,7 +661,9 @@ impl std::ops::Deref for PoolObjset {
 /// An opened offline vdev member. All methods are read-only with respect to the
 /// source; extraction writes only to the explicitly selected destination.
 pub struct PoolMember {
-    source: FileSource,
+    source: PoolSource,
+    backup_format: String,
+    container_encryption: Option<String>,
     pool_name: String,
     pool_guid: u64,
     vdev_guid: u64,
@@ -517,55 +687,135 @@ impl PoolMember {
     /// Open an exact ZFS vdev partition, a file-backed vdev, or an image of one.
     /// GPT whole disks are auto-sliced only when one partition has ZFS labels.
     pub fn open(path: &Path) -> Result<Self> {
-        let mut source = FileSource::open(path)?;
-        let (mut parsed, mut failures) = read_labels(&source);
+        Self::open_with_container_key(path, None)
+    }
 
-        if parsed.is_empty() {
-            match gpt_partitions(&source) {
-                Ok(partitions) if !partitions.is_empty() => {
-                    let mut candidates = Vec::new();
-                    for partition in partitions {
-                        let candidate = match source.slice(
-                            partition.number,
-                            partition.offset,
-                            partition.length,
-                        ) {
-                            Ok(candidate) => candidate,
-                            Err(error) => {
-                                failures.push(error.to_string());
-                                continue;
-                            }
-                        };
-                        let (candidate_labels, candidate_failures) = read_labels(&candidate);
-                        if candidate_labels.is_empty() {
-                            failures.extend(candidate_failures.into_iter().map(|failure| {
-                                format!("GPT partition {}: {failure}", partition.number)
-                            }));
-                        } else {
-                            candidates.push((candidate, candidate_labels));
+    /// Open a pool whose vdev may be inside a LUKS1/LUKS2 partition. The
+    /// passphrase is used only when a LUKS signature is actually present.
+    pub fn open_with_container_key(path: &Path, container_key: Option<&[u8]>) -> Result<Self> {
+        let file_source = FileSource::open(path)?;
+        let (mut parsed, mut failures) = read_labels(&file_source);
+        let mut container_encryption = None;
+        let source = if !parsed.is_empty() {
+            if container_key.is_some() {
+                bail!(
+                    "a container key was supplied, but {} is not LUKS-encrypted",
+                    path.display()
+                );
+            }
+            PoolSource::Plain(file_source)
+        } else if is_luks(&file_source) {
+            let key = container_key.ok_or_else(|| {
+                anyhow!(
+                    "{} is a LUKS-encrypted pool source; provide its container passphrase file",
+                    path.display()
+                )
+            })?;
+            let (source, description) = unlock_luks(file_source, key)?;
+            let labels = read_labels(&source);
+            parsed = labels.0;
+            failures.extend(labels.1);
+            container_encryption = Some(description);
+            source
+        } else {
+            let partitions = match gpt_partitions(&file_source) {
+                Ok(partitions) if !partitions.is_empty() => partitions,
+                Ok(_) => {
+                    failures.push("no non-empty GPT partitions were found".to_owned());
+                    mbr_partitions(&file_source).unwrap_or_default()
+                }
+                Err(error) => {
+                    failures.push(format!("GPT scan: {error}"));
+                    match mbr_partitions(&file_source) {
+                        Ok(partitions) => partitions,
+                        Err(error) => {
+                            failures.push(format!("MBR scan: {error}"));
+                            Vec::new()
                         }
-                    }
-                    match candidates.len() {
-                        0 => {}
-                        1 => {
-                            let (candidate, candidate_labels) = candidates.pop().unwrap();
-                            source = candidate;
-                            parsed = candidate_labels;
-                        }
-                        count => bail!(
-                            "{} contains {count} GPT partitions with ZFS vdev labels; open the intended partition device or image explicitly",
-                            path.display()
-                        ),
                     }
                 }
-                Ok(_) => failures.push("no non-empty GPT partitions were found".to_owned()),
-                Err(error) => failures.push(format!("GPT scan: {error}")),
+            };
+            let mut candidates = Vec::new();
+            let mut locked_luks = 0usize;
+            for partition in partitions {
+                let candidate =
+                    match file_source.slice(partition.number, partition.offset, partition.length) {
+                        Ok(candidate) => candidate,
+                        Err(error) => {
+                            failures.push(error.to_string());
+                            continue;
+                        }
+                    };
+                let (candidate_labels, candidate_failures) = read_labels(&candidate);
+                if !candidate_labels.is_empty() {
+                    candidates.push((PoolSource::Plain(candidate), candidate_labels, None));
+                    continue;
+                }
+                failures.extend(
+                    candidate_failures
+                        .into_iter()
+                        .map(|failure| format!("partition {}: {failure}", partition.number)),
+                );
+                if !is_luks(&candidate) {
+                    continue;
+                }
+                let Some(key) = container_key else {
+                    locked_luks += 1;
+                    continue;
+                };
+                match unlock_luks(candidate, key) {
+                    Ok((unlocked, description)) => {
+                        let (labels, label_failures) = read_labels(&unlocked);
+                        if labels.is_empty() {
+                            failures.extend(label_failures.into_iter().map(|failure| {
+                                format!("decrypted partition {}: {failure}", partition.number)
+                            }));
+                        } else {
+                            candidates.push((unlocked, labels, Some(description)));
+                        }
+                    }
+                    Err(error) => failures.push(format!(
+                        "unlocking LUKS partition {}: {error}",
+                        partition.number
+                    )),
+                }
             }
-        }
+            if candidates.is_empty() && locked_luks != 0 {
+                bail!(
+                    "{} contains {locked_luks} LUKS-encrypted partition{}; provide the Datto pool passphrase with --container-key-file",
+                    path.display(),
+                    if locked_luks == 1 { "" } else { "s" }
+                );
+            }
+            if candidates.len() != 1 {
+                if candidates.len() > 1 {
+                    bail!(
+                        "{} contains {} partitions with readable ZFS pools; open the intended partition explicitly",
+                        path.display(),
+                        candidates.len()
+                    );
+                }
+                bail!(
+                    "{} has no readable ZFS vdev label in the source or its partitions ({})",
+                    path.display(),
+                    failures.join("; ")
+                );
+            }
+            let (source, labels, encryption) = candidates.pop().unwrap();
+            if container_key.is_some() && encryption.is_none() {
+                bail!(
+                    "a container key was supplied, but the selected ZFS partition in {} is not LUKS-encrypted",
+                    path.display()
+                );
+            }
+            parsed = labels;
+            container_encryption = encryption;
+            source
+        };
 
         if parsed.is_empty() {
             bail!(
-                "{} has no readable ZFS vdev label in the source or its GPT partitions ({})",
+                "{} has no readable ZFS vdev label after opening its source ({})",
                 path.display(),
                 failures.join("; ")
             );
@@ -637,8 +887,21 @@ impl PoolMember {
             );
         }
 
+        let backup_format = if pool_name.eq_ignore_ascii_case("slide") {
+            "slide_box"
+        } else if container_encryption.is_some()
+            && pool_name.to_ascii_lowercase().starts_with("revrt-")
+        {
+            "datto_reverse_roundtrip"
+        } else {
+            "generic_zfs"
+        }
+        .to_owned();
+
         Ok(Self {
             source,
+            backup_format,
+            container_encryption,
             pool_name,
             pool_guid,
             vdev_guid,
@@ -657,6 +920,8 @@ impl PoolMember {
             snapshots = snapshots.saturating_add(self.snapshots_for(dataset)?.len());
         }
         Ok(PoolInspection {
+            backup_format: self.backup_format.clone(),
+            container_encryption: self.container_encryption.clone(),
             pool_name: self.pool_name.clone(),
             pool_guid: guid_string(self.pool_guid),
             vdev_guid: guid_string(self.vdev_guid),
@@ -806,6 +1071,52 @@ impl PoolMember {
         })
     }
 
+    /// Read a bounded regular ZFS file into memory. This is intended for small
+    /// metadata such as Datto's `.encryptionKeyStash`, never disk images.
+    pub(crate) fn read_small_file_with_key(
+        &self,
+        selector: &str,
+        path: &str,
+        key_material: Option<&[u8]>,
+        maximum_size: u64,
+    ) -> Result<Vec<u8>> {
+        let view = self.dataset_view(selector, key_material)?;
+        let resolved = self.resolve_path(&view, path)?;
+        if resolved.dirent_type != 8 {
+            bail!("{} is not a regular file", resolved.normalized_path);
+        }
+        if resolved.logical_size > maximum_size {
+            bail!(
+                "{} is {} bytes, exceeding the {maximum_size}-byte metadata limit",
+                resolved.normalized_path,
+                resolved.logical_size
+            );
+        }
+        let length = usize::try_from(resolved.logical_size)
+            .context("metadata file is too large for this platform")?;
+        let mut output = vec![0_u8; length];
+        if length == 0 {
+            return Ok(output);
+        }
+        let block_size = resolved.dnode.data_block_size();
+        if block_size == 0 {
+            bail!("metadata file has a zero ZFS record size");
+        }
+        let mut filled = 0usize;
+        while filled < length {
+            let block_id = filled as u64 / block_size as u64;
+            let block =
+                self.read_dnode_data_with_key(&resolved.dnode, block_id, view.key.as_ref())?;
+            let count = (length - filled).min(block_size).min(block.len());
+            if count == 0 {
+                bail!("metadata file block {block_id} is unexpectedly empty");
+            }
+            output[filled..filled + count].copy_from_slice(&block[..count]);
+            filled += count;
+        }
+        Ok(output)
+    }
+
     /// Extract a regular file. Named-snapshot extraction writes a sidecar that
     /// is compatible with `apply`; current-head extraction intentionally does
     /// not, because a head dataset is not a valid incremental-send base.
@@ -893,6 +1204,55 @@ impl PoolMember {
             sha256,
             sidecar_written,
         })
+    }
+
+    /// Recursively extract a ZFS directory without following symlinks. Tree
+    /// members intentionally omit incremental sidecars; each file is still
+    /// written through a synchronized same-directory temporary file.
+    pub fn extract_tree_with_key(
+        &self,
+        selector: &str,
+        path: &str,
+        output: &Path,
+        force: bool,
+        key_material: Option<&[u8]>,
+    ) -> Result<RecursiveExtraction> {
+        extract_directory_tree(
+            path,
+            output,
+            force,
+            |directory| self.list_directory_with_key(selector, directory, key_material),
+            |source, destination| {
+                self.extract_tree_file_with_key(selector, source, destination, key_material)
+            },
+        )
+    }
+
+    fn extract_tree_file_with_key(
+        &self,
+        selector: &str,
+        path: &str,
+        output: &Path,
+        key_material: Option<&[u8]>,
+    ) -> Result<u64> {
+        let view = self.dataset_view(selector, key_material)?;
+        let resolved = self.resolve_path(&view, path)?;
+        if resolved.dirent_type != 8 {
+            bail!("{} is not a regular file", resolved.normalized_path);
+        }
+        let mut temporary = temporary_for(output)?;
+        sparse::prepare(temporary.as_file())?;
+        let mut digest = Sha256::new();
+        self.write_file(
+            &resolved,
+            temporary.as_file_mut(),
+            &mut digest,
+            view.key.as_ref(),
+        )?;
+        temporary.as_file_mut().set_len(resolved.logical_size)?;
+        temporary.as_file_mut().sync_all()?;
+        persist_replace(temporary, output, false)?;
+        Ok(resolved.logical_size)
     }
 
     fn snapshots_for(&self, dataset: &DatasetInfo) -> Result<Vec<PoolSnapshot>> {
@@ -1805,8 +2165,8 @@ fn persist_replace(temporary: NamedTempFile, path: &Path, force: bool) -> Result
 #[cfg(test)]
 mod tests {
     use super::{
-        FileSource, ReadAt, blkptr_uses_crypt, gpt_partitions, normalize_path, parse_blkptr,
-        read_block_from, write_file_record,
+        FileSource, PoolMember, ReadAt, blkptr_uses_crypt, gpt_partitions, mbr_partitions,
+        normalize_path, parse_blkptr, read_block_from, write_file_record,
     };
     use sha2::{Digest, Sha256};
     use std::fs;
@@ -1890,6 +2250,31 @@ mod tests {
         assert_eq!(partitions[0].number, 1);
         assert_eq!(partitions[0].offset, 2048 * 512);
         assert_eq!(partitions[0].length, (8192 - 2048) * 512);
+    }
+
+    #[test]
+    fn mbr_luks_partition_is_detected_before_zfs_parsing() {
+        const SECTOR: usize = 512;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("roundtrip.img");
+        let mut image = vec![0_u8; 4 * 1024 * 1024];
+        image[510..512].copy_from_slice(&[0x55, 0xaa]);
+        let entry = &mut image[446..462];
+        entry[4] = 0x83;
+        entry[8..12].copy_from_slice(&2048_u32.to_le_bytes());
+        entry[12..16].copy_from_slice(&4096_u32.to_le_bytes());
+        image[2048 * SECTOR..2048 * SECTOR + 6].copy_from_slice(b"LUKS\xba\xbe");
+        fs::write(&path, image).unwrap();
+
+        let source = FileSource::open(&path).unwrap();
+        let partitions = mbr_partitions(&source).unwrap();
+        assert_eq!(partitions.len(), 1);
+        let error = match PoolMember::open(&path) {
+            Ok(_) => panic!("synthetic LUKS partition unexpectedly opened as ZFS"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("LUKS-encrypted partition"), "{error}");
+        assert!(error.contains("--container-key-file"), "{error}");
     }
 
     #[test]

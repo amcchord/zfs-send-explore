@@ -795,6 +795,37 @@ fn decode_hex_key(material: &[u8], output: &mut [u8; 32]) -> Result<()> {
     Ok(())
 }
 
+/// Normalize key-file bytes before the dataset-specific unlock. OpenZFS raw
+/// keys are binary, but Slide Support distributes the same 32 bytes as 64
+/// hexadecimal characters. Accepting that unambiguous representation avoids a
+/// separate conversion utility while preserving exact 32-byte binary keys.
+#[doc(hidden)]
+pub fn normalize_key_file_material(key_format: &str, material: &mut Vec<u8>) -> Result<()> {
+    if key_format != "raw" {
+        if material.last() == Some(&b'\n') {
+            material.pop();
+            if material.last() == Some(&b'\r') {
+                material.pop();
+            }
+        }
+        return Ok(());
+    }
+    if matches!(material.len(), 65 | 66) && material.last() == Some(&b'\n') {
+        material.pop();
+        if material.last() == Some(&b'\r') {
+            material.pop();
+        }
+    }
+    if material.len() == 64 {
+        let mut decoded = [0_u8; 32];
+        decode_hex_key(material, &mut decoded)?;
+        material.clear();
+        material.extend_from_slice(&decoded);
+        decoded.zeroize();
+    }
+    Ok(())
+}
+
 fn uint64(values: &BTreeMap<String, NvValue>, name: &str) -> Result<u64> {
     match values.get(name) {
         Some(NvValue::Uint64(value)) => Ok(*value),
@@ -1061,7 +1092,9 @@ fn align_8(value: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{EncryptionParams, decode_hex_key, pool_block_pointer_auth};
+    use super::{
+        EncryptionParams, decode_hex_key, normalize_key_file_material, pool_block_pointer_auth,
+    };
     use std::collections::BTreeMap;
 
     #[test]
@@ -1074,6 +1107,23 @@ mod tests {
         .unwrap();
         assert_eq!(output[0], 0);
         assert_eq!(output[31], 31);
+    }
+
+    #[test]
+    fn slide_hex_representation_normalizes_for_a_raw_dataset() {
+        let mut material =
+            b"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\n".to_vec();
+        normalize_key_file_material("raw", &mut material).unwrap();
+        assert_eq!(material, (0_u8..32).collect::<Vec<_>>());
+
+        let mut windows_material =
+            b"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\r\n".to_vec();
+        normalize_key_file_material("raw", &mut windows_material).unwrap();
+        assert_eq!(windows_material, (0_u8..32).collect::<Vec<_>>());
+
+        let mut binary = vec![0x41; 32];
+        normalize_key_file_material("raw", &mut binary).unwrap();
+        assert_eq!(binary, vec![0x41; 32]);
     }
 
     #[test]

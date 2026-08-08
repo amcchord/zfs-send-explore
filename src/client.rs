@@ -9,6 +9,7 @@ use crate::inception::{DiskContainerKind, InceptionSession, VolumeInfo};
 use crate::operations::{self, EncryptionRequirement, Sidecar};
 use crate::pool::{PoolExtraction, PoolMember};
 use crate::stream::FEATURE_RAW;
+use crate::tree::RecursiveExtraction;
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -46,6 +47,7 @@ pub struct SourceCatalog {
     pub title: String,
     pub summary: String,
     pub views: Vec<SourceView>,
+    container_key_file: Option<PathBuf>,
 }
 
 /// Result of extracting one selected file.
@@ -90,6 +92,16 @@ impl InceptionCatalog {
             sha256: extraction.sha256,
             update_eligible: false,
         })
+    }
+
+    pub fn extract_tree(
+        &self,
+        volume: Option<&str>,
+        path: &str,
+        destination: &Path,
+        force: bool,
+    ) -> Result<RecursiveExtraction> {
+        self.session.extract_tree(volume, path, destination, force)
     }
 }
 
@@ -136,13 +148,26 @@ impl SourceCatalog {
                 inspection.stream_bytes
             ),
             views,
+            container_key_file: None,
         })
     }
 
     /// Open an exported vdev member, vdev image, or supported whole-disk image.
     pub fn open_pool(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_pool_with_container_key_file(path, None)
+    }
+
+    /// Open a pool that may be wrapped by a LUKS container. Only the key-file
+    /// path is retained; secret bytes are reread and zeroized per operation.
+    pub fn open_pool_with_container_key_file(
+        path: impl AsRef<Path>,
+        container_key_file: Option<&Path>,
+    ) -> Result<Self> {
         let path = path.as_ref();
-        let pool = PoolMember::open(path)?;
+        let container_key =
+            read_secret_file(container_key_file, "LUKS container passphrase", 4096)?;
+        let pool =
+            PoolMember::open_with_container_key(path, container_key.as_deref().map(Vec::as_slice))?;
         let inspection = pool.inspect()?;
         let datasets = pool.datasets()?;
         let snapshots = pool.snapshots(None)?;
@@ -184,20 +209,30 @@ impl SourceCatalog {
                 inspection.pool_name
             );
         }
+        let vendor = match inspection.backup_format.as_str() {
+            "slide_box" => "Slide Box",
+            "datto_reverse_roundtrip" => "Datto Reverse RoundTrip",
+            _ => "ZFS pool",
+        };
         Ok(Self {
             kind: SourceKind::PoolMember,
             path: path.to_owned(),
-            title: inspection.pool_name.clone(),
+            title: format!("{vendor} — {}", inspection.pool_name),
             summary: format!(
-                "{} · txg {} · {} dataset{} · {} snapshot{}",
+                "{vendor} · {} · txg {} · {} dataset{} · {} snapshot{}{}",
                 inspection.vdev_type,
                 inspection.txg,
                 inspection.datasets,
                 if inspection.datasets == 1 { "" } else { "s" },
                 inspection.snapshots,
                 if inspection.snapshots == 1 { "" } else { "s" },
+                inspection
+                    .container_encryption
+                    .as_deref()
+                    .map_or_else(String::new, |value| format!(" · {value}")),
             ),
             views,
+            container_key_file: container_key_file.map(Path::to_owned),
         })
     }
 
@@ -227,7 +262,7 @@ impl SourceCatalog {
                 )
             }
             SourceKind::PoolMember => {
-                let pool = PoolMember::open(&self.path)?;
+                let pool = self.open_pool_member()?;
                 let key = key_for_pool(&pool, &view.selector, key_file)?;
                 pool.list_directory_with_key(
                     &view.selector,
@@ -262,7 +297,7 @@ impl SourceCatalog {
                 Ok(extraction_from_sidecar(sidecar))
             }
             SourceKind::PoolMember => {
-                let pool = PoolMember::open(&self.path)?;
+                let pool = self.open_pool_member()?;
                 let key = key_for_pool(&pool, &view.selector, key_file)?;
                 let extraction = pool.extract_with_key(
                     &view.selector,
@@ -272,6 +307,42 @@ impl SourceCatalog {
                     key.as_deref().map(Vec::as_slice),
                 )?;
                 Ok(extraction_from_pool(extraction))
+            }
+        }
+    }
+
+    /// Recursively extract one selected ZFS directory into a staged tree.
+    pub fn extract_tree(
+        &self,
+        view_index: usize,
+        source_path: &str,
+        destination: &Path,
+        force: bool,
+        key_file: Option<&Path>,
+    ) -> Result<RecursiveExtraction> {
+        let view = self.view(view_index)?;
+        match self.kind {
+            SourceKind::SendStream => {
+                let key = key_for_snapshot(&self.path, &view.selector, key_file)?;
+                operations::extract_tree_snapshot_with_key(
+                    &self.path,
+                    source_path,
+                    destination,
+                    force,
+                    Some(&view.selector),
+                    key.as_deref().map(Vec::as_slice),
+                )
+            }
+            SourceKind::PoolMember => {
+                let pool = self.open_pool_member()?;
+                let key = key_for_pool(&pool, &view.selector, key_file)?;
+                pool.extract_tree_with_key(
+                    &view.selector,
+                    source_path,
+                    destination,
+                    force,
+                    key.as_deref().map(Vec::as_slice),
+                )
             }
         }
     }
@@ -286,12 +357,35 @@ impl SourceCatalog {
         image_offset: u64,
         image_length: Option<u64>,
     ) -> Result<InceptionCatalog> {
+        self.inspect_inception_with_datto(
+            view_index,
+            image_path,
+            key_file,
+            None,
+            None,
+            image_offset,
+            image_length,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn inspect_inception_with_datto(
+        &self,
+        view_index: usize,
+        image_path: &str,
+        key_file: Option<&Path>,
+        agent_password_file: Option<&Path>,
+        key_stash_path: Option<&str>,
+        image_offset: u64,
+        image_length: Option<u64>,
+    ) -> Result<InceptionCatalog> {
         let session = Arc::new(self.open_inception(
             view_index,
             image_path,
             key_file,
-            image_offset,
-            image_length,
+            agent_password_file,
+            key_stash_path,
+            (image_offset, image_length),
         )?);
         Ok(InceptionCatalog {
             image_path: session.image_path().to_owned(),
@@ -309,12 +403,17 @@ impl SourceCatalog {
         view_index: usize,
         image_path: &str,
         key_file: Option<&Path>,
-        image_offset: u64,
-        image_length: Option<u64>,
+        agent_password_file: Option<&Path>,
+        key_stash_path: Option<&str>,
+        image_window: (u64, Option<u64>),
     ) -> Result<InceptionSession> {
+        let (image_offset, image_length) = image_window;
         let view = self.view(view_index)?;
         match self.kind {
             SourceKind::SendStream => {
+                if agent_password_file.is_some() || key_stash_path.is_some() {
+                    bail!("Datto agent credentials are only valid for a pool member");
+                }
                 let key = key_for_snapshot(&self.path, &view.selector, key_file)?;
                 InceptionSession::from_send_at(
                     &self.path,
@@ -326,18 +425,31 @@ impl SourceCatalog {
                 )
             }
             SourceKind::PoolMember => {
-                let pool = PoolMember::open(&self.path)?;
+                let pool = self.open_pool_member()?;
                 let key = key_for_pool(&pool, &view.selector, key_file)?;
-                InceptionSession::from_pool_at_with_key(
-                    &self.path,
+                let agent_password =
+                    read_secret_file(agent_password_file, "Datto agent password", 4096)?;
+                InceptionSession::from_pool_member_at_with_keys(
+                    pool,
                     &view.selector,
                     image_path,
                     key.as_deref().map(Vec::as_slice),
+                    agent_password.as_deref().map(Vec::as_slice),
+                    key_stash_path,
                     image_offset,
                     image_length,
                 )
             }
         }
+    }
+
+    fn open_pool_member(&self) -> Result<PoolMember> {
+        let key = read_secret_file(
+            self.container_key_file.as_deref(),
+            "LUKS container passphrase",
+            4096,
+        )?;
+        PoolMember::open_with_container_key(&self.path, key.as_deref().map(Vec::as_slice))
     }
 }
 
@@ -403,9 +515,10 @@ fn read_key_for_requirement(
         )
     })?;
     let maximum_size = match requirement.key_format.as_str() {
-        "raw" => 32_u64,
-        "hex" => 65,
-        "passphrase" => 513,
+        // Raw ZFS keys may also be supplied in Slide's 64-character hex form.
+        "raw" => 66_u64,
+        "hex" => 66,
+        "passphrase" => 514,
         _ => unreachable!("encryption requirement validates the key format"),
     };
     let mut file = File::open(path)
@@ -421,8 +534,32 @@ fn read_key_for_requirement(
             path.display()
         );
     }
-    if requirement.key_format != "raw" && material.last() == Some(&b'\n') {
+    crate::encrypted::normalize_key_file_material(&requirement.key_format, &mut material)?;
+    Ok(Some(Zeroizing::new(material)))
+}
+
+fn read_secret_file(
+    path: Option<&Path>,
+    label: &str,
+    maximum_size: u64,
+) -> Result<Option<Zeroizing<Vec<u8>>>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let mut file = File::open(path)
+        .with_context(|| format!("opening {label} file {}", path.display()))?
+        .take(maximum_size + 1);
+    let mut material = Vec::new();
+    file.read_to_end(&mut material)
+        .with_context(|| format!("reading {label} file {}", path.display()))?;
+    if material.len() as u64 > maximum_size {
+        bail!("{label} file {} is too large", path.display());
+    }
+    if material.last() == Some(&b'\n') {
         material.pop();
+        if material.last() == Some(&b'\r') {
+            material.pop();
+        }
     }
     Ok(Some(Zeroizing::new(material)))
 }
@@ -539,6 +676,12 @@ mod tests {
         assert_eq!(extraction.logical_size, 5);
         assert!(!extraction.update_eligible);
         assert_eq!(std::fs::read(output).unwrap(), b"hello");
+
+        let tree = temporary.path().join("tree");
+        let recursive = catalog.extract_tree(None, "/", &tree, false).unwrap();
+        assert_eq!(recursive.files, 1);
+        assert_eq!(recursive.directories, 1);
+        assert_eq!(std::fs::read(tree.join("HELLO.TXT")).unwrap(), b"hello");
     }
 
     #[test]
@@ -560,6 +703,20 @@ mod tests {
             std::fs::read_to_string(target).unwrap(),
             "hello from the incremental snapshot\nwith an appended line\n"
         );
+    }
+
+    #[test]
+    fn send_catalog_recursively_extracts_a_directory_without_sidecars() {
+        let catalog = SourceCatalog::open_send(Path::new("tests/fixtures/tiny-full.zfs")).unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let target = temporary.path().join("tree");
+        let extraction = catalog.extract_tree(0, "/", &target, false, None).unwrap();
+        assert_eq!(extraction.files, 3);
+        assert_eq!(
+            std::fs::read(target.join("hello.txt")).unwrap(),
+            b"hello from the base snapshot\n"
+        );
+        assert!(!target.join("hello.txt.zfse.json").exists());
     }
 
     fn small_fat12_image() -> Vec<u8> {

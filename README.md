@@ -5,7 +5,7 @@
 The extraction machine does **not** need ZFS, `libzfs`, or a ZFS kernel module. The tool never invokes `zfs` or `zpool`, and pool members are opened read-only.
 
 > [!IMPORTANT]
-> This is an early `0.3.0` implementation. The CLI, Windows UI, sidecar format, and supported on-disk profile may change. Stream and native-encryption pool fixtures are produced on little-endian OpenZFS systems. Linux validates the core end to end, and CI runs the full test suite and release packaging on native Windows.
+> This is an early `0.4.0` implementation. The CLI, Windows UI, sidecar format, and supported on-disk profile may change. Stream and native-encryption pool fixtures are produced on little-endian OpenZFS systems. Linux validates the core end to end, and CI runs the full test suite and release packaging on native Windows.
 
 Detailed implementation and validation material lives in:
 
@@ -34,13 +34,17 @@ Detailed implementation and validation material lives in:
 | Explore self-contained QCOW2 and VMDK sparse containers stored on ZFS | QCOW2 v2/v3 and VMDK `monolithicSparse`; sparse QCOW2 v3 and VMDK are in the full matrix |
 | Browse and extract from a subordinate filesystem (“inception mode”) | NTFS, FAT12/16/32, exFAT, ext4, and compatible ext2; all seven are in the full matrix |
 | Native Windows snapshot browser and extractor | Supported as `zfs-send-explore-windows.exe` |
-| Open a GPT whole-disk image or `\\.\PhysicalDriveN` | Supported when exactly one partition has a supported ZFS vdev label |
+| Open a GPT/MBR whole-disk image or `\\.\PhysicalDriveN` | Supported when exactly one partition resolves to a supported plain or LUKS-wrapped ZFS member |
 | Preserve sparse holes during extraction and incremental updates | Supported; zero ranges are deallocated when the destination filesystem permits it |
 | Read compressed and embedded blocks from a pool member | LZJB, LZ4, gzip, ZLE, and Zstandard |
 | Extract from a native-encrypted pool dataset | AES-CCM/GCM at 128/192/256 bits with raw, hex, or passphrase keys on little-endian pools |
+| Open a Slide Box backup | Supported through the native-encrypted pool and nested raw-disk readers; Slide's 64-character raw-key representation is accepted directly |
+| Open a Datto Reverse RoundTrip drive | Built-in read-only LUKS1/LUKS2 AES-XTS source; no `cryptsetup`, driver, or host mount required |
+| Browse Datto `.datto` and encrypted `.detto` volumes | Supported; `.detto` keys are authenticated and derived from `.encryptionKeyStash` plus the agent password |
+| Recursively recover a folder | Supported for send snapshots, pool datasets/snapshots, and subordinate filesystems; symlinks and special entries are not followed |
 | Read RAIDZ/dRAID or pools with several top-level vdevs | Not yet supported |
 
-The tool extracts regular files only. It can list directories and report symlinks, but it does not recreate directory trees, symlinks, ownership, permissions, ACLs, or other filesystem metadata.
+The tool extracts individual regular files or recursively stages a selected directory tree. Recursive recovery never follows symlinks or special entries and does not recreate ownership, permissions, ACLs, alternate NTFS streams, or other filesystem metadata.
 
 ## Downloads
 
@@ -193,9 +197,84 @@ Selecting a raw incremental snapshot from a history file follows the same rule a
 
 A raw extraction sidecar additionally stores the portable dnode and block-MAC state for the target's range. This lets `apply` authenticate a standalone raw incremental without retaining the full base stream. The sidecar may be larger than a plaintext sidecar for files with many blocks, but it contains no encryption key. Raw `apply` validates the key identity, base snapshot GUID, file hash, individual target blocks, and the updated dnode-range authentication tag before replacing the target.
 
+## Recover Slide Box and Datto Reverse RoundTrip backups
+
+The vendor workflows use the same read-only pool and inception engines rather
+than shelling out to recovery utilities. All decryption and filesystem access is
+compiled into the CLI and Windows application.
+
+### Slide Box
+
+A Slide Box pool is recognized by its `slide` pool name. Agent datasets such as
+`slide/agents/a_abc123` appear as selectable pool views, and their `disk_*.raw`
+files can be explored directly as virtual disks:
+
+```powershell
+zfs-send-extract pool inspect '\\.\PhysicalDrive3'
+zfs-send-extract pool datasets '\\.\PhysicalDrive3'
+
+zfs-send-extract pool inception inspect '\\.\PhysicalDrive3' `
+  slide/agents/a_abc123 /disk_example.raw `
+  --key-file .\slide-agent-key.txt
+
+zfs-send-extract pool inception extract-tree '\\.\PhysicalDrive3' `
+  slide/agents/a_abc123 /disk_example.raw /Users `
+  --volume gpt3 --key-file .\slide-agent-key.txt `
+  --output .\Recovered-Users
+```
+
+For a dataset whose OpenZFS `keyformat` is `raw`, `--key-file` accepts either
+the exact 32 binary bytes or the 64 hexadecimal characters supplied by Slide
+Support, with an optional final newline. The app performs the conversion in
+memory; `xxd` is not required.
+
+### Datto Reverse RoundTrip
+
+A whole Reverse RoundTrip disk may use GPT or MBR and contains a LUKS-encrypted
+partition around its ZFS pool. Supply the pool passphrase in a text file. The
+LUKS1/LUKS2 reader derives and decrypts sectors on demand in userspace:
+
+```powershell
+zfs-send-extract pool inspect '\\.\PhysicalDrive4' `
+  --container-key-file .\datto-pool-passphrase.txt
+
+zfs-send-extract pool datasets '\\.\PhysicalDrive4' `
+  --container-key-file .\datto-pool-passphrase.txt
+```
+
+An unencrypted `.datto` volume then follows the ordinary inception workflow:
+
+```powershell
+zfs-send-extract pool inception inspect '\\.\PhysicalDrive4' `
+  revRT-123456/home/agents/AGENT_GUID /VOLUME_GUID.datto `
+  --container-key-file .\datto-pool-passphrase.txt
+```
+
+For `.detto`, additionally supply the protected system's agent password. The
+reader locates the single `config/*.encryptionKeyStash` file automatically,
+authenticates its compact JWE with PBKDF2-SHA3-256 and AES-256-GCM, and exposes
+the AES-256-XTS volume as another positioned virtual disk:
+
+```powershell
+zfs-send-extract pool inception extract-tree '\\.\PhysicalDrive4' `
+  revRT-123456/home/agents/AGENT_GUID /VOLUME_GUID.detto /Users `
+  --container-key-file .\datto-pool-passphrase.txt `
+  --agent-password-file .\datto-agent-password.txt `
+  --volume gpt1 --output .\Recovered-Users
+```
+
+Use `--key-stash /config/name.encryptionKeyStash` only when the agent has more
+than one matching stash. Passwords are read from bounded files with a final
+CR/LF removed; they are never accepted as command-line values or written to an
+extraction sidecar.
+
+Both vendor paths retain the direct-pool layout limits below. In particular, a
+Slide or Datto pool using RAIDZ, several top-level vdevs, or unsupported
+allocation classes still requires a future multi-member pool reader.
+
 ## Browse an offline pool member
 
-The `pool` command family reads an exported vdev using positioned I/O. Pass an exact ZFS partition, file vdev, or image. A GPT whole-disk image is also accepted when exactly one partition contains readable ZFS vdev labels; the Windows client uses the same discovery for `\\.\PhysicalDriveN`.
+The `pool` command family reads an exported vdev using positioned I/O. Pass an exact ZFS partition, file vdev, or image. A GPT/MBR whole-disk image is also accepted when exactly one partition resolves to a supported plain or LUKS-wrapped ZFS member; the Windows client uses the same discovery for `\\.\PhysicalDriveN`.
 
 Export a live pool first. This keeps the selected uberblock stable and prevents blocks from being freed and reused during traversal:
 
@@ -304,7 +383,7 @@ Focused tests additionally validate resident, non-resident, and sparse NTFS data
 
 QCOW2 v2, deflate-compressed QCOW2 clusters, and 4096-byte-sector GPT are implemented reader profiles but are not members of the 63-case cross-product. The Windows UI service layer has automated list/extract coverage and the complete suite runs on native Windows CI; this is distinct from a scripted interactive UI walkthrough for every matrix case. Fixture provenance and hashes are recorded in [`tests/fixtures/inception/README.md`](tests/fixtures/inception/README.md), with detailed results in [`docs/test-evidence.md`](docs/test-evidence.md).
 
-QCOW1, QCOW2 overlays that require a backing file, encrypted QCOW2, multi-file/split/flat/stream-optimized VMDK, NTFS-compressed or EFS-encrypted data, and non-UTF-8 ext names are reported rather than silently misread. ext symlinks are listed but never followed during extraction. Inception mode extracts one regular file and does not recreate inner ACLs, alternate NTFS streams, ownership, permissions, or directory trees.
+QCOW1, QCOW2 overlays that require a backing file, encrypted QCOW2, multi-file/split/flat/stream-optimized VMDK, NTFS-compressed or EFS-encrypted data, and non-UTF-8 ext names are reported rather than silently misread. ext symlinks are listed but never followed during extraction. Recursive inception extraction recreates directories and regular-file contents but skips symlinks and special entries and does not recreate inner ACLs, alternate NTFS streams, ownership, or permissions.
 
 For send streams, the selected snapshot chain is scanned once when the image is opened to build a compact map from virtual ZFS-file ranges to replay payloads. Reads then decode only the blocks requested by the partition and filesystem readers, with a one-block cache. Pool-member reads similarly fetch only the addressed ZFS blocks. Sparse virtual disk capacity therefore does not become an equivalent RAM or temporary-disk requirement.
 
@@ -349,16 +428,19 @@ This remains experimental software, not a replacement for maintaining independen
 | `snapshots <stream>` | List the full/incremental snapshots contained in a send file |
 | `list <stream> [path] [--snapshot ...] [--key-file ...]` | List one directory in a selected snapshot |
 | `extract <stream> <path> -o <file> [--snapshot ...] [--key-file ...] [--force]` | Extract one regular file and write its sidecar |
+| `extract-tree <stream> <path> -o <directory> [...]` | Recursively stage and publish one directory tree without per-file sidecars |
 | `apply <incremental-stream> <target> [--key-file ...]` | Atomically update a previously extracted file; the key is required for raw sends |
 | `inception inspect <stream> <image> [--snapshot ...] [--image-offset ...] [--image-length ...] [--json]` | Detect a nested container, partitions, and subordinate filesystems |
 | `inception list <stream> <image> [path] [--volume ...] [...]` | List a directory inside a selected subordinate filesystem |
 | `inception extract <stream> <image> <path> -o <file> [--volume ...] [...]` | Extract one regular file from a subordinate filesystem |
-| `pool inspect <member> [--json]` | Validate a vdev member and summarize its active pool state |
+| `inception extract-tree <stream> <image> <path> -o <directory> [...]` | Recursively recover a subordinate directory tree |
+| `pool inspect <member> [--json] [--container-key-file ...]` | Validate a vdev member, including a built-in LUKS source, and summarize its active pool state |
 | `pool datasets <member>` | List reachable filesystem datasets |
 | `pool snapshots <member> [dataset]` | List named snapshots, optionally for one dataset |
 | `pool list <member> <dataset[@snapshot]> [path] [--key-file ...]` | List one directory from a dataset head or snapshot |
 | `pool extract <member> <dataset[@snapshot]> <path> -o <file> [--key-file ...] [--force]` | Extract one regular file directly from the member |
-| `pool inception inspect/list/extract ... [--key-file ...]` | Perform the same nested-image operations directly against an offline pool dataset or snapshot |
+| `pool extract-tree <member> <dataset[@snapshot]> <path> -o <directory> [...]` | Recursively recover a ZFS directory tree |
+| `pool inception inspect/list/extract/extract-tree ...` | Explore `.raw`, `.datto`, `.detto`, QCOW2, or VMDK files; Datto adds `--container-key-file` and, for `.detto`, `--agent-password-file` |
 
 Run `zfs-send-extract <command> --help` for complete argument details.
 
