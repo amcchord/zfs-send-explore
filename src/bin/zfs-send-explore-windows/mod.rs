@@ -2137,7 +2137,7 @@ unsafe extern "system" fn action_dialog_proc(
     let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ActionDialogState;
     match message {
         WM_COMMAND if !state.is_null() => {
-            let command = (wparam & 0xffff) as usize;
+            let command = wparam & 0xffff;
             if command >= 1000 {
                 (*state).selected = (command - 1000) as i32;
                 DestroyWindow(hwnd);
@@ -2342,7 +2342,10 @@ unsafe fn show_fallback_action_dialog(
         SetFocus(first_button);
     }
     let mut message = MSG::default();
-    while !state.finished {
+    loop {
+        if state.finished {
+            break;
+        }
         let result = GetMessageW(&mut message, null_mut(), 0, 0);
         if result <= 0 {
             if result == 0 {
@@ -2416,7 +2419,7 @@ unsafe fn show_action_dialog(
     let activation_config = ACTCTXW {
         cbSize: size_of::<ACTCTXW>() as u32,
         dwFlags: ACTCTX_FLAG_HMODULE_VALID | ACTCTX_FLAG_RESOURCE_NAME_VALID,
-        lpResourceName: 1_usize as *const u16,
+        lpResourceName: std::ptr::without_provenance::<u16>(1),
         hModule: instance,
         ..ACTCTXW::default()
     };

@@ -382,7 +382,8 @@ The v0.5.1 screenshots at the top of this guide are captured automatically from
 the optimized native executable on a GitHub-hosted Windows runner. The run opens
 the committed multi-snapshot send fixture, captures the format-aware credential
 method chooser and real Windows secure prompt, and opens the committed ext4
-fixture as a standalone image.
+fixture as a standalone image. The final capture is recorded in
+[workflow run 31282726061](https://github.com/amcchord/zfs-send-explore/actions/runs/31282726061).
 The service test also descends through a FAT image stored inside another FAT
 image and reads its child directory without exporting either image.
 

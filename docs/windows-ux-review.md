@@ -8,14 +8,14 @@ The follow-up review applies one rule throughout the UI: when the app knows the 
 
 | Friction found after v0.5.0 | v0.5.1 response |
 | --- | --- |
-| The encrypted-view prompt said a binary raw key must be chosen from a file, but supplied no file action. | A native command-link dialog reads the configured `raw`, `hex`, or `passphrase` key format and places direct entry and the appropriate file chooser together. Raw datasets explicitly distinguish Slide's 64-character representation from an original 32-byte binary file. |
+| The encrypted-view prompt said a binary raw key must be chosen from a file, but supplied no file action. | A native contextual action chooser reads the configured `raw`, `hex`, or `passphrase` key format and places direct entry and the appropriate file chooser together. Raw datasets explicitly distinguish Slide's 64-character representation from an original 32-byte binary file. |
 | A missing or incorrect LUKS pool passphrase, ZFS key, or `.detto` agent password ended as a generic operation error. | The relevant direct/file choice reopens and the interrupted source, browse, or image operation retries after replacement. |
 | One ZFS key could be reused accidentally when switching encrypted datasets. | Retained ZFS keys are keyed by source and view selector; unrelated datasets do not silently receive one another's key material. |
 | Starting a new source cleared the working source and its credentials before validation. | Source replacement is transactional: the current catalog and listing remain active until the new source opens successfully. Scoped credentials are committed or cleared only after success. |
 | **Ctrl+O** and **Ctrl+Shift+O** could reuse text already present in the source box instead of showing a chooser. | Both accelerators always open their documented picker. **Choose** selects and opens in one step; **Open path** is the explicit action for pasted/manual paths. |
 | The image row showed blank disabled controls outside inception mode, and two unlabeled number boxes inside it. | Image-only navigation appears only inside an image. The Open-image action moves beside Extract, while advanced range fields are hidden by default and labeled when enabled. |
 | The active image's offset and size were carried into the next selected child image. | Child range fields are cleared after every successful descent. They now describe only the next selected file. |
-| Clearing credentials closed an active source without first exposing that consequence. | A warning command link explicitly says **Clear credentials and close source** before releasing the retained secrets and read session. |
+| Clearing credentials closed an active source without first exposing that consequence. | A warning action explicitly says **Clear credentials and close source** before releasing the retained secrets and read session. |
 
 ## What changed
 
@@ -33,7 +33,7 @@ The follow-up review applies one rule throughout the UI: when the app knows the 
 
 ## Primary workflow
 
-![The v0.5.0 source and snapshot browser](screenshots/windows/source-browser.png)
+![The v0.5.1 source and snapshot browser](screenshots/windows/source-browser.png)
 
 The first decision is now “file or physical drive,” not “send parser or pool parser.” **Choose** selects and immediately opens a file; **Open path** handles a pasted/manual source. A device is selected by observable hardware identity, then confirmed and opened. Once a source is recognized, the view selector, breadcrumb, path controls, and file list follow the same interaction model for streams, pools, and nested filesystems.
 
@@ -77,6 +77,6 @@ The full shortcut table is in the [Windows client guide](windows-client.md#keybo
 - Native clippy: all targets with warnings denied.
 - Windows x86-64 clippy: all targets with warnings denied.
 - Windows release build and packaging: performed by CI on a native Windows runner.
-- Screenshot capture: optimized executable, real Win32 controls, real Windows credential UI, committed send fixture, and committed ext4 fixture.
+- Screenshot capture: optimized executable, real Win32 controls, real Windows credential UI, committed send fixture, and committed ext4 fixture. The credential-method capture verifies both the chooser title and the transition into protected entry.
 
 Hardware acceptance is separate from UI correctness. The existing direct-member validation covers a physical exported vdev. A representative physical Slide Box and Datto Reverse RoundTrip drive are still recommended before broad operational deployment, especially for unsupported multi-vdev/RAIDZ layouts.
