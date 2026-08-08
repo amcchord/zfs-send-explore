@@ -24,6 +24,9 @@ use windows_sys::Win32::Security::Credentials::{
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
+use windows_sys::Win32::System::ApplicationInstallationAndServicing::{
+    ACTCTXW, ActivateActCtx, CreateActCtxW, DeactivateActCtx, ReleaseActCtx,
+};
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{
     GET_LENGTH_INFORMATION, IOCTL_DISK_GET_LENGTH_INFO, IOCTL_STORAGE_QUERY_PROPERTY,
@@ -31,6 +34,9 @@ use windows_sys::Win32::System::Ioctl::{
     StorageDeviceProperty,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
+use windows_sys::Win32::System::WindowsProgramming::{
+    ACTCTX_FLAG_HMODULE_VALID, ACTCTX_FLAG_RESOURCE_NAME_VALID,
+};
 use windows_sys::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, GetSaveFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY,
     OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
@@ -2152,9 +2158,21 @@ unsafe fn show_action_dialog(
         ..TASKDIALOGCONFIG::default()
     };
     let mut selected = 0_i32;
-    // TaskDialogIndirect is available only from Common Controls 6. Loading it
-    // here, after the manifest activation context is active, avoids binding the
-    // process to the legacy in-box comctl32 during executable startup.
+    // TaskDialogIndirect is available only from Common Controls 6. Re-activate
+    // the executable's embedded manifest on this thread before loading the DLL:
+    // other common-control imports may already have loaded the legacy module.
+    let instance = GetModuleHandleW(null());
+    let activation_config = ACTCTXW {
+        cbSize: size_of::<ACTCTXW>() as u32,
+        dwFlags: ACTCTX_FLAG_HMODULE_VALID | ACTCTX_FLAG_RESOURCE_NAME_VALID,
+        lpResourceName: 1_usize as *const u16,
+        hModule: instance,
+        ..ACTCTXW::default()
+    };
+    let activation_context = CreateActCtxW(&activation_config);
+    let mut activation_cookie = 0_usize;
+    let activation_active = activation_context != INVALID_HANDLE_VALUE
+        && ActivateActCtx(activation_context, &mut activation_cookie) != 0;
     let common_controls = LoadLibraryW(windows_sys::core::w!("comctl32.dll"));
     let task_dialog = (!common_controls.is_null())
         .then(|| GetProcAddress(common_controls, c"TaskDialogIndirect".as_ptr().cast()))
@@ -2162,6 +2180,12 @@ unsafe fn show_action_dialog(
     let Some(task_dialog) = task_dialog else {
         if !common_controls.is_null() {
             FreeLibrary(common_controls);
+        }
+        if activation_active {
+            DeactivateActCtx(0, activation_cookie);
+        }
+        if activation_context != INVALID_HANDLE_VALUE {
+            ReleaseActCtx(activation_context);
         }
         show_error(
             owner,
@@ -2175,6 +2199,12 @@ unsafe fn show_action_dialog(
     let task_dialog: TaskDialogIndirectFn = std::mem::transmute(task_dialog);
     let result = task_dialog(&config, &mut selected, null_mut(), null_mut());
     FreeLibrary(common_controls);
+    if activation_active {
+        DeactivateActCtx(0, activation_cookie);
+    }
+    if activation_context != INVALID_HANDLE_VALUE {
+        ReleaseActCtx(activation_context);
+    }
     if result < 0 {
         show_error(
             owner,

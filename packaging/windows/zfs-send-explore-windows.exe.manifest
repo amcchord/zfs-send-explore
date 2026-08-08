@@ -3,7 +3,7 @@
   <assemblyIdentity
       name="ZfsSendExplore.WindowsClient"
       processorArchitecture="*"
-      version="0.2.1.0"
+      version="0.5.1.0"
       type="win32" />
   <description>ZFS Send Explorer native Windows client</description>
   <dependency>
