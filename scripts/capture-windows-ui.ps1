@@ -93,16 +93,28 @@ try {
     $BrowserWindow = Wait-MainWindow $Browser
     Start-Sleep -Seconds 5
     Save-Window $BrowserWindow (Join-Path $Output "source-browser.png")
+}
+finally {
+    Stop-Client $Browser
+}
 
-    [ZfseWindowCapture]::SetForegroundWindow($BrowserWindow) | Out-Null
-    [System.Windows.Forms.SendKeys]::SendWait("^k")
+$EncryptedFixture = Join-Path $Root "tests\fixtures\encrypted-raw-s1.zfs"
+$CredentialFlow = Start-Process -FilePath $Executable -ArgumentList ('"' + $EncryptedFixture + '"') -PassThru
+try {
+    $CredentialMainWindow = Wait-MainWindow $CredentialFlow
+    Start-Sleep -Seconds 5
+    $CredentialMethodWindow = [ZfseWindowCapture]::GetForegroundWindow()
+    Save-Window $CredentialMethodWindow (Join-Path $Output "credential-method.png")
+
+    [ZfseWindowCapture]::SetForegroundWindow($CredentialMethodWindow) | Out-Null
+    [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
     Start-Sleep -Seconds 2
     $CredentialWindow = [ZfseWindowCapture]::GetForegroundWindow()
     Save-Window $CredentialWindow (Join-Path $Output "credential-entry.png")
     [System.Windows.Forms.SendKeys]::SendWait("{ESC}")
 }
 finally {
-    Stop-Client $Browser
+    Stop-Client $CredentialFlow
 }
 
 $Compressed = Join-Path $Root "tests\fixtures\inception\ext4.img.zst.b64"
