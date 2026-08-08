@@ -30,7 +30,9 @@ use windows_sys::Win32::System::Ioctl::{
     PropertyStandardQuery, STORAGE_DEVICE_DESCRIPTOR, STORAGE_PROPERTY_QUERY,
     StorageDeviceProperty,
 };
-use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+use windows_sys::Win32::System::LibraryLoader::{
+    FreeLibrary, GetModuleHandleW, GetProcAddress, LoadLibraryW,
+};
 use windows_sys::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, GetSaveFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY,
     OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
@@ -829,7 +831,7 @@ unsafe fn initialize_window(state: &mut AppState) -> Result<()> {
     add_column(controls.list, 0, "Name", 480);
     add_column(controls.list, 1, "Type", 130);
     add_column(controls.list, 2, "Size", 150);
-    add_column(controls.list, 3, "Object", 120);
+    add_column(controls.list, 3, "Object", 220);
     update_settings_menu(state);
     refresh_physical_drives(state);
     trace_startup("initialize: physical drives refreshed");
@@ -2152,11 +2154,17 @@ unsafe fn show_action_dialog(
         ..TASKDIALOGCONFIG::default()
     };
     let mut selected = 0_i32;
-    let common_controls = GetModuleHandleW(windows_sys::core::w!("comctl32.dll"));
+    // TaskDialogIndirect is available only from Common Controls 6. Loading it
+    // here, after the manifest activation context is active, avoids binding the
+    // process to the legacy in-box comctl32 during executable startup.
+    let common_controls = LoadLibraryW(windows_sys::core::w!("comctl32.dll"));
     let task_dialog = (!common_controls.is_null())
         .then(|| GetProcAddress(common_controls, c"TaskDialogIndirect".as_ptr().cast()))
         .flatten();
     let Some(task_dialog) = task_dialog else {
+        if !common_controls.is_null() {
+            FreeLibrary(common_controls);
+        }
         show_error(
             owner,
             "Could not show the requested choices",
@@ -2168,6 +2176,7 @@ unsafe fn show_action_dialog(
         unsafe extern "system" fn(*const TASKDIALOGCONFIG, *mut i32, *mut i32, *mut i32) -> i32;
     let task_dialog: TaskDialogIndirectFn = std::mem::transmute(task_dialog);
     let result = task_dialog(&config, &mut selected, null_mut(), null_mut());
+    FreeLibrary(common_controls);
     if result < 0 {
         show_error(
             owner,

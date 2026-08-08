@@ -160,12 +160,20 @@ try {
     $CredentialMainWindow = Wait-MainWindow $CredentialFlow
     Start-Sleep -Seconds 5
     $CredentialMethodWindow = [ZfseWindowCapture]::GetForegroundWindow()
+    $CredentialMethodTitle = Get-WindowTitle $CredentialMethodWindow
+    if ($CredentialMethodTitle -ne "ZFS Send Explorer") {
+        throw "Expected the credential-method dialog, found '$CredentialMethodTitle'."
+    }
     Save-Window $CredentialMethodWindow (Join-Path $Output "credential-method.png")
 
     [ZfseWindowCapture]::SetForegroundWindow($CredentialMethodWindow) | Out-Null
     [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
     Start-Sleep -Seconds 2
     $CredentialWindow = [ZfseWindowCapture]::GetForegroundWindow()
+    $CredentialTitle = Get-WindowTitle $CredentialWindow
+    if ($CredentialTitle -ne "ZFS dataset key") {
+        throw "Expected the secure ZFS credential prompt, found '$CredentialTitle'."
+    }
     Save-Window $CredentialWindow (Join-Path $Output "credential-entry.png")
     [System.Windows.Forms.SendKeys]::SendWait("{ESC}")
 }
