@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::thread;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_CANCELLED, HINSTANCE, HWND, INVALID_HANDLE_VALUE, LPARAM, LRESULT, RECT,
-    WPARAM,
+    CloseHandle, ERROR_CANCELLED, FreeLibrary, HINSTANCE, HWND, INVALID_HANDLE_VALUE, LPARAM,
+    LRESULT, RECT, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     COLOR_WINDOW, CreateFontW, DEFAULT_CHARSET, DeleteObject, FW_NORMAL, HFONT, UpdateWindow,
@@ -30,9 +30,7 @@ use windows_sys::Win32::System::Ioctl::{
     PropertyStandardQuery, STORAGE_DEVICE_DESCRIPTOR, STORAGE_PROPERTY_QUERY,
     StorageDeviceProperty,
 };
-use windows_sys::Win32::System::LibraryLoader::{
-    FreeLibrary, GetModuleHandleW, GetProcAddress, LoadLibraryW,
-};
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, GetSaveFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY,
     OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
