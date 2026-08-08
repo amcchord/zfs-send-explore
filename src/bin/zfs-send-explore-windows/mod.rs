@@ -14,7 +14,8 @@ use windows_sys::Win32::Foundation::{
     LRESULT, RECT, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    COLOR_WINDOW, CreateFontW, DEFAULT_CHARSET, DeleteObject, FW_NORMAL, HFONT, UpdateWindow,
+    COLOR_WINDOW, CreateFontW, DEFAULT_CHARSET, DeleteObject, FW_NORMAL, FW_SEMIBOLD, HFONT,
+    UpdateWindow,
 };
 use windows_sys::Win32::Security::Credentials::{
     CREDUI_FLAGS_ALWAYS_SHOW_UI, CREDUI_FLAGS_DO_NOT_PERSIST, CREDUI_FLAGS_EXCLUDE_CERTIFICATES,
@@ -57,21 +58,22 @@ use windows_sys::Win32::UI::HiDpi::{
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus, VK_BACK, VK_RETURN};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    ACCEL, AppendMenuW, BN_CLICKED, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL,
-    CB_RESETCONTENT, CB_SETCURSEL, CBN_SELCHANGE, CBS_DROPDOWNLIST, CREATESTRUCTW, CS_HREDRAW,
-    CS_VREDRAW, CW_USEDEFAULT, CheckMenuItem, CreateAcceleratorTableW, CreateMenu, CreatePopupMenu,
-    CreateWindowExW, DefWindowProcW, DestroyAcceleratorTable, DestroyMenu, DestroyWindow,
-    DispatchMessageW, FALT, FCONTROL, FSHIFT, FVIRTKEY, GWLP_USERDATA, GetClientRect, GetMenu,
-    GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, HACCEL,
-    HMENU, IDC_ARROW, IsDialogMessageW, LoadCursorW, MB_ICONERROR, MB_ICONINFORMATION,
-    MB_ICONWARNING, MB_OK, MB_OKCANCEL, MF_BYCOMMAND, MF_CHECKED, MF_POPUP, MF_SEPARATOR,
-    MF_STRING, MF_UNCHECKED, MSG, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage,
-    RegisterClassW, SW_HIDE, SW_SHOW, SendMessageW, SetMenu, SetWindowLongPtrW, SetWindowPos,
-    SetWindowTextW, ShowWindow, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN, TrackPopupMenu,
-    TranslateAcceleratorW, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_COMMAND,
-    WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_NCCREATE, WM_NOTIFY, WM_SETFONT, WM_SIZE, WNDCLASSW,
-    WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT,
-    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    ACCEL, AppendMenuW, BN_CLICKED, BS_DEFPUSHBUTTON, BS_LEFT, BS_MULTILINE, BS_PUSHBUTTON,
+    CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL, CBN_SELCHANGE, CBS_DROPDOWNLIST,
+    CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CheckMenuItem, CreateAcceleratorTableW,
+    CreateMenu, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyAcceleratorTable,
+    DestroyMenu, DestroyWindow, DispatchMessageW, FALT, FCONTROL, FSHIFT, FVIRTKEY, GWLP_USERDATA,
+    GetClientRect, GetMenu, GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW,
+    GetWindowTextW, HACCEL, HMENU, IDC_ARROW, IsDialogMessageW, LoadCursorW, MB_ICONERROR,
+    MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_OKCANCEL, MF_BYCOMMAND, MF_CHECKED, MF_POPUP,
+    MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MessageBoxW, MoveWindow, PostMessageW,
+    PostQuitMessage, RegisterClassW, SW_HIDE, SW_SHOW, SendMessageW, SetForegroundWindow, SetMenu,
+    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TPM_LEFTALIGN, TPM_RETURNCMD,
+    TPM_TOPALIGN, TrackPopupMenu, TranslateAcceleratorW, TranslateMessage, WINDOW_EX_STYLE, WM_APP,
+    WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_NCCREATE, WM_NOTIFY, WM_SETFONT,
+    WM_SIZE, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE,
+    WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    WS_VSCROLL,
 };
 use zeroize::{Zeroize, Zeroizing};
 use zfs_send_extract::client::{
@@ -2116,6 +2118,237 @@ enum DialogIcon {
     Error,
 }
 
+#[derive(Default)]
+struct ActionDialogState {
+    selected: i32,
+    finished: bool,
+}
+
+unsafe extern "system" fn action_dialog_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if message == WM_NCCREATE {
+        let create = lparam as *const CREATESTRUCTW;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (*create).lpCreateParams as isize);
+    }
+    let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ActionDialogState;
+    match message {
+        WM_COMMAND if !state.is_null() => {
+            let command = (wparam & 0xffff) as usize;
+            if command >= 1000 {
+                (*state).selected = (command - 1000) as i32;
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            if command == 2 {
+                (*state).selected = -1;
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            DefWindowProcW(hwnd, message, wparam, lparam)
+        }
+        WM_CLOSE => {
+            if !state.is_null() {
+                (*state).selected = -1;
+            }
+            DestroyWindow(hwnd);
+            0
+        }
+        WM_DESTROY => {
+            if !state.is_null() {
+                (*state).finished = true;
+            }
+            0
+        }
+        _ => DefWindowProcW(hwnd, message, wparam, lparam),
+    }
+}
+
+unsafe fn show_fallback_action_dialog(
+    owner: HWND,
+    instruction: &str,
+    content: &str,
+    actions: &[(&str, &str)],
+) -> Option<usize> {
+    let instance = GetModuleHandleW(null());
+    let class_name = wide("ZfsSendExploreActionDialog");
+    let class = WNDCLASSW {
+        lpfnWndProc: Some(action_dialog_proc),
+        hInstance: instance,
+        hCursor: LoadCursorW(null_mut(), IDC_ARROW),
+        hbrBackground: (COLOR_WINDOW as usize + 1) as _,
+        lpszClassName: class_name.as_ptr(),
+        ..zeroed()
+    };
+    RegisterClassW(&class);
+
+    let dpi = GetDpiForWindow(owner).max(96) as i32;
+    let scale = |value: i32| value * dpi / 96;
+    let width = scale(620);
+    let height = scale(174 + actions.len() as i32 * 70);
+    let mut owner_rect = RECT::default();
+    GetWindowRect(owner, &mut owner_rect);
+    let x = owner_rect.left + ((owner_rect.right - owner_rect.left - width) / 2).max(0);
+    let y = owner_rect.top + ((owner_rect.bottom - owner_rect.top - height) / 2).max(0);
+    let mut state = ActionDialogState {
+        selected: -1,
+        finished: false,
+    };
+    let title = wide(APP_TITLE);
+    let dialog = CreateWindowExW(
+        WS_EX_CONTROLPARENT,
+        class_name.as_ptr(),
+        title.as_ptr(),
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN,
+        x,
+        y,
+        width,
+        height,
+        owner,
+        null_mut(),
+        instance,
+        (&mut state as *mut ActionDialogState).cast::<c_void>(),
+    );
+    if dialog.is_null() {
+        return None;
+    }
+
+    let normal_font = CreateFontW(
+        -scale(16),
+        0,
+        0,
+        0,
+        FW_NORMAL as i32,
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET.into(),
+        0,
+        0,
+        5,
+        0,
+        wide("Segoe UI").as_ptr(),
+    );
+    let heading_font = CreateFontW(
+        -scale(20),
+        0,
+        0,
+        0,
+        FW_SEMIBOLD as i32,
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET.into(),
+        0,
+        0,
+        5,
+        0,
+        wide("Segoe UI").as_ptr(),
+    );
+    let pad = scale(22);
+    let heading = control(
+        dialog,
+        instance,
+        windows_sys::core::w!("STATIC"),
+        instruction,
+        WS_CHILD | WS_VISIBLE,
+        0,
+        0,
+    );
+    MoveWindow(heading, pad, scale(18), width - pad * 2, scale(30), 1);
+    SendMessageW(heading, WM_SETFONT, heading_font as usize, 1);
+    let description = control(
+        dialog,
+        instance,
+        windows_sys::core::w!("STATIC"),
+        content,
+        WS_CHILD | WS_VISIBLE,
+        0,
+        0,
+    );
+    MoveWindow(description, pad, scale(52), width - pad * 2, scale(38), 1);
+    SendMessageW(description, WM_SETFONT, normal_font as usize, 1);
+
+    let mut first_button = null_mut();
+    for (index, (label, note)) in actions.iter().enumerate() {
+        let text = format!("{label}\r\n{note}");
+        let action = control(
+            dialog,
+            instance,
+            windows_sys::core::w!("BUTTON"),
+            &text,
+            WS_CHILD
+                | WS_VISIBLE
+                | WS_TABSTOP
+                | BS_MULTILINE as u32
+                | BS_LEFT as u32
+                | if index == 0 {
+                    BS_DEFPUSHBUTTON as u32
+                } else {
+                    BS_PUSHBUTTON as u32
+                },
+            0,
+            1000 + index as u16,
+        );
+        MoveWindow(
+            action,
+            pad,
+            scale(94 + index as i32 * 70),
+            width - pad * 2,
+            scale(58),
+            1,
+        );
+        SendMessageW(action, WM_SETFONT, normal_font as usize, 1);
+        if index == 0 {
+            first_button = action;
+        }
+    }
+    let cancel = button(dialog, instance, "Cancel", 2, false);
+    MoveWindow(
+        cancel,
+        width - pad - scale(92),
+        height - scale(60),
+        scale(92),
+        scale(30),
+        1,
+    );
+    SendMessageW(cancel, WM_SETFONT, normal_font as usize, 1);
+
+    EnableWindow(owner, 0);
+    ShowWindow(dialog, SW_SHOW);
+    UpdateWindow(dialog);
+    if !first_button.is_null() {
+        SetFocus(first_button);
+    }
+    let mut message = MSG::default();
+    while !state.finished {
+        let result = GetMessageW(&mut message, null_mut(), 0, 0);
+        if result <= 0 {
+            if result == 0 {
+                PostQuitMessage(message.wParam as i32);
+            }
+            break;
+        }
+        if IsDialogMessageW(dialog, &message) == 0 {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+    EnableWindow(owner, 1);
+    SetForegroundWindow(owner);
+    if !normal_font.is_null() {
+        DeleteObject(normal_font);
+    }
+    if !heading_font.is_null() {
+        DeleteObject(heading_font);
+    }
+    (state.selected >= 0 && (state.selected as usize) < actions.len())
+        .then_some(state.selected as usize)
+}
+
 unsafe fn show_action_dialog(
     owner: HWND,
     icon: DialogIcon,
@@ -2124,8 +2357,8 @@ unsafe fn show_action_dialog(
     actions: &[(&str, &str)],
 ) -> Option<usize> {
     let title = wide(APP_TITLE);
-    let instruction = wide(instruction);
-    let content = wide(content);
+    let instruction_wide = wide(instruction);
+    let content_wide = wide(content);
     let labels = actions
         .iter()
         .map(|(label, detail)| wide(&format!("{label}\n{detail}")))
@@ -2150,8 +2383,8 @@ unsafe fn show_action_dialog(
         dwCommonButtons: TDCBF_CANCEL_BUTTON,
         pszWindowTitle: title.as_ptr(),
         Anonymous1: TASKDIALOGCONFIG_0 { pszMainIcon: icon },
-        pszMainInstruction: instruction.as_ptr(),
-        pszContent: content.as_ptr(),
+        pszMainInstruction: instruction_wide.as_ptr(),
+        pszContent: content_wide.as_ptr(),
         cButtons: buttons.len() as u32,
         pButtons: buttons.as_ptr(),
         nDefaultButton: 1000,
@@ -2187,12 +2420,7 @@ unsafe fn show_action_dialog(
         if activation_context != INVALID_HANDLE_VALUE {
             ReleaseActCtx(activation_context);
         }
-        show_error(
-            owner,
-            "Could not show the requested choices",
-            "This Windows installation does not expose the native task-dialog function.",
-        );
-        return None;
+        return show_fallback_action_dialog(owner, instruction, content, actions);
     };
     type TaskDialogIndirectFn =
         unsafe extern "system" fn(*const TASKDIALOGCONFIG, *mut i32, *mut i32, *mut i32) -> i32;
