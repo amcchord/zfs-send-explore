@@ -30,7 +30,7 @@ use windows_sys::Win32::System::Ioctl::{
     PropertyStandardQuery, STORAGE_DEVICE_DESCRIPTOR, STORAGE_PROPERTY_QUERY,
     StorageDeviceProperty,
 };
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, GetSaveFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY,
     OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
@@ -44,7 +44,7 @@ use windows_sys::Win32::UI::Controls::{
     LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP, NM_DBLCLK, NMHDR, NMLVKEYDOWN, SB_SETTEXTW,
     STATUSCLASSNAMEW, TASKDIALOG_BUTTON, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0, TD_ERROR_ICON,
     TD_INFORMATION_ICON, TD_WARNING_ICON, TDCBF_CANCEL_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION,
-    TDF_SIZE_TO_CONTENT, TDF_USE_COMMAND_LINKS, TaskDialogIndirect, WC_LISTVIEWW,
+    TDF_SIZE_TO_CONTENT, TDF_USE_COMMAND_LINKS, WC_LISTVIEWW,
 };
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
@@ -2152,7 +2152,22 @@ unsafe fn show_action_dialog(
         ..TASKDIALOGCONFIG::default()
     };
     let mut selected = 0_i32;
-    let result = TaskDialogIndirect(&config, &mut selected, null_mut(), null_mut());
+    let common_controls = GetModuleHandleW(windows_sys::core::w!("comctl32.dll"));
+    let task_dialog = (!common_controls.is_null())
+        .then(|| GetProcAddress(common_controls, c"TaskDialogIndirect".as_ptr().cast()))
+        .flatten();
+    let Some(task_dialog) = task_dialog else {
+        show_error(
+            owner,
+            "Could not show the requested choices",
+            "This Windows installation does not expose the native task-dialog function.",
+        );
+        return None;
+    };
+    type TaskDialogIndirectFn =
+        unsafe extern "system" fn(*const TASKDIALOGCONFIG, *mut i32, *mut i32, *mut i32) -> i32;
+    let task_dialog: TaskDialogIndirectFn = std::mem::transmute(task_dialog);
+    let result = task_dialog(&config, &mut selected, null_mut(), null_mut());
     if result < 0 {
         show_error(
             owner,

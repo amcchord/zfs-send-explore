@@ -378,10 +378,11 @@ The run covered:
 - a read-only 1 GiB single-vdev pool member with two snapshots; and
 - a 256 MiB logical sparse file with 256 KiB allocated on NTFS.
 
-The v0.5.0 screenshots at the top of this guide are captured automatically from
+The v0.5.1 screenshots at the top of this guide are captured automatically from
 the optimized native executable on a GitHub-hosted Windows runner. The run opens
-the committed multi-snapshot send fixture, invokes the real Windows secure
-credential prompt, and opens the committed ext4 fixture as a standalone image.
+the committed multi-snapshot send fixture, captures the format-aware credential
+method chooser and real Windows secure prompt, and opens the committed ext4
+fixture as a standalone image.
 The service test also descends through a FAT image stored inside another FAT
 image and reads its child directory without exporting either image.
 

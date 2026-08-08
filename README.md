@@ -12,7 +12,7 @@ Detailed implementation and validation material lives in:
 - [`docs/format-notes.md`](docs/format-notes.md), which maps the supported send and on-disk formats to the reader; and
 - [`docs/test-evidence.md`](docs/test-evidence.md), which records the real OpenZFS fixtures, lab scenarios, sizes, and hashes.
 - [`docs/windows-client.md`](docs/windows-client.md), which covers the Windows UI, attached-drive access, updates, sparse files, and packaging; and
-- [`docs/windows-ux-review.md`](docs/windows-ux-review.md), which records the v0.5.0 usability audit, credential model, shortcuts, and recursive inception design.
+- [`docs/windows-ux-review.md`](docs/windows-ux-review.md), which records the v0.5.0–v0.5.1 usability audits, contextual credential model, shortcuts, and recursive inception design.
 
 ## What works today
 
