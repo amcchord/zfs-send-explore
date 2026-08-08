@@ -46,6 +46,9 @@ public static class ZfseWindowCapture {
 function Wait-MainWindow([System.Diagnostics.Process]$Process) {
     for ($Attempt = 0; $Attempt -lt 120; $Attempt++) {
         $Process.Refresh()
+        if ($Process.HasExited) {
+            throw "The Windows client exited before creating a main window (exit code $($Process.ExitCode))."
+        }
         if ($Process.MainWindowHandle -ne [IntPtr]::Zero) {
             return $Process.MainWindowHandle
         }
@@ -88,6 +91,7 @@ function Stop-Client([System.Diagnostics.Process]$Process) {
 }
 
 $SendFixture = Join-Path $Root "tests\fixtures\multi-snapshot.zfs"
+Write-Host "Capturing the ordinary source browser"
 $Browser = Start-Process -FilePath $Executable -ArgumentList ('"' + $SendFixture + '"') -PassThru
 try {
     $BrowserWindow = Wait-MainWindow $Browser
@@ -99,6 +103,7 @@ finally {
 }
 
 $EncryptedFixture = Join-Path $Root "tests\fixtures\encrypted-raw-s1.zfs"
+Write-Host "Capturing the contextual credential flow"
 $CredentialFlow = Start-Process -FilePath $Executable -ArgumentList ('"' + $EncryptedFixture + '"') -PassThru
 try {
     $CredentialMainWindow = Wait-MainWindow $CredentialFlow
@@ -136,6 +141,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $ImageBrowser = Start-Process -FilePath $Executable -ArgumentList ('"' + $StandaloneImage + '"') -PassThru
+Write-Host "Capturing the standalone image browser"
 try {
     $ImageWindow = Wait-MainWindow $ImageBrowser
     Start-Sleep -Seconds 5

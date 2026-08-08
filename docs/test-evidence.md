@@ -18,6 +18,28 @@ opens the committed multi-snapshot send fixture, captures the optimized app and
 the real non-persisting Windows credential prompt, then opens the committed
 ext4 fixture as a standalone disk image.
 
+## Contextual Windows recovery in v0.5.1
+
+The follow-up audit covers every place where the UI could identify a next
+action but previously returned only prose or a generic error. Encrypted ZFS
+views now expose their configured key format before traversal and show direct
+entry plus file selection in one native command-link dialog. Missing or rejected
+ZFS, Datto pool, and Datto agent credentials return to the relevant choices and
+retry the interrupted operation. ZFS values are scoped by source and view.
+
+Source replacement is now transactional: opening an invalid or inaccessible
+new path leaves the previous catalog, list, and credentials intact. The
+automated Windows capture separately exercises the ordinary source browser, the
+format-aware credential-method chooser, the non-persisting secure entry prompt,
+and a standalone ext filesystem image.
+
+The inception UI regression pass also found that the active parent's offset and
+stored length were being copied into the controls used for the next child. The
+fields now reset after every successful descent, are hidden by default, and are
+revealed with labels from Settings or directly from a failed image-open action.
+The native suite now contains 61 tests, including a catalog assertion that the
+credential format is available before an encrypted view is browsed.
+
 ## Slide and Datto recovery paths
 
 The v0.4.0 automated coverage exercises the vendor-specific adapters without
