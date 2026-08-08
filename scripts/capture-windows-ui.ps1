@@ -40,8 +40,20 @@ public static class ZfseWindowCapture {
 
     [DllImport("user32.dll")]
     public static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern int GetWindowText(IntPtr hwnd, System.Text.StringBuilder text, int count);
 }
 "@
+
+function Get-WindowTitle([IntPtr]$Window) {
+    $Text = New-Object System.Text.StringBuilder 1024
+    [ZfseWindowCapture]::GetWindowText($Window, $Text, $Text.Capacity) | Out-Null
+    return $Text.ToString()
+}
 
 function Wait-MainWindow([System.Diagnostics.Process]$Process) {
     for ($Attempt = 0; $Attempt -lt 120; $Attempt++) {
@@ -51,6 +63,15 @@ function Wait-MainWindow([System.Diagnostics.Process]$Process) {
         }
         if ($Process.MainWindowHandle -ne [IntPtr]::Zero) {
             return $Process.MainWindowHandle
+        }
+        $Foreground = [ZfseWindowCapture]::GetForegroundWindow()
+        $ForegroundProcess = [uint32]0
+        if ($Foreground -ne [IntPtr]::Zero) {
+            [ZfseWindowCapture]::GetWindowThreadProcessId($Foreground, [ref]$ForegroundProcess) | Out-Null
+            if ($ForegroundProcess -eq $Process.Id) {
+                Write-Host "Using process-owned foreground window: $(Get-WindowTitle $Foreground)"
+                return $Foreground
+            }
         }
         Start-Sleep -Milliseconds 250
     }
