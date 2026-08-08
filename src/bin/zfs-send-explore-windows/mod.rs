@@ -2188,7 +2188,7 @@ unsafe fn show_fallback_action_dialog(
     let dpi = GetDpiForWindow(owner).max(96) as i32;
     let scale = |value: i32| value * dpi / 96;
     let width = scale(620);
-    let height = scale(174 + actions.len() as i32 * 70);
+    let height = scale(194 + actions.len() as i32 * 70);
     let mut owner_rect = RECT::default();
     GetWindowRect(owner, &mut owner_rect);
     let x = owner_rect.left + ((owner_rect.right - owner_rect.left - width) / 2).max(0);
@@ -2215,6 +2215,10 @@ unsafe fn show_fallback_action_dialog(
     if dialog.is_null() {
         return None;
     }
+    let mut client = RECT::default();
+    GetClientRect(dialog, &mut client);
+    let client_width = client.right - client.left;
+    let client_height = client.bottom - client.top;
 
     let normal_font = CreateFontW(
         -scale(16),
@@ -2258,7 +2262,14 @@ unsafe fn show_fallback_action_dialog(
         0,
         0,
     );
-    MoveWindow(heading, pad, scale(18), width - pad * 2, scale(30), 1);
+    MoveWindow(
+        heading,
+        pad,
+        scale(18),
+        client_width - pad * 2,
+        scale(30),
+        1,
+    );
     SendMessageW(heading, WM_SETFONT, heading_font as usize, 1);
     let description = control(
         dialog,
@@ -2269,12 +2280,19 @@ unsafe fn show_fallback_action_dialog(
         0,
         0,
     );
-    MoveWindow(description, pad, scale(52), width - pad * 2, scale(38), 1);
+    MoveWindow(
+        description,
+        pad,
+        scale(52),
+        client_width - pad * 2,
+        scale(38),
+        1,
+    );
     SendMessageW(description, WM_SETFONT, normal_font as usize, 1);
 
     let mut first_button = null_mut();
     for (index, (label, note)) in actions.iter().enumerate() {
-        let text = format!("{label}\r\n{note}");
+        let text = format!("  {label}\r\n  {note}");
         let action = control(
             dialog,
             instance,
@@ -2297,7 +2315,7 @@ unsafe fn show_fallback_action_dialog(
             action,
             pad,
             scale(94 + index as i32 * 70),
-            width - pad * 2,
+            client_width - pad * 2,
             scale(58),
             1,
         );
@@ -2309,8 +2327,8 @@ unsafe fn show_fallback_action_dialog(
     let cancel = button(dialog, instance, "Cancel", 2, false);
     MoveWindow(
         cancel,
-        width - pad - scale(92),
-        height - scale(60),
+        client_width - pad - scale(92),
+        client_height - pad - scale(30),
         scale(92),
         scale(30),
         1,
