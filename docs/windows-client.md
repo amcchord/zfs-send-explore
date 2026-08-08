@@ -147,7 +147,7 @@ Use **Credentials** or **Ctrl+K** at any time. The menu supports:
 - direct or file-backed Datto agent passwords; and
 - immediate clearing of every in-memory credential.
 
-Directly entered secrets and loaded file bytes live only in zeroizing process memory. Windows credential persistence is disabled. Credentials are scoped to the selected source when the default clear-on-source-change setting is enabled, are never written to settings or `.zfse.json`, and are released when cleared or when the process exits.
+Directly entered secrets and loaded file bytes live only in zeroizing process memory. Windows credential persistence is disabled. Credentials are scoped to the selected source when the default clear-on-source-change setting is enabled and are never written to settings or `.zfse.json`. Clearing credentials also closes the current source so an outer pool-unlock key cannot remain retained by its read session.
 
 Authentication tags, encrypted metadata, block tags, spill blocks, and supported indirect authentication state are verified before plaintext is used. Native-encrypted pools additionally verify inherited encryption-root discovery, wrapped keys, the objset portable MAC, encrypted dnode bonuses, and folded physical checksums.
 

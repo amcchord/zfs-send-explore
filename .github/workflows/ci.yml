@@ -36,16 +36,3 @@ jobs:
         with:
           name: zfs-send-explore-windows-x86_64
           path: target/windows-package/zfs-send-explore-windows-x86_64.zip
-      - name: Install screenshot fixture decoder
-        if: github.event_name == 'push' && startsWith(github.ref_name, 'agent/windows-ux')
-        run: python -m pip install --disable-pip-version-check zstandard
-      - name: Capture native UI screenshots
-        if: github.event_name == 'push' && startsWith(github.ref_name, 'agent/windows-ux')
-        shell: pwsh
-        run: .\scripts\capture-windows-ui.ps1
-      - uses: actions/upload-artifact@v4
-        if: github.event_name == 'push' && startsWith(github.ref_name, 'agent/windows-ux')
-        with:
-          name: windows-ui-screenshots
-          path: artifacts/windows-ui
-          if-no-files-found: error

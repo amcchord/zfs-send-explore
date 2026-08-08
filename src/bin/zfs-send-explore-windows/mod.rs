@@ -394,7 +394,7 @@ unsafe extern "system" fn window_proc(
             0
         }
         WM_COMMAND if !state.is_null() => {
-            handle_command(&mut *state, wparam);
+            handle_command(&mut *state, wparam, lparam);
             0
         }
         WM_NOTIFY if !state.is_null() => {
@@ -767,11 +767,12 @@ unsafe fn initialize_window(state: &mut AppState) -> Result<()> {
     EnableWindow(state.controls.update, 1);
     EnableWindow(state.controls.container_key, 1);
     EnableWindow(state.controls.agent_password, 1);
+    EnableWindow(state.controls.choose_key, 1);
     layout(state);
     Ok(())
 }
 
-unsafe fn handle_command(state: &mut AppState, wparam: WPARAM) {
+unsafe fn handle_command(state: &mut AppState, wparam: WPARAM, lparam: LPARAM) {
     let id = (wparam & 0xffff) as u16;
     let notification = ((wparam >> 16) & 0xffff) as u16;
     if state.busy && !matches!(id, ID_EXIT | ID_ABOUT) {
@@ -804,7 +805,7 @@ unsafe fn handle_command(state: &mut AppState, wparam: WPARAM) {
             SetFocus(state.controls.path);
         }
         ID_REFRESH => refresh(state),
-        ID_ENTER_KEY if notification == BN_CLICKED as u16 => show_credentials_menu(state),
+        ID_ENTER_KEY if lparam != 0 => show_credentials_menu(state),
         ID_ENTER_KEY => enter_key(state),
         ID_CHOOSE_KEY => choose_key_file(state),
         ID_ENTER_CONTAINER_KEY => enter_container_key(state),
@@ -877,6 +878,11 @@ unsafe fn open_source(state: &mut AppState, mode: OpenMode) {
     }
     if state.settings.clear_credentials_on_source_change && source_is_changing(state, &path) {
         clear_credentials_for_source(state, &path);
+        state.catalog = None;
+        state.inception.clear();
+        SendMessageW(state.controls.view, CB_RESETCONTENT, 0, 0);
+        SendMessageW(state.controls.volume, CB_RESETCONTENT, 0, 0);
+        close_source_ui(state);
     }
     set_busy(
         state,
@@ -1097,6 +1103,12 @@ unsafe fn explore_selected_image(state: &mut AppState) {
     let parent_image = state.inception.last().map(|frame| frame.catalog.clone());
     let parent_volume = selected_volume_index(state);
     let key = state.key.clone();
+    if image_path.to_ascii_lowercase().ends_with(".detto") && state.agent_password.is_none() {
+        enter_agent_password(state);
+        if state.agent_password.is_none() {
+            return;
+        }
+    }
     let agent_password = image_path
         .to_ascii_lowercase()
         .ends_with(".detto")
@@ -1554,6 +1566,7 @@ unsafe fn set_busy(state: &mut AppState, busy: bool, message: &str) {
         state.controls.update,
         state.controls.container_key,
         state.controls.agent_password,
+        state.controls.choose_key,
     ] {
         EnableWindow(control, enabled);
     }
@@ -1570,7 +1583,6 @@ unsafe fn set_source_enabled(state: &AppState, enabled: bool) {
         state.controls.path,
         state.controls.up,
         state.controls.go,
-        state.controls.choose_key,
         state.controls.list,
         state.controls.extract,
         state.controls.inception,
@@ -2097,7 +2109,19 @@ unsafe fn update_credential_button(state: &AppState) {
 
 unsafe fn clear_credentials(state: &mut AppState) {
     clear_credentials_silent(state);
-    set_status(state, "All in-memory credentials were cleared");
+    if state.catalog.is_some() || !state.inception.is_empty() {
+        state.catalog = None;
+        state.inception.clear();
+        SendMessageW(state.controls.view, CB_RESETCONTENT, 0, 0);
+        SendMessageW(state.controls.volume, CB_RESETCONTENT, 0, 0);
+        close_source_ui(state);
+        set_status(
+            state,
+            "All credentials were cleared; the source was closed to release its unlock key",
+        );
+    } else {
+        set_status(state, "All in-memory credentials were cleared");
+    }
 }
 
 unsafe fn clear_credentials_silent(state: &mut AppState) {

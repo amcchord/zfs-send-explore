@@ -34,7 +34,7 @@ Three credentials have deliberately distinct roles:
 - **Datto pool passphrase** unlocks the outer LUKS1/LUKS2 Reverse RoundTrip partition.
 - **Datto agent password** authenticates an agent's `.encryptionKeyStash` and derives the `.detto` AES-XTS key.
 
-The native prompt disables Windows credential persistence. Direct UTF-16 input is converted to bytes, the temporary UTF-16 and string buffers are zeroized, and the retained bytes use `Zeroizing<Vec<u8>>`. Key-file reads are size-bounded before allocation. With the default setting, a secret is scoped to the source path shown when it is entered and unrelated credentials are dropped when another source opens. **Credentials > Clear all credentials** releases all retained values immediately.
+The native prompt disables Windows credential persistence. Direct UTF-16 input is converted to bytes, the temporary UTF-16 and string buffers are zeroized, and the retained bytes use `Zeroizing<Vec<u8>>`. Key-file reads are size-bounded before allocation. With the default setting, a secret is scoped to the source path shown when it is entered and unrelated credentials are dropped when another source opens. **Credentials > Clear all credentials** closes the active source as it releases every retained value, including an outer pool-unlock key owned by the open read session.
 
 ## Recursive inception model
 
