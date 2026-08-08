@@ -16,6 +16,7 @@ Copy-Item (Join-Path $Root "target\release\zfs-send-explore-windows.exe") $Stage
 Copy-Item (Join-Path $Root "target\release\zfs-send-extract.exe") $Stage
 Copy-Item (Join-Path $Root "README.md") $Stage
 Copy-Item (Join-Path $Root "docs\windows-client.md") $DocsStage
+Copy-Item (Join-Path $Root "docs\windows-ux-review.md") $DocsStage
 Copy-Item (Join-Path $Root "docs\screenshots") (Join-Path $DocsStage "screenshots") -Recurse
 Copy-Item (Join-Path $Root "LICENSE") $Stage
 

@@ -109,13 +109,19 @@ $Compressed = Join-Path $Root "tests\fixtures\inception\ext4.img.zst.b64"
 $StandaloneImage = Join-Path $env:RUNNER_TEMP "zfse-ext4.img"
 @"
 import base64
+import io
 import pathlib
 import zstandard
 
 source = pathlib.Path(r'$Compressed')
 target = pathlib.Path(r'$StandaloneImage')
-target.write_bytes(zstandard.ZstdDecompressor().decompress(base64.b64decode(source.read_bytes())))
+compressed = io.BytesIO(base64.b64decode(source.read_bytes()))
+with zstandard.ZstdDecompressor().stream_reader(compressed) as reader:
+    target.write_bytes(reader.read())
 "@ | python -
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not decode the standalone image fixture."
+}
 
 $ImageBrowser = Start-Process -FilePath $Executable -ArgumentList ('"' + $StandaloneImage + '"') -PassThru
 try {

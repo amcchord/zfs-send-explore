@@ -5,13 +5,14 @@
 The extraction machine does **not** need ZFS, `libzfs`, or a ZFS kernel module. The tool never invokes `zfs` or `zpool`, and pool members are opened read-only.
 
 > [!IMPORTANT]
-> This is an early `0.4.0` implementation. The CLI, Windows UI, sidecar format, and supported on-disk profile may change. Stream and native-encryption pool fixtures are produced on little-endian OpenZFS systems. Linux validates the core end to end, and CI runs the full test suite and release packaging on native Windows.
+> This is an early `0.5.0` implementation. The CLI, Windows UI, sidecar format, and supported on-disk profile may change. Stream and native-encryption pool fixtures are produced on little-endian OpenZFS systems. Linux validates the core end to end, and CI runs the full test suite and release packaging on native Windows.
 
 Detailed implementation and validation material lives in:
 
 - [`docs/format-notes.md`](docs/format-notes.md), which maps the supported send and on-disk formats to the reader; and
 - [`docs/test-evidence.md`](docs/test-evidence.md), which records the real OpenZFS fixtures, lab scenarios, sizes, and hashes.
-- [`docs/windows-client.md`](docs/windows-client.md), which covers the Windows UI, attached-drive access, updates, sparse files, and packaging.
+- [`docs/windows-client.md`](docs/windows-client.md), which covers the Windows UI, attached-drive access, updates, sparse files, and packaging; and
+- [`docs/windows-ux-review.md`](docs/windows-ux-review.md), which records the v0.5.0 usability audit, credential model, shortcuts, and recursive inception design.
 
 ## What works today
 
@@ -33,7 +34,10 @@ Detailed implementation and validation material lives in:
 | Explore a raw or sparse disk image stored as a regular ZFS file | Supported, including explicit byte offset/length windows; validated across every subordinate filesystem below |
 | Explore self-contained QCOW2 and VMDK sparse containers stored on ZFS | QCOW2 v2/v3 and VMDK `monolithicSparse`; sparse QCOW2 v3 and VMDK are in the full matrix |
 | Browse and extract from a subordinate filesystem (“inception mode”) | NTFS, FAT12/16/32, exFAT, ext4, and compatible ext2; all seven are in the full matrix |
+| Open standalone images and recursively nested images | Supported without mounting or materializing the complete child image; the UI retains up to eight active layers |
 | Native Windows snapshot browser and extractor | Supported as `zfs-send-explore-windows.exe` |
+| Native Windows physical-drive discovery | Enumerates disk number, model, size, and media type; confirms the exact read-only selection |
+| Direct password/key entry in Windows | ZFS, Datto LUKS, and Datto agent secrets use the non-persisting Windows credential prompt and zeroizing memory; key files remain supported |
 | Open a GPT/MBR whole-disk image or `\\.\PhysicalDriveN` | Supported when exactly one partition resolves to a supported plain or LUKS-wrapped ZFS member |
 | Preserve sparse holes during extraction and incremental updates | Supported; zero ranges are deallocated when the destination filesystem permits it |
 | Read compressed and embedded blocks from a pool member | LZJB, LZ4, gzip, ZLE, and Zstandard |
@@ -103,7 +107,7 @@ cargo build --release --bin zfs-send-explore-windows
 
 The GUI binary is `target\release\zfs-send-explore-windows.exe`; the packaging script also builds `zfs-send-extract.exe` and creates a distributable ZIP containing both clients and the illustrated documentation. It uses Win32 common controls, Windows file dialogs, the Segoe UI system typeface, per-monitor DPI scaling, and background workers so long stream scans do not block the window.
 
-Open a send file or vdev image with **Browse**, or type a raw device path such as `\\.\PhysicalDrive3` and choose **Open pool / drive**. Physical-drive access normally requires starting the client as Administrator. The reader opens the source read-only, validates GPT metadata when auto-selecting a partition, and never imports or mounts the pool. See [the Windows client guide](docs/windows-client.md) for the complete workflow and safety constraints.
+Use **Browse > Open** for automatic send, pool-member, and standalone-image detection. Attached disks appear in a physical-drive picker with disk number, model, capacity, and media type; the exact read-only choice is confirmed before opening. Physical-drive access may require starting the client as Administrator. Encrypted views request a key through the secure Windows prompt, while binary key files remain supported. See the [Windows client guide](docs/windows-client.md) and [UI/UX review](docs/windows-ux-review.md) for the complete workflow, shortcuts, settings, and safety constraints.
 
 ## Browse and extract from a send file
 

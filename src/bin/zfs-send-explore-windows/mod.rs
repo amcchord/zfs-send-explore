@@ -40,8 +40,9 @@ use windows_sys::Win32::UI::Controls::{
     InitCommonControlsEx, LVCF_FMT, LVCF_TEXT, LVCF_WIDTH, LVCFMT_LEFT, LVCOLUMNW, LVIF_TEXT,
     LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS, LVM_ENSUREVISIBLE, LVM_GETNEXTITEM,
     LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE,
-    LVM_SETITEMTEXTW, LVN_KEYDOWN, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
-    LVS_EX_LABELTIP, NM_DBLCLK, NMHDR, NMLVKEYDOWN, SB_SETTEXTW, STATUSCLASSNAMEW, WC_LISTVIEWW,
+    LVM_SETITEMTEXTW, LVN_ITEMCHANGED, LVN_KEYDOWN, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER,
+    LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP, NM_DBLCLK, NMHDR, NMLVKEYDOWN, SB_SETTEXTW,
+    STATUSCLASSNAMEW, WC_LISTVIEWW,
 };
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
@@ -832,6 +833,8 @@ unsafe fn handle_notify(state: &mut AppState, lparam: LPARAM) {
     let header = &*(lparam as *const NMHDR);
     if header.hwndFrom == state.controls.list && header.code == NM_DBLCLK {
         open_selected(state);
+    } else if header.hwndFrom == state.controls.list && header.code == LVN_ITEMCHANGED {
+        update_selection_actions(state);
     } else if header.hwndFrom == state.controls.list && header.code == LVN_KEYDOWN {
         let key = lparam as *const NMLVKEYDOWN;
         let virtual_key = std::ptr::addr_of!((*key).wVKey).read_unaligned();
@@ -1519,6 +1522,7 @@ unsafe fn populate_list(state: &AppState) {
         );
         SendMessageW(list, LVM_ENSUREVISIBLE, 0, 0);
     }
+    update_selection_actions(state);
 }
 
 fn spawn_job<F>(hwnd: HWND, operation: F)
@@ -1587,6 +1591,9 @@ unsafe fn set_source_enabled(state: &AppState, enabled: bool) {
         state.controls.leave_image,
         (enabled != 0 && !state.inception.is_empty()) as i32,
     );
+    if enabled != 0 {
+        update_selection_actions(state);
+    }
 }
 
 unsafe fn selected_view(state: &AppState) -> Option<usize> {
@@ -1602,6 +1609,21 @@ unsafe fn selected_volume_index(state: &AppState) -> Option<usize> {
 unsafe fn selected_index(list: HWND) -> Option<usize> {
     let selected = SendMessageW(list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize);
     (selected >= 0).then_some(selected as usize)
+}
+
+unsafe fn update_selection_actions(state: &AppState) {
+    if state.busy {
+        return;
+    }
+    let entry = selected_index(state.controls.list).and_then(|index| state.entries.get(index));
+    let extractable = entry.is_some_and(|entry| matches!(entry.dirent_type, 4 | 8));
+    let image = entry.is_some_and(|entry| entry.dirent_type == 8);
+    EnableWindow(state.controls.extract, extractable as i32);
+    EnableWindow(state.controls.inception, image as i32);
+    let label = entry
+        .filter(|entry| likely_disk_image(&entry.name))
+        .map_or("Explore as disk image…", |_| "Open disk image…");
+    set_text(state.controls.inception, label);
 }
 
 unsafe fn open_selected(state: &mut AppState) {
