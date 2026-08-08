@@ -1,6 +1,6 @@
 [package]
 name = "zfs-send-extract"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.87"
 license = "Apache-2.0"
@@ -15,6 +15,7 @@ aes-gcm = "0.10"
 am-fs-core = "0.2.2"
 am-img-vmdk = "0.3.2"
 anyhow = "1.0"
+base64 = "0.22"
 ccm = "0.5"
 clap = { version = "4.5", features = ["derive"] }
 crc32fast = "1.5"
@@ -25,6 +26,7 @@ hmac = "0.12"
 hkdf = "0.12"
 libc = "0.2"
 lz4_flex = "0.11"
+luks-core = "0.1.8"
 ntfs = "0.4.0"
 pbkdf2 = "0.12"
 qcow2-core = "0.3.4"
@@ -34,11 +36,13 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha1 = "0.10"
 sha2 = "0.10"
+sha3 = "0.10"
 subtle = "2.6"
 tempfile = "3.20"
 thiserror = "2.0"
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
 zfs-forensic-core = "0.1.1"
+xts-mode = "0.5"
 
 [build-dependencies]
 embed-resource = "3.0"

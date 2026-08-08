@@ -46,6 +46,7 @@ use zfs_send_extract::client::{
 };
 use zfs_send_extract::filesystem::DirectoryEntry;
 use zfs_send_extract::operations::Sidecar;
+use zfs_send_extract::tree::RecursiveExtraction;
 
 const CLASS_NAME: &str = "ZfsSendExploreWindows";
 const APP_TITLE: &str = "ZFS Send Explorer";
@@ -69,6 +70,8 @@ const ID_LEAVE_IMAGE: u16 = 115;
 const ID_VOLUME: u16 = 116;
 const ID_IMAGE_OFFSET: u16 = 117;
 const ID_IMAGE_LENGTH: u16 = 118;
+const ID_CONTAINER_KEY: u16 = 119;
+const ID_AGENT_PASSWORD: u16 = 120;
 
 const WM_JOB_COMPLETE: u32 = WM_APP + 1;
 
@@ -84,6 +87,8 @@ struct Controls {
     up: HWND,
     go: HWND,
     choose_key: HWND,
+    container_key: HWND,
+    agent_password: HWND,
     list: HWND,
     extract: HWND,
     inception: HWND,
@@ -102,6 +107,8 @@ struct AppState {
     entries: Vec<DirectoryEntry>,
     current_path: String,
     key_file: Option<PathBuf>,
+    container_key_file: Option<PathBuf>,
+    agent_password_file: Option<PathBuf>,
     inception: Option<InceptionCatalog>,
     busy: bool,
 }
@@ -116,6 +123,8 @@ impl Default for AppState {
             entries: Vec::new(),
             current_path: "/".to_owned(),
             key_file: None,
+            container_key_file: None,
+            agent_password_file: None,
             inception: None,
             busy: false,
         }
@@ -132,6 +141,10 @@ enum JobResult {
         destination: PathBuf,
         extraction: ClientExtraction,
         nested: bool,
+    },
+    TreeExtracted {
+        destination: PathBuf,
+        extraction: RecursiveExtraction,
     },
     InceptionOpened(InceptionCatalog),
     Updated {
@@ -338,7 +351,19 @@ unsafe fn initialize_window(state: &mut AppState) -> Result<()> {
         file_menu,
         MF_STRING,
         ID_CHOOSE_KEY as usize,
-        "Choose decryption key…",
+        "Choose ZFS dataset key…",
+    );
+    append_menu(
+        file_menu,
+        MF_STRING,
+        ID_CONTAINER_KEY as usize,
+        "Choose Datto pool passphrase…",
+    );
+    append_menu(
+        file_menu,
+        MF_STRING,
+        ID_AGENT_PASSWORD as usize,
+        "Choose Datto agent password…",
     );
     AppendMenuW(file_menu, MF_SEPARATOR, 0, null());
     append_menu(file_menu, MF_STRING, ID_EXIT as usize, "Exit");
@@ -346,7 +371,7 @@ unsafe fn initialize_window(state: &mut AppState) -> Result<()> {
         actions_menu,
         MF_STRING,
         ID_EXTRACT as usize,
-        "Extract selected file…",
+        "Extract selected file or folder…",
     );
     append_menu(
         actions_menu,
@@ -432,6 +457,20 @@ unsafe fn initialize_window(state: &mut AppState) -> Result<()> {
         ID_CHOOSE_KEY,
         false,
     );
+    controls.container_key = button(
+        state.hwnd,
+        instance,
+        "Datto pool key…",
+        ID_CONTAINER_KEY,
+        false,
+    );
+    controls.agent_password = button(
+        state.hwnd,
+        instance,
+        "Datto agent password…",
+        ID_AGENT_PASSWORD,
+        false,
+    );
     controls.list = control(
         state.hwnd,
         instance,
@@ -441,7 +480,13 @@ unsafe fn initialize_window(state: &mut AppState) -> Result<()> {
         WS_EX_CLIENTEDGE,
         ID_LIST,
     );
-    controls.extract = button(state.hwnd, instance, "Extract selected…", ID_EXTRACT, false);
+    controls.extract = button(
+        state.hwnd,
+        instance,
+        "Extract file / folder…",
+        ID_EXTRACT,
+        false,
+    );
     controls.inception = button(
         state.hwnd,
         instance,
@@ -534,6 +579,8 @@ unsafe fn initialize_window(state: &mut AppState) -> Result<()> {
     EnableWindow(state.controls.browse_source, 1);
     EnableWindow(state.controls.source_path, 1);
     EnableWindow(state.controls.update, 1);
+    EnableWindow(state.controls.container_key, 1);
+    EnableWindow(state.controls.agent_password, 1);
     layout(state);
     Ok(())
 }
@@ -562,6 +609,8 @@ unsafe fn handle_command(state: &mut AppState, wparam: WPARAM) {
         ID_GO => browse(state, get_text(state.controls.path)),
         ID_UP => browse(state, parent_path(&state.current_path)),
         ID_CHOOSE_KEY => choose_key(state),
+        ID_CONTAINER_KEY => choose_container_key(state),
+        ID_AGENT_PASSWORD => choose_agent_password(state),
         ID_EXTRACT => extract_selected(state),
         ID_INCEPTION => explore_selected_image(state),
         ID_LEAVE_IMAGE => leave_inception(state, true),
@@ -624,11 +673,13 @@ unsafe fn open_source(state: &mut AppState, send: bool) {
             "Reading pool labels and datasets…"
         },
     );
+    let container_key = state.container_key_file.clone();
     spawn_job(state.hwnd, move || {
         if send {
             SourceCatalog::open_send(path).map(JobResult::Catalog)
         } else {
-            SourceCatalog::open_pool(path).map(JobResult::Catalog)
+            SourceCatalog::open_pool_with_container_key_file(path, container_key.as_deref())
+                .map(JobResult::Catalog)
         }
     });
 }
@@ -669,23 +720,24 @@ unsafe fn extract_selected(state: &mut AppState) {
     let Some(index) = selected_index(state.controls.list) else {
         show_error(
             state.hwnd,
-            "No file selected",
-            "Select a regular file in the list first.",
+            "No item selected",
+            "Select a regular file or folder in the list first.",
         );
         return;
     };
     let Some(entry) = state.entries.get(index).cloned() else {
         return;
     };
-    if entry.dirent_type != 8 {
+    if !matches!(entry.dirent_type, 4 | 8) {
         show_error(
             state.hwnd,
             "Cannot extract this item",
-            "Only regular files can be extracted.",
+            "Only regular files and folders can be extracted.",
         );
         return;
     }
-    let Some(destination) = save_file_dialog(state.hwnd, &entry.name) else {
+    let is_directory = entry.dirent_type == 4;
+    let Some(destination) = save_extraction_dialog(state.hwnd, &entry.name, is_directory) else {
         return;
     };
     let Some(catalog) = state.catalog.clone() else {
@@ -704,8 +756,31 @@ unsafe fn extract_selected(state: &mut AppState) {
     let key = state.key_file.clone();
     let inception = state.inception.clone();
     let volume_index = selected_volume_index(state);
-    set_busy(state, true, "Extracting into a sparse temporary file…");
+    set_busy(
+        state,
+        true,
+        if is_directory {
+            "Recursively extracting into a staged directory tree…"
+        } else {
+            "Extracting into a sparse temporary file…"
+        },
+    );
     spawn_job(state.hwnd, move || {
+        if is_directory {
+            let extraction = if let Some(inception) = inception {
+                let volume = inception
+                    .volumes
+                    .get(volume_index.ok_or_else(|| anyhow::anyhow!("no inner volume selected"))?)
+                    .ok_or_else(|| anyhow::anyhow!("selected inner volume no longer exists"))?;
+                inception.extract_tree(Some(&volume.selector), &source_path, &destination, true)?
+            } else {
+                catalog.extract_tree(view, &source_path, &destination, true, key.as_deref())?
+            };
+            return Ok(JobResult::TreeExtracted {
+                destination,
+                extraction,
+            });
+        }
         let (extraction, nested) = if let Some(inception) = inception {
             let volume = inception
                 .volumes
@@ -781,6 +856,11 @@ unsafe fn explore_selected_image(state: &mut AppState) {
         return;
     };
     let key = state.key_file.clone();
+    let agent_password = image_path
+        .to_ascii_lowercase()
+        .ends_with(".detto")
+        .then(|| state.agent_password_file.clone())
+        .flatten();
     set_busy(
         state,
         true,
@@ -788,10 +868,12 @@ unsafe fn explore_selected_image(state: &mut AppState) {
     );
     spawn_job(state.hwnd, move || {
         catalog
-            .inspect_inception(
+            .inspect_inception_with_datto(
                 view,
                 &image_path,
                 key.as_deref(),
+                agent_password.as_deref(),
+                None,
                 image_offset,
                 image_length,
             )
@@ -854,6 +936,34 @@ unsafe fn choose_key(state: &mut AppState) {
         if state.catalog.is_some() {
             browse(state, state.current_path.clone());
         }
+    }
+}
+
+unsafe fn choose_container_key(state: &mut AppState) {
+    if let Some(path) = open_file_dialog(
+        state.hwnd,
+        "Choose the Datto Reverse RoundTrip pool passphrase file",
+        SourceFilter::All,
+    ) {
+        state.container_key_file = Some(path.clone());
+        set_status(
+            state,
+            &format!("Datto pool passphrase selected: {}", file_label(&path)),
+        );
+    }
+}
+
+unsafe fn choose_agent_password(state: &mut AppState) {
+    if let Some(path) = open_file_dialog(
+        state.hwnd,
+        "Choose the Datto agent password file",
+        SourceFilter::All,
+    ) {
+        state.agent_password_file = Some(path.clone());
+        set_status(
+            state,
+            &format!("Datto agent password selected: {}", file_label(&path)),
+        );
     }
 }
 
@@ -983,6 +1093,43 @@ unsafe fn finish_job(state: &mut AppState, result: JobMessage) {
             show_information(state.hwnd, "Extraction complete", &message);
             set_status(state, &format!("Extracted {}", destination.display()));
         }
+        Ok(JobResult::TreeExtracted {
+            destination,
+            extraction,
+        }) => {
+            let skipped = if extraction.skipped_entries == 0 {
+                String::new()
+            } else {
+                format!(
+                    "\n\nSkipped {} symbolic link or special entr{}; none were followed.",
+                    extraction.skipped_entries,
+                    if extraction.skipped_entries == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    }
+                )
+            };
+            let message = format!(
+                "Extracted {} file{} in {} director{} to {}.\n\nLogical data: {}{}",
+                extraction.files,
+                if extraction.files == 1 { "" } else { "s" },
+                extraction.directories,
+                if extraction.directories == 1 {
+                    "y"
+                } else {
+                    "ies"
+                },
+                destination.display(),
+                format_size(extraction.logical_bytes),
+                skipped
+            );
+            show_information(state.hwnd, "Folder extraction complete", &message);
+            set_status(
+                state,
+                &format!("Extracted folder to {}", destination.display()),
+            );
+        }
         Ok(JobResult::Updated { target, sidecar }) => {
             let message = format!(
                 "Updated {} to snapshot {}.\n\nNew size: {}\nSHA-256: {}",
@@ -1073,6 +1220,8 @@ unsafe fn set_busy(state: &mut AppState, busy: bool, message: &str) {
         state.controls.open_send,
         state.controls.open_pool,
         state.controls.update,
+        state.controls.container_key,
+        state.controls.agent_password,
     ] {
         EnableWindow(control, enabled);
     }
@@ -1152,8 +1301,10 @@ unsafe fn layout(state: &AppState) {
     let browse_width = scale(84);
     let send_width = scale(118);
     let pool_width = scale(136);
+    let container_key_width = scale(124);
     let source_edit_width =
-        (width - pad * 2 - gap * 3 - browse_width - send_width - pool_width).max(scale(180));
+        (width - pad * 2 - gap * 4 - browse_width - send_width - pool_width - container_key_width)
+            .max(scale(180));
     let mut x = pad;
     MoveWindow(
         state.controls.source_path,
@@ -1169,6 +1320,15 @@ unsafe fn layout(state: &AppState) {
     MoveWindow(state.controls.open_send, x, pad, send_width, row, 1);
     x += send_width + gap;
     MoveWindow(state.controls.open_pool, x, pad, pool_width, row, 1);
+    x += pool_width + gap;
+    MoveWindow(
+        state.controls.container_key,
+        x,
+        pad,
+        container_key_width,
+        row,
+        1,
+    );
 
     let second_y = pad + row + gap;
     let view_width = (width * 42 / 100).max(scale(260));
@@ -1233,8 +1393,18 @@ unsafe fn layout(state: &AppState) {
     x += inception_width + gap;
     MoveWindow(state.controls.leave_image, x, third_y, leave_width, row, 1);
 
+    let fourth_y = third_y + row + gap;
+    MoveWindow(
+        state.controls.agent_password,
+        pad,
+        fourth_y,
+        scale(172),
+        row,
+        1,
+    );
+
     let actions_y = height - status_height - pad - row;
-    let list_y = third_y + row + gap;
+    let list_y = fourth_y + row + gap;
     let list_height = (actions_y - gap - list_y).max(scale(80));
     MoveWindow(
         state.controls.list,
@@ -1300,7 +1470,7 @@ unsafe fn button(parent: HWND, instance: HINSTANCE, text: &str, id: u16, default
     )
 }
 
-unsafe fn all_controls(controls: &Controls) -> [HWND; 18] {
+unsafe fn all_controls(controls: &Controls) -> [HWND; 20] {
     [
         controls.source_path,
         controls.browse_source,
@@ -1312,6 +1482,8 @@ unsafe fn all_controls(controls: &Controls) -> [HWND; 18] {
         controls.up,
         controls.go,
         controls.choose_key,
+        controls.container_key,
+        controls.agent_password,
         controls.list,
         controls.extract,
         controls.inception,
@@ -1412,8 +1584,18 @@ unsafe fn open_file_dialog(owner: HWND, title: &str, filter: SourceFilter) -> Op
     file_dialog(owner, title, filter, None, false)
 }
 
-unsafe fn save_file_dialog(owner: HWND, name: &str) -> Option<PathBuf> {
-    file_dialog(owner, "Extract file", SourceFilter::All, Some(name), true)
+unsafe fn save_extraction_dialog(owner: HWND, name: &str, directory: bool) -> Option<PathBuf> {
+    file_dialog(
+        owner,
+        if directory {
+            "Save recovered folder as"
+        } else {
+            "Extract file"
+        },
+        SourceFilter::All,
+        Some(name),
+        true,
+    )
 }
 
 unsafe fn file_dialog(
@@ -1484,7 +1666,7 @@ unsafe fn show_about(owner: HWND) {
     show_information(
         owner,
         "About ZFS Send Explorer",
-        "Browse snapshots in ZFS send files and exported pool members without importing or mounting them. Inception mode opens raw, QCOW2, and self-contained sparse VMDK files to explore NTFS, FAT, exFAT, and ext filesystems one layer deeper.\n\nSources are always opened read-only. Extractions and validated incremental updates preserve sparse file ranges when the destination filesystem supports them.",
+        "Browse snapshots in ZFS send files, Slide Boxes, Datto Reverse RoundTrip drives, and exported pool members without importing or mounting them. Inception mode opens raw, .datto, authenticated .detto, QCOW2, and self-contained sparse VMDK files to explore NTFS, FAT, exFAT, and ext filesystems one layer deeper.\n\nSources are always opened read-only. File and staged folder extraction plus validated incremental updates preserve sparse file ranges when the destination filesystem supports them.",
     );
 }
 

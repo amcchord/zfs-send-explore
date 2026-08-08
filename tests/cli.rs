@@ -107,6 +107,31 @@ fn real_openzfs_stream_extracts_and_applies_an_incremental() {
 }
 
 #[test]
+fn real_openzfs_stream_recursively_extracts_a_staged_tree() {
+    let temporary = tempfile::tempdir().unwrap();
+    let target = temporary.path().join("recovered");
+    let extract = run(&[
+        "extract-tree",
+        fixture("tiny-full.zfs").to_str().unwrap(),
+        "/",
+        "--output",
+        target.to_str().unwrap(),
+    ]);
+    assert!(
+        extract.status.success(),
+        "{}",
+        String::from_utf8_lossy(&extract.stderr)
+    );
+    assert_eq!(
+        fs::read(target.join("hello.txt")).unwrap(),
+        b"hello from the base snapshot\n"
+    );
+    assert!(target.join("subdir").is_dir());
+    assert!(!target.join("hello.txt.zfse.json").exists());
+    assert!(String::from_utf8_lossy(&extract.stdout).contains("3 files"));
+}
+
+#[test]
 fn checksum_corruption_is_rejected() {
     let temporary = tempfile::tempdir().unwrap();
     let corrupt = temporary.path().join("corrupt.zfs");

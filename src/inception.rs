@@ -5,11 +5,13 @@
 //! even a multi-terabyte sparse image does not need to be exported first.
 
 use crate::compression::{decode_embedded_write, decode_replay_write};
+use crate::datto::{DettoImage, derive_agent_key};
 use crate::encrypted::{DatasetKey, EncryptionParams, decompress_block, is_encrypted_object_type};
 use crate::filesystem::{DirectoryEntry, ObjectIndex, ResolvedPath, SnapshotPlan, plan_snapshot};
 use crate::pool::PoolMember;
 use crate::sparse;
 use crate::stream::{DMU_SUBSTREAM, FEATURE_RAW, RECORD_SIZE, RecordKind, StreamReader};
+use crate::tree::{RecursiveExtraction, extract_directory_tree};
 use anyhow::{Context, Result, anyhow, bail};
 use ext4_view::{Ext4, Ext4Read};
 use fat::{FatFs, FatVariant, FileId};
@@ -205,17 +207,62 @@ impl InceptionSession {
         image_offset: u64,
         image_length: Option<u64>,
     ) -> Result<Self> {
-        let source = PoolMember::open(member)?.into_image_file_with_key(
+        let pool = PoolMember::open(member)?;
+        Self::from_pool_member_at_with_keys(
+            pool,
             dataset,
             image_path,
             key_material,
-        )?;
-        Self::inspect_source_at(
-            Arc::new(source),
-            image_path.to_owned(),
+            None,
+            None,
             image_offset,
             image_length,
         )
+    }
+
+    /// Open a disk image from an already-unlocked pool. A `.detto` image is
+    /// decrypted on demand when an agent password is provided; ordinary raw,
+    /// QCOW2, and VMDK files keep the existing path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_pool_member_at_with_keys(
+        pool: PoolMember,
+        dataset: &str,
+        image_path: &str,
+        key_material: Option<&[u8]>,
+        datto_agent_password: Option<&[u8]>,
+        key_stash_path: Option<&str>,
+        image_offset: u64,
+        image_length: Option<u64>,
+    ) -> Result<Self> {
+        let is_detto = image_path.to_ascii_lowercase().ends_with(".detto");
+        let datto_key = if is_detto {
+            let password = datto_agent_password.ok_or_else(|| {
+                anyhow!(
+                    "{image_path} is an encrypted Datto .detto image; provide --agent-password-file"
+                )
+            })?;
+            let stash_path = match key_stash_path {
+                Some(path) => path.to_owned(),
+                None => find_datto_key_stash(&pool, dataset, key_material)?,
+            };
+            let stash =
+                pool.read_small_file_with_key(dataset, &stash_path, key_material, 4 * 1024 * 1024)?;
+            Some(
+                derive_agent_key(&stash, password)
+                    .with_context(|| format!("unlocking {image_path} with {stash_path}"))?,
+            )
+        } else {
+            if datto_agent_password.is_some() || key_stash_path.is_some() {
+                bail!("Datto agent credentials are only valid for a .detto image");
+            }
+            None
+        };
+        let source = pool.into_image_file_with_key(dataset, image_path, key_material)?;
+        let mut source = Arc::new(source) as Arc<dyn ImageRead>;
+        if let Some(key) = datto_key {
+            source = Arc::new(DettoImage::new(source, key)?) as Arc<dyn ImageRead>;
+        }
+        Self::inspect_source_at(source, image_path.to_owned(), image_offset, image_length)
     }
 
     /// Build a session around any bounded source so tests can exercise nested
@@ -364,6 +411,31 @@ impl InceptionSession {
         })
     }
 
+    /// Recursively extract a directory without following symlinks or special
+    /// entries. The destination tree is staged and published only after every
+    /// regular file succeeds.
+    pub fn extract_tree(
+        &self,
+        volume: Option<&str>,
+        path: &str,
+        output: &Path,
+        force: bool,
+    ) -> Result<RecursiveExtraction> {
+        // Force volume selection once so an ambiguous image fails before the
+        // staging directory is created.
+        self.select_volume(volume)?;
+        extract_directory_tree(
+            path,
+            output,
+            force,
+            |directory| self.list_directory(volume, directory),
+            |source, destination| {
+                self.extract(volume, source, destination, false)
+                    .map(|result| result.logical_size)
+            },
+        )
+    }
+
     fn select_volume(&self, selector: Option<&str>) -> Result<&VolumeInfo> {
         if let Some(selector) = selector {
             return self
@@ -410,6 +482,36 @@ impl InceptionSession {
             volume.offset,
             volume.length,
         )?))
+    }
+}
+
+fn find_datto_key_stash(
+    pool: &PoolMember,
+    dataset: &str,
+    key_material: Option<&[u8]>,
+) -> Result<String> {
+    let entries = pool
+        .list_directory_with_key(dataset, "/config", key_material)
+        .context("listing Datto agent /config directory")?;
+    let matches = entries
+        .into_iter()
+        .filter(|entry| {
+            entry.dirent_type == 8
+                && entry
+                    .name
+                    .to_ascii_lowercase()
+                    .ends_with(".encryptionkeystash")
+        })
+        .map(|entry| format!("/config/{}", entry.name))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [only] => Ok(only.clone()),
+        [] => {
+            bail!("no *.encryptionKeyStash file was found in {dataset}/config; provide --key-stash")
+        }
+        _ => bail!(
+            "multiple *.encryptionKeyStash files were found in {dataset}/config; choose one with --key-stash"
+        ),
     }
 }
 

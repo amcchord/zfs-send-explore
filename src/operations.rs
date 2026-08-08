@@ -10,6 +10,7 @@ use crate::sparse;
 use crate::stream::{
     BeginRecord, DMU_SUBSTREAM, FEATURE_RAW, ObjectRecord, RecordKind, StreamReader,
 };
+use crate::tree::{RecursiveExtraction, extract_directory_tree};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -131,6 +132,29 @@ pub fn extract_snapshot_with_key(
     let plan = plan_snapshot(stream, snapshot)?;
     let index = ObjectIndex::build_plan_with_key(stream, &plan, key_material)?;
     let resolved = index.resolve_path(path)?;
+    extract_resolved_snapshot(
+        stream,
+        &plan,
+        &index,
+        resolved,
+        output,
+        force,
+        key_material,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extract_resolved_snapshot(
+    stream: &Path,
+    plan: &SnapshotPlan,
+    index: &ObjectIndex,
+    resolved: ResolvedPath,
+    output: &Path,
+    force: bool,
+    key_material: Option<&[u8]>,
+    write_sidecar: bool,
+) -> Result<Sidecar> {
     if resolved.dirent_type != 8 {
         bail!("{} is not a regular file", resolved.normalized_path);
     }
@@ -145,7 +169,7 @@ pub fn extract_snapshot_with_key(
     sparse::prepare(temporary.as_file())?;
     replay_object(
         stream,
-        &plan,
+        plan,
         &resolved,
         temporary.as_file_mut(),
         key_material,
@@ -165,10 +189,50 @@ pub fn extract_snapshot_with_key(
         size_spill_offset: resolved.size_spill_offset,
         snapshot_guid: guid_string(index.begin.to_guid),
         sha256: sha256_file(output)?,
-        raw_state: index.raw_sidecar_state(resolved.object_id)?,
+        raw_state: if write_sidecar {
+            index.raw_sidecar_state(resolved.object_id)?
+        } else {
+            None
+        },
     };
-    save_sidecar(output, &sidecar)?;
+    if write_sidecar {
+        save_sidecar(output, &sidecar)?;
+    }
     Ok(sidecar)
+}
+
+/// Recursively extract a directory from one selected send snapshot. Files are
+/// staged as a tree and intentionally omit incremental-update sidecars.
+pub fn extract_tree_snapshot_with_key(
+    stream: &Path,
+    path: &str,
+    output: &Path,
+    force: bool,
+    snapshot: Option<&str>,
+    key_material: Option<&[u8]>,
+) -> Result<RecursiveExtraction> {
+    let plan = plan_snapshot(stream, snapshot)?;
+    let index = ObjectIndex::build_plan_with_key(stream, &plan, key_material)?;
+    extract_directory_tree(
+        path,
+        output,
+        force,
+        |directory| index.list_directory(directory),
+        |source, destination| {
+            let resolved = index.resolve_path(source)?;
+            extract_resolved_snapshot(
+                stream,
+                &plan,
+                &index,
+                resolved,
+                destination,
+                false,
+                key_material,
+                false,
+            )
+            .map(|sidecar| sidecar.logical_size)
+        },
+    )
 }
 
 pub fn encryption_requirement(
