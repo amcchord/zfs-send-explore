@@ -96,7 +96,20 @@ cargo clippy --all-targets -- -D warnings
 
 ### Native Windows client
 
-![The native Windows client selecting a snapshot from a compound send](docs/screenshots/windows/snapshot-selector.jpg)
+![The native Windows client browsing a multi-snapshot ZFS send](docs/screenshots/windows/source-browser.png)
+
+<table>
+  <tr>
+    <td width="50%">
+      <img src="docs/screenshots/windows/credential-method.png" alt="The contextual ZFS dataset-key chooser">
+      <br><sub><strong>Context-aware credentials.</strong> Enter a key securely or choose the file format configured by the dataset.</sub>
+    </td>
+    <td width="50%">
+      <img src="docs/screenshots/windows/standalone-image.png" alt="A standalone ext4 image open in the Windows client">
+      <br><sub><strong>Nested-image browsing.</strong> Explore a supported disk or filesystem image without mounting it.</sub>
+    </td>
+  </tr>
+</table>
 
 On Windows 10 or 11, build the GUI with the stable MSVC Rust toolchain and the Windows SDK:
 
