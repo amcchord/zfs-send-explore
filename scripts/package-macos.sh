@@ -17,6 +17,7 @@ swiftc -parse-as-library -O -target "$ARCH-apple-macosx13.0" \
   -o "$APP/Contents/MacOS/ZFSExplore" macos/ZFSExplore.swift
 cp "target/$RUST_TARGET/release/zfs-explore-service" "$APP/Contents/MacOS/"
 cp "target/$RUST_TARGET/release/zfs-send-extract" "$DEST/zfs-send-extract"
+"$DEST/zfs-send-extract" --version
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

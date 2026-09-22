@@ -5,7 +5,7 @@
 The extraction machine does **not** need ZFS, `libzfs`, or a ZFS kernel module. The tool never invokes `zfs` or `zpool`, and pool members are opened read-only.
 
 > [!IMPORTANT]
-> This is an early `0.5.1` implementation. The CLI, Windows UI, sidecar format, and supported on-disk profile may change. Stream and native-encryption pool fixtures are produced on little-endian OpenZFS systems. Linux validates the core end to end, and CI runs the full test suite and release packaging on native Windows.
+> This is an early `0.6.0` implementation. The CLI, desktop UIs, sidecar format, and supported on-disk profile may change. Stream and native-encryption pool fixtures are produced on little-endian OpenZFS systems. CI runs the test suite on Linux, Windows, Apple Silicon macOS, and Intel macOS, and builds native release packages.
 
 Detailed implementation and validation material lives in:
 
@@ -56,11 +56,17 @@ Portable release builds are available from the [GitHub Releases page](https://gi
 
 | Asset | Contents |
 | --- | --- |
+| `zfs-send-explore-macos-arm64.zip` | Native macOS app for Apple Silicon (M1 and later) |
+| `zfs-send-explore-macos-x86_64.zip` | Native macOS app for Intel Macs |
+| `zfs-send-extract-macos-arm64.tar.gz` | macOS Apple Silicon command-line client |
+| `zfs-send-extract-macos-x86_64.tar.gz` | macOS Intel command-line client |
 | `zfs-send-extract-linux-x86_64.tar.gz` | Linux x86-64 command-line client |
 | `zfs-send-extract-windows-x86_64.exe` | Windows x86-64 command-line client |
 | `zfs-send-explore-windows-x86_64.exe` | Native Windows x86-64 desktop client |
 | `zfs-send-explore-windows-x86_64.zip` | Both Windows executables, the illustrated Windows guide, screenshots, README, and license |
 | `SHA256SUMS.txt` | SHA-256 checksums for every downloadable program and archive |
+
+On macOS 13 or later, download the app ZIP for your Mac, extract it, and move **ZFS Explore.app** to Applications. Mac builds are ad-hoc signed and are not Apple-notarized; Gatekeeper may require approval in **System Settings → Privacy & Security → Open Anyway**. Verify the checksum and source before approving. See the [Mac recovery guide](docs/macos-client.md).
 
 Verify a Windows download before running it:
 

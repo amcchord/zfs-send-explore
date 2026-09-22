@@ -6,7 +6,8 @@ Native macOS SwiftUI app with a bundled persistent Rust service using the existi
 `client` library. The standalone CLI shares the same parser and extraction code.
 Mac packaging produces an app ZIP and a separate CLI tarball; Apple Silicon and
 Intel jobs are defined in CI and release workflows. Local execution was on Apple
-Silicon only; Intel execution and hosted workflow runs remain unverified.
+Silicon only; Intel builds and tests are qualified separately by the hosted
+release CI. Interactive real-Slide GUI testing was on Apple Silicon.
 
 ## Real Slide fixture
 
@@ -60,6 +61,6 @@ passed manual Mac GUI restoration, with its independently recorded fixture hash.
 - Local screenshots and detailed logs live under the project's dated evidence
   directory. No backup keys or real source images are included in Git.
 - Mac builds are not Developer ID signed or notarized. Windows builds remain
-  unsigned. No GitHub release was published.
+  unsigned. These limitations are disclosed in the release notes.
 - No multi-vdev or RAIDZ support was added. Live production pools were not
   exported, unmounted, stopped, or modified for this work.

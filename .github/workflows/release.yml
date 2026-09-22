@@ -76,6 +76,7 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -87,8 +88,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          test "$GITHUB_REF_NAME" = "v$version"
+          notes=(--generate-notes)
+          if [[ -f "docs/releases/$GITHUB_REF_NAME.md" ]]; then
+            notes=(--notes-file "docs/releases/$GITHUB_REF_NAME.md")
+          fi
           gh release create "$GITHUB_REF_NAME" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --title "ZFS Send Explore $GITHUB_REF_NAME" \
-            --generate-notes
+            --draft \
+            "${notes[@]}"
