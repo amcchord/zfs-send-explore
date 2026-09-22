@@ -70,8 +70,11 @@ staple/package/assessment steps only after the saved submission is accepted.
 5. Upload the signed Mac ZIPs/tarballs and DMGs to the draft release. Preserve the
    existing Windows/Linux artifacts. Recompute the complete `SHA256SUMS.txt` over
    the final release assets, not just the Mac subset.
-6. Download the final GitHub assets and verify their digests, signatures, stapled
-   tickets and the checksum manifest before publishing the draft.
+6. Run the **Verify signed Mac release** workflow with the draft release tag.
+   It downloads the exact assets on native Apple Silicon and Intel runners,
+   checks digests/signatures/tickets/Gatekeeper, and restores a synthetic file
+   with both the signed CLI and the signed desktop worker. Both jobs must pass
+   before publishing the draft.
 
 The disk images are the recommended app + CLI downloads. Bare command-line
 executables and tarballs do not support stapled notarization tickets; the CLI

@@ -1,0 +1,100 @@
+name: Verify signed Mac release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Draft or published release tag whose Mac assets are already notarized
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      MAC_ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+      - name: Download exact release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir dist
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir dist \
+            --pattern "zfs-send-explore-macos-$MAC_ARCH.zip" \
+            --pattern "zfs-send-extract-macos-$MAC_ARCH.tar.gz" \
+            --pattern "zfs-send-explore-macos-$MAC_ARCH.dmg" \
+            --pattern SHA256SUMS.txt
+          python3 - <<'PY'
+          import hashlib, pathlib
+          root = pathlib.Path('dist')
+          manifest = dict((name, digest) for digest, name in
+                          (line.split() for line in (root/'SHA256SUMS.txt').read_text().splitlines()))
+          for path in root.iterdir():
+              if path.name != 'SHA256SUMS.txt':
+                  assert hashlib.sha256(path.read_bytes()).hexdigest() == manifest[path.name], path
+          PY
+      - name: Validate signatures, notarization, tickets and Gatekeeper
+        run: |
+          mkdir app cli evidence
+          ditto -x -k "dist/zfs-send-explore-macos-$MAC_ARCH.zip" app
+          tar -xzf "dist/zfs-send-extract-macos-$MAC_ARCH.tar.gz" -C cli
+          app='app/ZFS Explore.app'
+          for binary in "$app/Contents/MacOS/ZFSExplore" "$app/Contents/MacOS/zfs-explore-service" cli/zfs-send-extract; do
+            test "$(lipo -archs "$binary")" = "$MAC_ARCH"
+            codesign --verify --strict --check-notarization "$binary"
+            codesign -dv --verbose=4 "$binary" 2>&1 | tee -a evidence/signatures.txt
+          done
+          codesign --verify --deep --strict "$app"
+          xcrun stapler validate "$app" | tee evidence/app-ticket.txt
+          xattr -w com.apple.quarantine '0083;00000000;GitHubActions;' "$app"
+          spctl --assess --type execute --verbose=4 "$app" 2>&1 | tee evidence/app-gatekeeper.txt
+          dmg="dist/zfs-send-explore-macos-$MAC_ARCH.dmg"
+          xcrun stapler validate "$dmg" | tee evidence/dmg-ticket.txt
+          spctl --assess --type open --context context:primary-signature --verbose=4 "$dmg" 2>&1 | tee evidence/dmg-gatekeeper.txt
+          mkdir "$RUNNER_TEMP/zfs-release-dmg"
+          hdiutil attach "$dmg" -readonly -nobrowse -mountpoint "$RUNNER_TEMP/zfs-release-dmg"
+          cmp cli/zfs-send-extract "$RUNNER_TEMP/zfs-release-dmg/zfs-send-extract"
+          xcrun stapler validate "$RUNNER_TEMP/zfs-release-dmg/ZFS Explore.app"
+          hdiutil detach "$RUNNER_TEMP/zfs-release-dmg"
+      - name: Run signed CLI and desktop worker on the native architecture
+        run: |
+          test "$(cli/zfs-send-extract --version)" = "zfs-send-extract ${RELEASE_TAG#v}"
+          cli/zfs-send-extract extract tests/fixtures/tiny-full.zfs /hello.txt --output evidence/cli-hello.txt
+          python3 - <<'PY'
+          import json, pathlib, subprocess, hashlib
+          expected = b'hello from the base snapshot\n'
+          assert pathlib.Path('evidence/cli-hello.txt').read_bytes() == expected
+          destination = pathlib.Path('evidence/service-hello.txt').resolve()
+          requests = [
+              {'method': 'open', 'path': str(pathlib.Path('tests/fixtures/tiny-full.zfs').resolve())},
+              {'method': 'extract', 'name': 'hello.txt', 'destination': str(destination)},
+          ]
+          result = subprocess.run(['app/ZFS Explore.app/Contents/MacOS/zfs-explore-service'],
+                                  input=''.join(json.dumps(r)+'\n' for r in requests),
+                                  text=True, capture_output=True, timeout=30, check=True)
+          responses = [json.loads(line) for line in result.stdout.splitlines()]
+          assert len(responses) == 2 and all(r['ok'] for r in responses), responses
+          assert destination.read_bytes() == expected
+          pathlib.Path('evidence/native-restore.json').write_text(json.dumps({
+              'cli_and_worker_match': True, 'sha256': hashlib.sha256(expected).hexdigest()
+          }, indent=2)+'\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: notarized-macos-verification-${{ matrix.arch }}
+          path: evidence
