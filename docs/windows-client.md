@@ -392,3 +392,12 @@ incremental updates, encrypted browsing, and an attached physical member. The
 v0.4.0 parser/service tests cover Slide/Datto inputs, LUKS detection,
 authenticated `.detto` adaptation, and staged folder recovery. Representative
 physical Slide and Datto media remain a separate hardware acceptance item.
+
+
+### Portable runtime
+
+Windows MSVC builds statically link the C runtime through `.cargo/config.toml`.
+The portable executables do not require `VCRUNTIME140.dll` or a separate Visual
+C++ Redistributable installation. Clean-machine startup and a real encrypted
+Slide pool restore were exercised on Windows 11 in AustinLand during Mac-client
+qualification; see `docs/macos-validation.md`.

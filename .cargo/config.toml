@@ -1,0 +1,4 @@
+# Portable Windows downloads must launch on a clean Windows installation,
+# without requiring the Visual C++ Redistributable beside the application.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]
