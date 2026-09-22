@@ -239,7 +239,7 @@ struct ContentView: View {
                         }.buttonStyle(.plain).foregroundStyle(.secondary)
                             .help("Change the time zone used for snapshot dates")
                         ScrollView {
-                            LazyVStack(spacing: 4) {
+                            VStack(spacing: 4) {
                                 ForEach(Array(state.views.enumerated()), id: \.offset) { i, item in
                                     Button {
                                         model.perform(["method": "select", "index": i], activity: "Opening snapshot…")
@@ -381,7 +381,7 @@ struct TimeZonePreferences: View {
             Divider()
             TextField("Find another time zone or city", text: $search).textFieldStyle(.roundedBorder)
             ScrollView {
-                LazyVStack(spacing: 2) {
+                VStack(spacing: 2) {
                     ForEach(zones, id: \.self) { zone in
                         choice(zone, zone.replacingOccurrences(of: "_", with: " "))
                     }
