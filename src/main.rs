@@ -3,6 +3,7 @@ use clap::{Args, Parser, Subcommand};
 use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
 use zeroize::Zeroizing;
+use zfs_send_extract::snapshot_time::SnapshotTimeZone;
 use zfs_send_extract::{inception::InceptionSession, operations, pool::PoolMember};
 
 #[derive(Debug, Parser)]
@@ -10,6 +11,9 @@ use zfs_send_extract::{inception::InceptionSession, operations, pool::PoolMember
 #[command(about = "Browse ZFS send streams and offline pool members without ZFS")]
 #[command(version)]
 struct Cli {
+    /// Time zone for displayed snapshot dates: local, UTC, or an IANA name.
+    #[arg(long, global = true, default_value = "local", value_name = "ZONE")]
+    time_zone: SnapshotTimeZone,
     #[command(subcommand)]
     command: Command,
 }
@@ -28,6 +32,9 @@ enum Command {
     Snapshots {
         /// ZFS send file, including compound or concatenated streams.
         stream: PathBuf,
+        /// Print original timestamps and snapshot metadata as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// List one directory from a snapshot in a send file.
     List {
@@ -122,6 +129,9 @@ enum PoolCommand {
         member: PathBuf,
         /// Restrict output to one full dataset name.
         dataset: Option<String>,
+        /// Print original timestamps and snapshot metadata as JSON.
+        #[arg(long)]
+        json: bool,
         #[command(flatten)]
         container: ContainerKeyInput,
     },
@@ -384,6 +394,9 @@ fn main() -> Result<()> {
                         "snapshot: {} ({mode}, to 0x{:016x}, from 0x{:016x})",
                         snapshot.dataset_name, snapshot.to_guid, snapshot.from_guid,
                     );
+                    if let Some(time) = cli.time_zone.format(snapshot.creation_time) {
+                        println!("  created: {time}");
+                    }
                 }
                 println!("stream bytes: {}", inspection.stream_bytes);
                 for (name, count) in inspection.records {
@@ -391,8 +404,13 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::Snapshots { stream } => {
-            for snapshot in operations::snapshots(&stream)? {
+        Command::Snapshots { stream, json } => {
+            let snapshots = operations::snapshots(&stream)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&snapshots)?);
+                return Ok(());
+            }
+            for snapshot in snapshots {
                 let kind = if snapshot.from_guid == 0 {
                     "full"
                 } else {
@@ -404,8 +422,13 @@ fn main() -> Result<()> {
                     "plain"
                 };
                 println!(
-                    "{kind}\t{mode}\t0x{:016x}\t0x{:016x}\t{}",
-                    snapshot.to_guid, snapshot.from_guid, snapshot.dataset_name
+                    "{kind}\t{mode}\t0x{:016x}\t0x{:016x}\t{}\t{}",
+                    snapshot.to_guid,
+                    snapshot.from_guid,
+                    snapshot.dataset_name,
+                    cli.time_zone
+                        .format(snapshot.creation_time)
+                        .unwrap_or_else(|| "Time unavailable".into())
                 );
             }
         }
@@ -495,12 +518,12 @@ fn main() -> Result<()> {
             );
         }
         Command::Inception { command } => run_inception(command)?,
-        Command::Pool { command } => run_pool(command)?,
+        Command::Pool { command } => run_pool(command, cli.time_zone)?,
     }
     Ok(())
 }
 
-fn run_pool(command: PoolCommand) -> Result<()> {
+fn run_pool(command: PoolCommand, time_zone: SnapshotTimeZone) -> Result<()> {
     match command {
         PoolCommand::Inspect {
             member,
@@ -541,16 +564,25 @@ fn run_pool(command: PoolCommand) -> Result<()> {
         PoolCommand::Snapshots {
             member,
             dataset,
+            json,
             container,
         } => {
             let pool = open_pool_member(&member, &container)?;
-            for snapshot in pool.snapshots(dataset.as_deref())? {
+            let snapshots = pool.snapshots(dataset.as_deref())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&snapshots)?);
+                return Ok(());
+            }
+            for snapshot in snapshots {
                 println!(
-                    "{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}",
                     snapshot.guid,
                     snapshot.creation_txg,
                     snapshot.creation_time,
-                    snapshot.full_name
+                    snapshot.full_name,
+                    time_zone
+                        .format(snapshot.creation_time)
+                        .unwrap_or_else(|| "Time unavailable".into())
                 );
             }
         }

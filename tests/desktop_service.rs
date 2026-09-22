@@ -59,6 +59,13 @@ fn desktop_restores_without_overwriting_and_preserves_session_after_errors() {
     let opened = desktop.request(json!({"method":"open", "path":fixture("tiny-full.zfs")}));
     assert_eq!(opened["ok"], true);
     assert_eq!(opened["result"]["title"], "tiny-full.zfs");
+    let metadata =
+        zfs_send_extract::operations::snapshots(std::path::Path::new(&fixture("tiny-full.zfs")))
+            .unwrap();
+    let view = &opened["result"]["views"][0];
+    assert_eq!(view["selector"], format!("0x{:016x}", metadata[0].to_guid));
+    let expected_time = (metadata[0].creation_time > 0).then_some(metadata[0].creation_time);
+    assert_eq!(view["created_at"], json!(expected_time));
     let output = tempfile::tempdir().unwrap();
     let destination = output.path().join("hello.txt");
     let request = json!({"method":"extract", "name":"hello.txt", "destination":destination});

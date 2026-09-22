@@ -19,6 +19,25 @@ fn run(arguments: &[&str]) -> Output {
         .expect("run CLI")
 }
 
+#[test]
+fn snapshot_time_zone_changes_display_but_not_json_metadata() {
+    let source = fixture("tiny-full.zfs");
+    let path = source.to_str().unwrap();
+    let utc = run(&["snapshots", path, "--time-zone", "UTC"]);
+    let pacific = run(&["snapshots", path, "--time-zone", "America/Los_Angeles"]);
+    assert!(utc.status.success() && pacific.status.success());
+    assert_ne!(utc.stdout, pacific.stdout);
+    let utc_json = run(&["snapshots", path, "--json", "--time-zone", "UTC"]);
+    let local_json = run(&["--time-zone", "local", "snapshots", path, "--json"]);
+    assert!(utc_json.status.success() && local_json.status.success());
+    assert_eq!(utc_json.stdout, local_json.stdout);
+    let metadata: serde_json::Value = serde_json::from_slice(&utc_json.stdout).unwrap();
+    assert!(metadata[0]["creation_time"].is_u64());
+    let invalid = run(&["snapshots", path, "--time-zone", "Mars/Olympus"]);
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("Unknown time zone"));
+}
+
 fn sha256(path: &Path) -> String {
     format!("{:x}", Sha256::digest(fs::read(path).unwrap()))
 }
@@ -338,6 +357,15 @@ fn native_encrypted_pool_lists_and_extracts_with_an_authenticated_key() {
     assert!(directory.contains("greeting.txt"));
 
     let catalog = SourceCatalog::open_pool(&member).unwrap();
+    let mut previous = u64::MAX;
+    for view in &catalog.views {
+        if let Some(time) = view.created_at {
+            assert!(time <= previous, "snapshot dates must be newest first");
+            previous = time;
+        } else if !view.selector.contains('@') {
+            assert!(view.label.contains("current"));
+        }
+    }
     assert_eq!(catalog.kind, SourceKind::PoolMember);
     let encrypted_view = catalog
         .views

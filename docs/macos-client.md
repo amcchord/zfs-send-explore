@@ -54,3 +54,14 @@ pool layouts are supported; RAIDZ and striped/multiple-vdev pools are not.
 
 Long operations show an indeterminate activity indicator and run off the main
 thread. Byte-level progress and cancel/resume are not yet provided.
+
+## Snapshot dates
+
+Snapshot creation times are shown as readable dates in your Mac's current time
+zone by default. Pool snapshots are newest first. Click **Times** above the
+snapshot list or use **ZFS Explore → Settings…** (Command-comma) to choose UTC
+or search for another city/time zone. The preference persists across restarts.
+The original snapshot ID remains beneath the date and in the hover detail.
+Changing the display zone preserves your selected snapshot, browsing location
+and in-memory key. Offsets are included to distinguish repeated hours at the
+end of daylight saving time. Undated/current views retain their original label.

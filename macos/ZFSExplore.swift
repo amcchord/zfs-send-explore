@@ -1,7 +1,10 @@
 import AppKit
 import SwiftUI
 
-struct BackupView: Decodable { let label: String; let encrypted: Bool; let key_format: String? }
+struct BackupView: Decodable {
+    let label: String; let encrypted: Bool; let key_format: String?
+    let created_at: UInt64?; let selector: String
+}
 struct Entry: Decodable, Identifiable {
     let name: String; let directory: Bool; let regular: Bool; let size: UInt64?
     var id: String { name }
@@ -80,6 +83,7 @@ final class Engine: @unchecked Sendable {
     @Published var secret = ""
     @Published var showUnlock = false
     @Published var showPath = false
+    @Published var showPreferences = false
     @Published var sourcePath = ""
     private let engine = Engine()
     var selected: Entry? { state?.entries.first { $0.name == selection } }
@@ -147,6 +151,8 @@ final class Engine: @unchecked Sendable {
 
 struct ContentView: View {
     @ObservedObject var model: Recovery
+    @AppStorage("snapshotTimeZone") private var timeZone = "local"
+    @State private var timeZoneRevision = 0
     var body: some View {
         HStack(spacing: 0) {
             sidebar.frame(width: 270)
@@ -203,6 +209,12 @@ struct ContentView: View {
             }.padding(28).frame(width: 480)
         }
         .onOpenURL { model.open($0) }
+        .sheet(isPresented: $model.showPreferences) {
+            TimeZonePreferences(selection: $timeZone)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .NSSystemTimeZoneDidChange)) { _ in
+            timeZoneRevision += 1
+        }
     }
     var sidebar: some View {
         VStack(alignment: .leading, spacing: 22) {
@@ -219,17 +231,31 @@ struct ContentView: View {
                 if !state.views.isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("SNAPSHOTS & DATASETS").font(.caption.bold()).foregroundStyle(.secondary)
+                        Button {
+                            model.showPreferences = true
+                        } label: {
+                            Label("Times: \(SnapshotTime.zoneLabel(timeZone))", systemImage: "globe")
+                                .font(.caption).lineLimit(2)
+                        }.buttonStyle(.plain).foregroundStyle(.secondary)
+                            .help("Change the time zone used for snapshot dates")
                         ScrollView {
-                            VStack(spacing: 4) {
+                            LazyVStack(spacing: 4) {
                                 ForEach(Array(state.views.enumerated()), id: \.offset) { i, item in
                                     Button {
                                         model.perform(["method": "select", "index": i], activity: "Opening snapshot…")
                                     } label: {
                                         HStack(alignment: .top, spacing: 8) {
                                             Image(systemName: item.encrypted ? "lock" : "clock").frame(width: 16)
-                                            Text(item.label).font(.system(size: 12)).lineLimit(4).frame(maxWidth: .infinity, alignment: .leading)
+                                            VStack(alignment: .leading, spacing: 5) {
+                                                if let date = SnapshotTime.label(item.created_at, zone: timeZone) {
+                                                    Text(date).font(.system(size: 12, weight: .medium)).fixedSize(horizontal: false, vertical: true)
+                                                    Text(item.label).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(2)
+                                                } else {
+                                                    Text(item.label).font(.system(size: 12)).lineLimit(4)
+                                                }
+                                            }.frame(maxWidth: .infinity, alignment: .leading)
                                         }.padding(10).background(state.view == i ? Color.accentColor.opacity(0.13) : .clear, in: RoundedRectangle(cornerRadius: 7))
-                                    }.buttonStyle(.plain)
+                                    }.buttonStyle(.plain).help(item.label)
                                 }
                             }
                         }
@@ -336,6 +362,50 @@ struct ContentView: View {
     }
 }
 
+struct TimeZonePreferences: View {
+    @Binding var selection: String
+    @Environment(\.dismiss) private var dismiss
+    @State private var search = ""
+    private var zones: [String] {
+        TimeZone.knownTimeZoneIdentifiers.filter {
+            $0 != "UTC" && (search.isEmpty || $0.replacingOccurrences(of: "_", with: " ").localizedCaseInsensitiveContains(search))
+        }.sorted()
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Snapshot time zone").font(.title2.bold())
+            Text("Show backup dates in the time zone that makes sense to you. This changes how dates appear; the backup stays unchanged.")
+                .foregroundStyle(.secondary)
+            choice("local", "Use my Mac’s time zone", detail: TimeZone.autoupdatingCurrent.identifier)
+            choice("UTC", "UTC", detail: "Coordinated Universal Time")
+            Divider()
+            TextField("Find another time zone or city", text: $search).textFieldStyle(.roundedBorder)
+            ScrollView {
+                LazyVStack(spacing: 2) {
+                    ForEach(zones, id: \.self) { zone in
+                        choice(zone, zone.replacingOccurrences(of: "_", with: " "))
+                    }
+                    if zones.isEmpty { Text("No matching time zones").foregroundStyle(.secondary).padding() }
+                }
+            }.frame(height: 220)
+            Text("Selected: \(SnapshotTime.zoneLabel(selection))").font(.caption)
+            HStack { Text("Saved automatically for future sessions.").font(.caption).foregroundStyle(.secondary); Spacer(); Button("Done") { dismiss() }.keyboardShortcut(.defaultAction) }
+        }.padding(26).frame(width: 510)
+    }
+    func choice(_ identifier: String, _ title: String, detail: String? = nil) -> some View {
+        Button { selection = identifier } label: {
+            HStack(spacing: 10) {
+                Image(systemName: selection == identifier ? "checkmark.circle.fill" : "circle").foregroundStyle(selection == identifier ? Color.accentColor : .secondary)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title)
+                    if let detail { Text(detail).font(.caption).foregroundStyle(.secondary) }
+                }
+                Spacer()
+            }.padding(8).contentShape(Rectangle())
+        }.buttonStyle(.plain).accessibilityLabel(title).accessibilityValue(selection == identifier ? "Selected" : "")
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) { NSApp.setActivationPolicy(.regular); NSApp.activate(ignoringOtherApps: true) }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -348,6 +418,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Window("ZFS Explore", id: "recovery") { ContentView(model: model).tint(.teal) }
             .defaultSize(width: 1120, height: 740)
             .commands {
+                CommandGroup(replacing: .appSettings) { Button("Settings…") { model.showPreferences = true }.keyboardShortcut(",").disabled(model.busy) }
                 CommandGroup(replacing: .newItem) { Button("Open Backup…") { model.chooseSource() }.keyboardShortcut("o").disabled(model.busy) }
             }
     }

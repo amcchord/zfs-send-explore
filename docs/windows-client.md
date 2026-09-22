@@ -401,3 +401,12 @@ The portable executables do not require `VCRUNTIME140.dll` or a separate Visual
 C++ Redistributable installation. Clean-machine startup and a real encrypted
 Slide pool restore were exercised on Windows 11 in AustinLand during Mac-client
 qualification; see `docs/macos-validation.md`.
+
+## Snapshot dates
+
+Pool snapshots are newest first and show their recorded creation time. Choose
+**Settings → Snapshot time zone** for this computer's local time (the default),
+UTC, or a named zone grouped by region. This preference is saved in the existing
+settings file. Changing it updates the labels while preserving the selected
+snapshot and current directory. Original snapshot IDs remain in the labels,
+and UTC offsets distinguish repeated daylight-saving hours.

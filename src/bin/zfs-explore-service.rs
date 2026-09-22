@@ -123,6 +123,7 @@ impl Session {
                 .map(|v| {
                     json!({
                         "label": v.label, "encrypted": v.encrypted, "key_format": v.key_format,
+                        "created_at": v.created_at, "selector": v.selector,
                     })
                 })
                 .collect()

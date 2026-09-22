@@ -552,3 +552,20 @@ See [`docs/format-notes.md`](docs/format-notes.md) for the implementation's form
 ## License
 
 Apache-2.0. See [`LICENSE`](LICENSE).
+
+### Snapshot dates and time zones
+
+Pool snapshots appear newest first, using their recorded ZFS creation time.
+Mac and Windows default to the current computer's time zone. On Mac, click the
+zone above the snapshot list or choose **ZFS Explore → Settings…**. On Windows,
+choose **Settings → Snapshot time zone**. Choices are saved for future sessions;
+they change display only and leave snapshot identifiers and backup bytes intact.
+
+The CLI adds a readable date column to snapshot lists while retaining the
+existing metadata columns. Use `--time-zone local`, `--time-zone UTC` or an IANA
+name such as `--time-zone America/New_York`. `snapshots --json` and
+`pool snapshots --json` retain original numeric UTC timestamps. Missing
+creation times remain unlabeled rather than displaying January 1970.
+
+A [real Linux history test](https://mcchord.net/zfs-send-explore-test/LINUX-HISTORY-TESTING.md)
+includes all 36 retained snapshots and known changing-file hashes.
