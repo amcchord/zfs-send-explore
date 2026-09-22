@@ -98,7 +98,7 @@ The GUI recognizes:
 
 Sources and all inner layers remain read-only. Nested file reads are served on demand through the active filesystem; a multi-terabyte child image is not materialized just to inspect its partitions. An extracted inner file is built in a same-directory sparse temporary file, synchronized, hashed with SHA-256, and moved into place only after success. It receives no `.zfse.json` sidecar because it is not a directly addressable ZFS object.
 
-The initial implementation intentionally rejects QCOW1, QCOW2 backing-file overlays and encryption, split/flat/stream-optimized VMDKs, compressed NTFS data streams, EFS-encrypted files, and non-UTF-8 ext names. ext symlinks are visible but are not followed for extraction. An error dialog reports the unsupported layer instead of falling back to potentially incorrect raw interpretation.
+The initial implementation intentionally rejects QCOW1, QCOW2 backing-file overlays and encryption, split/flat/stream-optimized VMDKs, EFS-encrypted files, and non-UTF-8 ext names. ext symlinks are visible but are not followed for extraction. An error dialog reports the unsupported layer instead of falling back to potentially incorrect raw interpretation.
 
 ## Extract a file or folder
 
@@ -330,7 +330,7 @@ The **Settings** menu persists to `%APPDATA%\ZFS Send Explorer\settings.json`. I
 | **No supported inner filesystem** | Use the offered **Extract the image file instead** or **Set an advanced image range** action; CLI `inception inspect` provides per-volume diagnostics. |
 | A valid filesystem starts after an appliance header | Choose **Set an advanced image range**, enter its exact byte offset and optional length, then select **Open disk image…** again. |
 | QCOW or VMDK reports an unsupported feature | Use a self-contained QCOW2 v2/v3 or VMDK `monolithicSparse` image. Backing files and external/split VMDK extents are not guessed or searched for. |
-| An inner NTFS file cannot be extracted | NTFS compression and EFS encryption are currently rejected; select an ordinary unnamed `$DATA` file stream. |
+| An inner NTFS file cannot be extracted | Standard NTFS LZNT1 compression is supported. EFS encryption remains unsupported; select an unencrypted unnamed `$DATA` stream. |
 | Sparse extraction has the right length but consumes full space | The destination filesystem may not support Windows sparse controls, or a storage layer may materialize holes. Logical content remains authoritative. |
 | An older build reports **Incorrect function** for a raw drive | Update to a build containing the Windows physical-drive length probe; ordinary file metadata calls do not work for every raw device handle. |
 

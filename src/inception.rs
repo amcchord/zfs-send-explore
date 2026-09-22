@@ -8,6 +8,7 @@ use crate::compression::{decode_embedded_write, decode_replay_write};
 use crate::datto::{DettoImage, derive_agent_key};
 use crate::encrypted::{DatasetKey, EncryptionParams, decompress_block, is_encrypted_object_type};
 use crate::filesystem::{DirectoryEntry, ObjectIndex, ResolvedPath, SnapshotPlan, plan_snapshot};
+use crate::ntfs_compression::CompressedStream;
 use crate::pool::PoolMember;
 use crate::sparse;
 use crate::stream::{DMU_SUBSTREAM, FEATURE_RAW, RECORD_SIZE, RecordKind, StreamReader};
@@ -1078,12 +1079,23 @@ fn extract_ntfs(
         .transpose()?
         .ok_or_else(|| anyhow!("{path:?} has no unnamed NTFS $DATA stream"))?;
     let data_attribute = data_item.to_attribute()?;
-    let flags = data_attribute.flags();
-    if flags.contains(NtfsAttributeFlags::COMPRESSED) {
-        bail!("{path:?} uses NTFS compression, which inception mode cannot decode yet");
-    }
-    if flags.contains(NtfsAttributeFlags::ENCRYPTED) {
-        bail!("{path:?} is EFS-encrypted; an unencrypted NTFS $DATA stream is required");
+    validate_ntfs_image_attribute(path, &data_attribute)?;
+    if data_attribute
+        .flags()
+        .contains(NtfsAttributeFlags::COMPRESSED)
+        && !data_attribute.is_resident()
+    {
+        let mut compressed = CompressedStream::open(&file, &mut reader)?;
+        let length = compressed.len();
+        let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
+        let mut offset = 0;
+        while offset < length {
+            let count = (length - offset).min(buffer.len() as u64) as usize;
+            compressed.read_exact_at(&mut reader, offset, &mut buffer[..count])?;
+            target.write(&buffer[..count])?;
+            offset += count as u64;
+        }
+        return Ok(length);
     }
     let mut value = data_attribute.value(&mut reader)?;
     let length = value.len();
@@ -1208,7 +1220,7 @@ fn inner_file_length(
                 .transpose()?
                 .ok_or_else(|| anyhow!("{path:?} has no unnamed NTFS $DATA stream"))?;
             let attribute = item.to_attribute()?;
-            validate_ntfs_image_attribute(path, attribute.flags())?;
+            validate_ntfs_image_attribute(path, &attribute)?;
             Ok(attribute.value_length())
         }
         FilesystemKind::Ext4 => {
@@ -1259,10 +1271,20 @@ fn read_inner_file_exact_at(
                 .transpose()?
                 .ok_or_else(|| anyhow!("{path:?} has no unnamed NTFS $DATA stream"))?;
             let attribute = item.to_attribute()?;
-            validate_ntfs_image_attribute(path, attribute.flags())?;
-            let mut value = attribute.value(&mut reader)?;
-            value.seek(&mut reader, SeekFrom::Start(offset))?;
-            value.read_exact(&mut reader, buffer)?;
+            validate_ntfs_image_attribute(path, &attribute)?;
+            if attribute.flags().contains(NtfsAttributeFlags::COMPRESSED)
+                && !attribute.is_resident()
+            {
+                CompressedStream::open(&file, &mut reader)?.read_exact_at(
+                    &mut reader,
+                    offset,
+                    buffer,
+                )?;
+            } else {
+                let mut value = attribute.value(&mut reader)?;
+                value.seek(&mut reader, SeekFrom::Start(offset))?;
+                value.read_exact(&mut reader, buffer)?;
+            }
         }
         FilesystemKind::Ext4 => {
             let fs = open_ext4(source)?;
@@ -1274,10 +1296,16 @@ fn read_inner_file_exact_at(
     Ok(())
 }
 
-fn validate_ntfs_image_attribute(path: &str, flags: NtfsAttributeFlags) -> Result<()> {
-    if flags.contains(NtfsAttributeFlags::COMPRESSED) {
-        bail!("{path:?} uses NTFS compression, which inception mode cannot decode yet");
+fn validate_ntfs_image_attribute(
+    path: &str,
+    attribute: &ntfs::NtfsAttribute<'_, '_>,
+) -> Result<()> {
+    let record = attribute.record_data();
+    let compression = record[12];
+    if compression > 1 {
+        bail!("{path:?} uses unsupported NTFS compression format {compression}");
     }
+    let flags = attribute.flags();
     if flags.contains(NtfsAttributeFlags::ENCRYPTED) {
         bail!("{path:?} is EFS-encrypted; an unencrypted NTFS $DATA stream is required");
     }
@@ -2164,6 +2192,109 @@ mod tests {
         result
             .err()
             .expect("inception inspection unexpectedly succeeded")
+    }
+
+    fn compressed_ntfs_fixture() -> Vec<u8> {
+        decode_zstd_fixture(
+            "ntfs-compressed",
+            include_str!("../tests/fixtures/inception/ntfs-compressed.img.zst.b64"),
+            "48caf0b566c14b5f80bb12e348a2f02d5b68804dfc5e60409591641704806930",
+            "5e25fa9a6285e94da771601492e3f00b0cc38a064ca404d0ff6da6d85aa6647d",
+            16_777_216,
+        )
+    }
+
+    #[test]
+    fn malformed_ntfs_compression_preserves_existing_destination() {
+        let raw = compressed_ntfs_fixture();
+        let (ntfs, mut reader) = super::open_ntfs(Arc::new(Bytes(raw.clone()))).unwrap();
+        let file = super::resolve_ntfs(&ntfs, &mut reader, "/mixed.bin").unwrap();
+        let item = file.data(&mut reader, "").unwrap().unwrap();
+        let attribute = item.to_attribute().unwrap();
+        let record = attribute.position().value().unwrap().get() as usize;
+        let data = attribute
+            .value(&mut reader)
+            .unwrap()
+            .data_position()
+            .value()
+            .unwrap()
+            .get() as usize;
+        for (offset, replacement) in [
+            (record + 12, vec![2]),
+            (record + 34, vec![31]),
+            (record + 32, vec![0, 0]),
+            (record + 56, u64::MAX.to_le_bytes().to_vec()),
+            (data, vec![0, 0]),
+        ] {
+            let mut corrupt = raw.clone();
+            corrupt[offset..offset + replacement.len()].copy_from_slice(&replacement);
+            let session =
+                InceptionSession::inspect_source(Arc::new(Bytes(corrupt)), "/corrupt.img".into())
+                    .unwrap();
+            let temporary = tempfile::tempdir().unwrap();
+            let output = temporary.path().join("existing.bin");
+            std::fs::write(&output, b"keep existing contents").unwrap();
+            assert!(session.extract(None, "/mixed.bin", &output, true).is_err());
+            assert_eq!(std::fs::read(&output).unwrap(), b"keep existing contents");
+            assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn compressed_ntfs_restores_mixed_units_fragments_and_nested_images() {
+        let raw = compressed_ntfs_fixture();
+        let source: Arc<dyn ImageRead> = Arc::new(Bytes(raw));
+        let session =
+            InceptionSession::inspect_source(source.clone(), "/compressed.img".into()).unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        for (path, length, hash) in [
+            (
+                "/mixed.bin",
+                262_810,
+                "6adee2e4ed78f7be62d38e46641a9cf1f5571126bac3855201d67da98cbf18c8",
+            ),
+            (
+                "/fragmented.bin",
+                8_388_608,
+                "7ae8d28492617099fc32eece636f33ba1dc31f83ab7ad0dae49aafd0e82f65b9",
+            ),
+        ] {
+            let actual = extract_bytes(&session, path, &temporary.path().join(&path[1..]));
+            assert_eq!(actual.len(), length);
+            assert_eq!(format!("{:x}", Sha256::digest(&actual)), hash);
+            // Exercise random reads across unit and attribute-list boundaries.
+            for offset in [0, 4090, 65_530, length / 2, length - 23] {
+                let count = (length - offset).min(9000);
+                let mut range = vec![0; count];
+                super::read_inner_file_exact_at(
+                    source.clone(),
+                    FilesystemKind::Ntfs,
+                    path,
+                    offset as u64,
+                    &mut range,
+                )
+                .unwrap();
+                assert_eq!(range, actual[offset..offset + count]);
+            }
+        }
+        assert_eq!(
+            extract_bytes(&session, "/tiny.txt", &temporary.path().join("tiny.txt")),
+            b"compressed directory, resident file\n"
+        );
+        assert!(
+            extract_bytes(&session, "/empty.bin", &temporary.path().join("empty.bin")).is_empty()
+        );
+        let child = session
+            .inspect_child_image_at(None, "/inner.img", 0, None)
+            .unwrap();
+        assert_eq!(
+            extract_bytes(
+                &child,
+                "/subdir/NESTED.TXT",
+                &temporary.path().join("nested.txt")
+            ),
+            b"nested file content 16\n"
+        );
     }
 
     #[test]

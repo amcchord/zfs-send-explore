@@ -21,3 +21,33 @@ The FAT32 image fills the upstream FAT32 coverage gap (the upstream repository i
 - `/SPARSE.BIN`: `HEAD`, zero bytes through offset 4 MiB, then `TAIL`
 
 All six raw images were recompressed with `zstd -19` before base64 encoding. The SHA-256 values above are asserted by the fixture-loading test, so accidental fixture drift is reported independently of parser behavior.
+
+## NTFS compression fixture (v0.8.0)
+
+`ntfs-compressed.img.zst.b64` is a locally generated, synthetic 16 MiB NTFS
+volume, made with `mkntfs -F -Q -c 4096 -L ZFSECompression`, mounted with
+`ntfs-3g -o compression`, with root attribute `0x810` (directory + compression).
+No lab data or credentials are included. Root compression is inherited by:
+
+- `mixed.bin`: 65,536 A bytes; 2,048 concatenated SHA256 hashes of consecutive
+  little-endian u32 values 0–2047; 65,536 zero bytes; 65,536 B bytes; then
+  `last partial unit\n` repeated 37 times. This covers compressed, incompressible,
+  sparse and partial units in one file.
+- `fragmented.bin`: 128 units, each 65,536 copies of byte i+1. Each unit was
+  appended and closed, followed by creating `fillerNNN.bin` with 128 concatenated
+  SHA256 hashes of little-endian (i,j) u32 pairs. This creates multiple MFT
+  extents and a nonresident attribute list.
+- `tiny.txt`: `compressed directory, resident file\n`; `empty.bin`: empty.
+- `inner.img`: the unchanged FAT16 fixture above, copied into the compressed
+  directory. The test browses it directly and restores its nested text file.
+
+Raw SHA256: `5e25fa9a6285e94da771601492e3f00b0cc38a064ca404d0ff6da6d85aa6647d`.
+Zstd SHA256: `48caf0b566c14b5f80bb12e348a2f02d5b68804dfc5e60409591641704806930`.
+Raw length16,777,216; compressed length728,986. The fixed fixture hashes and
+independent content hashes are asserted in the tests. Reformatting changes
+filesystem serial numbers/timestamps; content generation remains reproducible.
+
+The NTFS dependency is pinned locally with one metadata accessor; see
+[`vendor/ntfs/LOCAL-CHANGES.md`](../../../vendor/ntfs/LOCAL-CHANGES.md). The decoder
+follows Microsoft's [attribute record](https://learn.microsoft.com/en-us/windows/win32/devnotes/attribute-record-header)
+and [LZNT1 format](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-xca/94164d22-2928-4417-876e-d193766c4db6).
