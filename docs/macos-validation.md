@@ -51,7 +51,7 @@ passed manual Mac GUI restoration, with its independently recorded fixture hash.
   reserves enough width for the label. Mac browsing also has an explicit Restore
   button, readable partition sizes, search, and a checksum confirmation.
 
-## Checks and limits
+## Original v0.6.0 checks and limits
 
 - 64 Rust tests passed on Apple Silicon macOS and native x86-64 Windows.
 - Rust formatting and clippy with warnings denied passed on macOS.
@@ -64,3 +64,10 @@ passed manual Mac GUI restoration, with its independently recorded fixture hash.
   unsigned. These limitations are disclosed in the release notes.
 - No multi-vdev or RAIDZ support was added. Live production pools were not
   exported, unmounted, stopped, or modified for this work.
+
+## v0.6.1 distribution signing
+
+Mac release executables now receive timestamped Developer ID signatures with
+hardened runtime and Apple notarization. Apps and disk images have stapled
+tickets. The [signing procedure](macos-signing.md) records required validation
+before the draft release is published. Windows signing is unchanged.

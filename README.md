@@ -5,7 +5,7 @@
 The extraction machine does **not** need ZFS, `libzfs`, or a ZFS kernel module. The tool never invokes `zfs` or `zpool`, and pool members are opened read-only.
 
 > [!IMPORTANT]
-> This is an early `0.6.0` implementation. The CLI, desktop UIs, sidecar format, and supported on-disk profile may change. Stream and native-encryption pool fixtures are produced on little-endian OpenZFS systems. CI runs the test suite on Linux, Windows, Apple Silicon macOS, and Intel macOS, and builds native release packages.
+> This is an early `0.6.1` implementation. The CLI, desktop UIs, sidecar format, and supported on-disk profile may change. Stream and native-encryption pool fixtures are produced on little-endian OpenZFS systems. CI runs the test suite on Linux, Windows, Apple Silicon macOS, and Intel macOS, and builds native release packages.
 
 Detailed implementation and validation material lives in:
 
@@ -56,6 +56,8 @@ Portable release builds are available from the [GitHub Releases page](https://gi
 
 | Asset | Contents |
 | --- | --- |
+| `zfs-send-explore-macos-arm64.dmg` | Signed and notarized Apple Silicon app + CLI (recommended) |
+| `zfs-send-explore-macos-x86_64.dmg` | Signed and notarized Intel app + CLI (recommended) |
 | `zfs-send-explore-macos-arm64.zip` | Native macOS app for Apple Silicon (M1 and later) |
 | `zfs-send-explore-macos-x86_64.zip` | Native macOS app for Intel Macs |
 | `zfs-send-extract-macos-arm64.tar.gz` | macOS Apple Silicon command-line client |
@@ -66,7 +68,7 @@ Portable release builds are available from the [GitHub Releases page](https://gi
 | `zfs-send-explore-windows-x86_64.zip` | Both Windows executables, the illustrated Windows guide, screenshots, README, and license |
 | `SHA256SUMS.txt` | SHA-256 checksums for every downloadable program and archive |
 
-On macOS 13 or later, download the app ZIP for your Mac, extract it, and move **ZFS Explore.app** to Applications. Mac builds are ad-hoc signed and are not Apple-notarized; Gatekeeper may require approval in **System Settings → Privacy & Security → Open Anyway**. Verify the checksum and source before approving. See the [Mac recovery guide](docs/macos-client.md).
+On macOS 13 or later, download the disk image for your Mac and drag **ZFS Explore.app** to Applications. The disk image also includes the standalone CLI. Published v0.6.1 Mac apps and CLIs are Developer ID signed and Apple-notarized; the apps and disk images carry stapled tickets. The app ZIP and CLI tarball are also available. macOS may still show its normal first-open confirmation. See the [Mac recovery guide](docs/macos-client.md).
 
 Verify a Windows download before running it:
 
@@ -113,7 +115,7 @@ Choose a backup, select a snapshot, unlock if needed, and browse folders or nest
 disk images. **Restore…** saves a copy to a new destination and shows its SHA-256.
 The source is read-only and existing destination files are preserved. See the
 [Mac guide](docs/macos-client.md) for packaging, key handling, and current limits.
-Mac builds are ad-hoc signed; Developer ID signing and notarization are pending.
+Local development builds are ad-hoc signed. The [Mac release signing procedure](docs/macos-signing.md) signs and notarizes the CI-built archives before publication.
 
 ### Native Windows client
 
