@@ -1,5 +1,6 @@
 fn main() {
     println!("cargo:rerun-if-changed=packaging/windows/zfs-send-explore.rc");
+    println!("cargo:rerun-if-changed=packaging/icons/ZFSExplore.ico");
     println!("cargo:rerun-if-changed=packaging/windows/zfs-send-explore-windows.exe.manifest");
 
     let target = std::env::var("TARGET").unwrap_or_default();

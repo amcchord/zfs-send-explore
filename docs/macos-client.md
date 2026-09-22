@@ -22,6 +22,24 @@ first-open confirmation and organization device policies still apply.
 
 For maintainers, see the [signing and notarization procedure](macos-signing.md).
 
+## Install by dragging to Applications
+
+Open the disk image and drag **ZFS Explore.app** onto **Applications**. Eject
+the disk image, then open **ZFS Explore** from Applications. For a ZIP download,
+unzip it first and drag the complete app to Applications.
+
+The recovery engine and app icon are inside the app bundle. You do not need to
+copy the standalone CLI, install Rust or Homebrew, install a ZFS driver, or keep
+the download mounted. Keep the `.app` intact; do not move its internal files.
+
+Packaging CI checks the icon and signatures, copies the app into a separate
+Applications directory, checks for non-system dynamic dependencies, and restores
+a fixture using only the copied app's bundled worker. Run this check locally:
+
+```sh
+python3 scripts/verify-macos-package.py 'target/macos-package/ZFS Explore.app'
+```
+
 ![ZFS Explore on macOS](screenshots/macos-welcome.png)
 
 ## Recover a file
@@ -54,3 +72,14 @@ pool layouts are supported; RAIDZ and striped/multiple-vdev pools are not.
 
 Long operations show an indeterminate activity indicator and run off the main
 thread. Byte-level progress and cancel/resume are not yet provided.
+
+## Snapshot dates
+
+Snapshot creation times are shown as readable dates in your Mac's current time
+zone by default. Pool snapshots are newest first. Click **Times** above the
+snapshot list or use **ZFS Explore → Settings…** (Command-comma) to choose UTC
+or search for another city/time zone. The preference persists across restarts.
+The original snapshot ID remains beneath the date and in the hover detail.
+Changing the display zone preserves your selected snapshot, browsing location
+and in-memory key. Offsets are included to distinguish repeated hours at the
+end of daylight saving time. Undated/current views retain their original label.

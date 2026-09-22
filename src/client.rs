@@ -31,6 +31,9 @@ pub struct SourceView {
     /// User-facing label, including whether the view is current, full, or
     /// incremental.
     pub label: String,
+    /// Recorded ZFS creation time, in UTC Unix seconds; absent for live views
+    /// and sources without a usable timestamp. Never inferred from the name.
+    pub created_at: Option<u64>,
     /// Stable selector accepted by the corresponding backend.
     pub selector: String,
     /// True when extracting from this view writes incremental-update metadata.
@@ -40,6 +43,15 @@ pub struct SourceView {
     /// Configured ZFS key format (`raw`, `hex`, or `passphrase`) when the view
     /// is encrypted. UIs use this to offer the right input methods in place.
     pub key_format: Option<String>,
+}
+
+impl SourceView {
+    pub fn display_label(&self, zone: crate::snapshot_time::SnapshotTimeZone) -> String {
+        match self.created_at.and_then(|time| zone.format(time)) {
+            Some(time) => format!("{time} — {}", self.label),
+            None => self.label.clone(),
+        }
+    }
 }
 
 /// Lightweight description retained by the UI after opening a source.
@@ -179,6 +191,7 @@ impl SourceCatalog {
                 };
                 SourceView {
                     label: format!("{}  —  {relation}, {mode}", snapshot.dataset_name),
+                    created_at: (snapshot.creation_time > 0).then_some(snapshot.creation_time),
                     selector: format!("0x{:016x}", snapshot.to_guid),
                     update_eligible: true,
                     encrypted: snapshot.features & FEATURE_RAW != 0,
@@ -246,7 +259,12 @@ impl SourceCatalog {
         let pool = PoolMember::open_with_container_key(path, container_key)?;
         let inspection = pool.inspect()?;
         let datasets = pool.datasets()?;
-        let snapshots = pool.snapshots(None)?;
+        let mut snapshots = pool.snapshots(None)?;
+        snapshots.sort_by(|a, b| {
+            b.creation_time
+                .cmp(&a.creation_time)
+                .then_with(|| a.full_name.cmp(&b.full_name))
+        });
         let mut encrypted_datasets = BTreeMap::new();
         for dataset in &datasets {
             encrypted_datasets.insert(
@@ -259,6 +277,7 @@ impl SourceCatalog {
             let requirement = encrypted_datasets.get(&snapshot.dataset).cloned().flatten();
             views.push(SourceView {
                 label: format!("{}  —  snapshot", snapshot.full_name),
+                created_at: (snapshot.creation_time > 0).then_some(snapshot.creation_time),
                 selector: snapshot.full_name,
                 update_eligible: true,
                 encrypted: requirement.is_some(),
@@ -269,6 +288,7 @@ impl SourceCatalog {
             let requirement = encrypted_datasets.get(&dataset.name).cloned().flatten();
             views.push(SourceView {
                 label: format!("{}  —  current (read-only)", dataset.name),
+                created_at: None,
                 selector: dataset.name,
                 update_eligible: false,
                 encrypted: requirement.is_some(),

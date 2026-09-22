@@ -1,6 +1,6 @@
 [package]
 name = "zfs-send-extract"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.87"
 license = "Apache-2.0"
@@ -43,6 +43,8 @@ thiserror = "2.0"
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
 zfs-forensic-core = "0.1.1"
 xts-mode = "0.5"
+chrono = "0.4"
+chrono-tz = "0.10"
 
 [build-dependencies]
 embed-resource = "3.0"

@@ -63,15 +63,17 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CheckMenuItem, CreateAcceleratorTableW,
     CreateMenu, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyAcceleratorTable,
     DestroyMenu, DestroyWindow, DispatchMessageW, FALT, FCONTROL, FSHIFT, FVIRTKEY, GWLP_USERDATA,
-    GetClientRect, GetMenu, GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW,
-    GetWindowTextW, HACCEL, HMENU, IDC_ARROW, IsDialogMessageW, LoadCursorW, MB_ICONERROR,
-    MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_OKCANCEL, MF_BYCOMMAND, MF_CHECKED, MF_POPUP,
-    MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MessageBoxW, MoveWindow, PostMessageW,
-    PostQuitMessage, RegisterClassW, SW_HIDE, SW_SHOW, SendMessageW, SetForegroundWindow, SetMenu,
-    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TPM_LEFTALIGN, TPM_RETURNCMD,
-    TPM_TOPALIGN, TrackPopupMenu, TranslateAcceleratorW, TranslateMessage, WINDOW_EX_STYLE, WM_APP,
-    WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_NCCREATE, WM_NOTIFY, WM_SETFONT,
-    WM_SIZE, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE,
+    GetClientRect, GetMenu, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
+    GetWindowTextLengthW, GetWindowTextW, HACCEL, HMENU, IDC_ARROW, IMAGE_ICON, IsDialogMessageW,
+    LR_SHARED, LoadCursorW, LoadImageW, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK,
+    MB_OKCANCEL, MF_BYCOMMAND, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG,
+    MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, RegisterClassW,
+    SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, SW_HIDE, SW_SHOW, SendMessageW,
+    SetForegroundWindow, SetMenu, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
+    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN, TrackPopupMenu, TranslateAcceleratorW,
+    TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY,
+    WM_DPICHANGED, WM_NCCREATE, WM_NOTIFY, WM_SETFONT, WM_SETTINGCHANGE, WM_SIZE, WM_TIMECHANGE,
+    WNDCLASSEXW, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE,
     WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
     WS_VSCROLL,
 };
@@ -82,10 +84,13 @@ use zfs_send_extract::client::{
 };
 use zfs_send_extract::filesystem::DirectoryEntry;
 use zfs_send_extract::operations::Sidecar;
+use zfs_send_extract::snapshot_time::SnapshotTimeZone;
 use zfs_send_extract::tree::RecursiveExtraction;
 
 const CLASS_NAME: &str = "ZfsSendExploreWindows";
 const APP_TITLE: &str = "ZFS Send Explorer";
+// Matches the icon group embedded by packaging/windows/zfs-send-explore.rc.
+const IDI_APP: usize = 101;
 
 const ID_SOURCE_PATH: u16 = 100;
 const ID_BROWSE_SOURCE: u16 = 101;
@@ -124,6 +129,7 @@ const ID_OPEN_SELECTED: u16 = 133;
 const ID_CREDENTIALS: u16 = 134;
 const ID_CHOOSE_SOURCE: u16 = 135;
 const ID_SETTING_ADVANCED_IMAGE_RANGE: u16 = 136;
+const ID_TIME_ZONE_BASE: u16 = 10_000;
 
 const WM_JOB_COMPLETE: u32 = WM_APP + 1;
 
@@ -218,6 +224,7 @@ struct UiSettings {
     clear_credentials_on_source_change: bool,
     confirm_physical_drive: bool,
     show_advanced_image_range: bool,
+    snapshot_time_zone: String,
     window_width: i32,
     window_height: i32,
 }
@@ -229,6 +236,7 @@ impl Default for UiSettings {
             clear_credentials_on_source_change: true,
             confirm_physical_drive: true,
             show_advanced_image_range: false,
+            snapshot_time_zone: "local".into(),
             window_width: 1180,
             window_height: 760,
         }
@@ -317,16 +325,36 @@ unsafe fn run_ui() -> Result<()> {
         return Err(std::io::Error::last_os_error()).context("getting application module");
     }
     let class_name = wide(CLASS_NAME);
-    let class = WNDCLASSW {
+    let class = WNDCLASSEXW {
+        cbSize: size_of::<WNDCLASSEXW>() as u32,
         style: CS_HREDRAW | CS_VREDRAW,
         lpfnWndProc: Some(window_proc),
         hInstance: instance,
+        hIcon: LoadImageW(
+            instance,
+            IDI_APP as _,
+            IMAGE_ICON,
+            GetSystemMetrics(SM_CXICON),
+            GetSystemMetrics(SM_CYICON),
+            LR_SHARED,
+        ) as _,
+        hIconSm: LoadImageW(
+            instance,
+            IDI_APP as _,
+            IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON),
+            GetSystemMetrics(SM_CYSMICON),
+            LR_SHARED,
+        ) as _,
         hCursor: LoadCursorW(null_mut(), IDC_ARROW),
         hbrBackground: (COLOR_WINDOW as usize + 1) as _,
         lpszClassName: class_name.as_ptr(),
         ..zeroed()
     };
-    if RegisterClassW(&class) == 0 {
+    if class.hIcon.is_null() || class.hIconSm.is_null() {
+        return Err(std::io::Error::last_os_error()).context("loading application icons");
+    }
+    if RegisterClassExW(&class) == 0 {
         return Err(std::io::Error::last_os_error()).context("registering window class");
     }
 
@@ -433,6 +461,10 @@ unsafe extern "system" fn window_proc(
                 0x0004 | 0x0010,
             );
             0
+        }
+        WM_TIMECHANGE | WM_SETTINGCHANGE if !state.is_null() => {
+            update_snapshot_labels(&*state);
+            DefWindowProcW(hwnd, message, wparam, lparam)
         }
         WM_COMMAND if !state.is_null() => {
             handle_command(&mut *state, wparam, lparam);
@@ -635,6 +667,7 @@ unsafe fn initialize_window(state: &mut AppState) -> Result<()> {
         ID_SETTING_ADVANCED_IMAGE_RANGE as usize,
         "Show advanced disk-image range fields",
     );
+    add_time_zone_menu(settings_menu);
     append_menu(
         help_menu,
         MF_STRING,
@@ -921,6 +954,22 @@ unsafe fn handle_command(state: &mut AppState, wparam: WPARAM, _lparam: LPARAM) 
         ID_SETTING_CLEAR_CREDENTIALS => toggle_setting(state, ID_SETTING_CLEAR_CREDENTIALS),
         ID_SETTING_CONFIRM_DRIVE => toggle_setting(state, ID_SETTING_CONFIRM_DRIVE),
         ID_SETTING_ADVANCED_IMAGE_RANGE => toggle_setting(state, ID_SETTING_ADVANCED_IMAGE_RANGE),
+        id if id >= ID_TIME_ZONE_BASE
+            && usize::from(id - ID_TIME_ZONE_BASE) < time_zone_choices().len() =>
+        {
+            state.settings.snapshot_time_zone =
+                time_zone_choices()[usize::from(id - ID_TIME_ZONE_BASE)].clone();
+            update_snapshot_labels(state);
+            update_settings_menu(state);
+            if let Err(error) = save_settings(&state.settings) {
+                show_error(state.hwnd, "Could not save time zone", &error.to_string());
+            } else {
+                set_status(
+                    state,
+                    &format!("Snapshot time zone: {}", state.settings.snapshot_time_zone),
+                );
+            }
+        }
         ID_SHORTCUTS => show_shortcuts(state.hwnd),
         ID_EXIT => {
             DestroyWindow(state.hwnd);
@@ -1440,7 +1489,15 @@ unsafe fn finish_job(state: &mut AppState, result: JobMessage) {
             SendMessageW(state.controls.volume, CB_RESETCONTENT, 0, 0);
             SendMessageW(state.controls.view, CB_RESETCONTENT, 0, 0);
             for view in &catalog.views {
-                let label = wide(&view.label);
+                let label = wide(
+                    &view.display_label(
+                        state
+                            .settings
+                            .snapshot_time_zone
+                            .parse()
+                            .unwrap_or_default(),
+                    ),
+                );
                 SendMessageW(
                     state.controls.view,
                     CB_ADDSTRING,
@@ -3248,8 +3305,78 @@ unsafe fn toggle_setting(state: &mut AppState, id: u16) {
     }
 }
 
+fn time_zone_choices() -> Vec<String> {
+    let mut zones: Vec<_> = chrono_tz::TZ_VARIANTS
+        .iter()
+        .map(|zone| zone.name().to_owned())
+        .filter(|name| name != "UTC")
+        .collect();
+    zones.sort();
+    zones.splice(0..0, ["local".into(), "UTC".into()]);
+    zones
+}
+
+unsafe fn add_time_zone_menu(settings_menu: HMENU) {
+    let menu = CreatePopupMenu();
+    let mut groups = std::collections::BTreeMap::new();
+    for (index, zone) in time_zone_choices().iter().enumerate() {
+        let (parent, label) = match zone.as_str() {
+            "local" => (menu, "Use this computer’s time zone (default)".to_owned()),
+            "UTC" => (menu, "UTC".to_owned()),
+            _ => {
+                let (region, city) = zone.split_once('/').unwrap_or(("Other", zone));
+                let parent = *groups.entry(region.to_owned()).or_insert_with(|| {
+                    let child = CreatePopupMenu();
+                    append_menu(menu, MF_POPUP, child as usize, region);
+                    child
+                });
+                (parent, city.replace('_', " "))
+            }
+        };
+        append_menu(
+            parent,
+            MF_STRING,
+            usize::from(ID_TIME_ZONE_BASE) + index,
+            &label,
+        );
+    }
+    append_menu(settings_menu, MF_POPUP, menu as usize, "Snapshot time zone");
+}
+
+unsafe fn update_snapshot_labels(state: &AppState) {
+    let Some(catalog) = &state.catalog else {
+        return;
+    };
+    let selected = SendMessageW(state.controls.view, CB_GETCURSEL, 0, 0);
+    let zone: SnapshotTimeZone = state
+        .settings
+        .snapshot_time_zone
+        .parse()
+        .unwrap_or_default();
+    SendMessageW(state.controls.view, CB_RESETCONTENT, 0, 0);
+    for view in &catalog.views {
+        let text = wide(&view.display_label(zone));
+        SendMessageW(state.controls.view, CB_ADDSTRING, 0, text.as_ptr() as isize);
+    }
+    if selected >= 0 {
+        SendMessageW(state.controls.view, CB_SETCURSEL, selected as usize, 0);
+    }
+}
+
 unsafe fn update_settings_menu(state: &AppState) {
     let menu = GetMenu(state.hwnd);
+    for (index, zone) in time_zone_choices().iter().enumerate() {
+        CheckMenuItem(
+            menu,
+            u32::from(ID_TIME_ZONE_BASE) + index as u32,
+            MF_BYCOMMAND
+                | if *zone == state.settings.snapshot_time_zone {
+                    MF_CHECKED
+                } else {
+                    MF_UNCHECKED
+                },
+        );
+    }
     for (id, checked) in [
         (ID_SETTING_AUTO_IMAGES, state.settings.auto_open_images),
         (

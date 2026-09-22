@@ -361,6 +361,10 @@ target\windows-package\zfs-send-explore-windows-x86_64.zip
 
 The native build embeds `packaging/windows/zfs-send-explore-windows.exe.manifest`. It requests Common Controls 6, per-monitor V2 DPI behavior, Windows 10/11 compatibility, long paths, and `asInvoker` execution. Ordinary send work therefore does not trigger elevation; use **Run as administrator** only for a raw physical drive when required.
 
+The app also embeds its full-resolution icon inside the executable. Explorer,
+taskbar and large/small window icons use this resource; no adjacent `.ico` file
+is required when moving the portable executable.
+
 ## Screenshot validation record
 
 The illustrated workflows were exercised on Microsoft Windows 11 Pro build 26100 with the x86-64 GNU cross-build whose SHA-256 was:
@@ -401,3 +405,12 @@ The portable executables do not require `VCRUNTIME140.dll` or a separate Visual
 C++ Redistributable installation. Clean-machine startup and a real encrypted
 Slide pool restore were exercised on Windows 11 in AustinLand during Mac-client
 qualification; see `docs/macos-validation.md`.
+
+## Snapshot dates
+
+Pool snapshots are newest first and show their recorded creation time. Choose
+**Settings → Snapshot time zone** for this computer's local time (the default),
+UTC, or a named zone grouped by region. This preference is saved in the existing
+settings file. Changing it updates the labels while preserving the selected
+snapshot and current directory. Original snapshot IDs remain in the labels,
+and UTC offsets distinguish repeated daylight-saving hours.
