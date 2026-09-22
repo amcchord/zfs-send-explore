@@ -154,6 +154,8 @@ struct ContentView: View {
     @AppStorage("snapshotTimeZone") private var timeZone = "local"
     @State private var timeZoneRevision = 0
     var body: some View {
+        // Read this state so system time-zone notifications refresh visible dates.
+        let _ = timeZoneRevision
         HStack(spacing: 0) {
             sidebar.frame(width: 270)
             Divider()
