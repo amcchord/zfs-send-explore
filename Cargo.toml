@@ -1,6 +1,6 @@
 [package]
 name = "zfs-send-extract"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.87"
 license = "Apache-2.0"
@@ -27,7 +27,7 @@ hkdf = "0.12"
 libc = "0.2"
 lz4_flex = "0.11"
 luks-core = "0.1.8"
-ntfs = "0.4.0"
+ntfs = { version = "0.4.0", path = "vendor/ntfs" }
 pbkdf2 = "0.12"
 qcow2-core = "0.3.4"
 rpassword = "7.4"

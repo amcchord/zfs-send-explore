@@ -2,6 +2,7 @@
 //! pool members.
 
 mod compression;
+mod ntfs_compression;
 
 pub mod client;
 pub mod datto;

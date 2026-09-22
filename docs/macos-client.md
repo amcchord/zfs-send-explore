@@ -83,3 +83,12 @@ The original snapshot ID remains beneath the date and in the hover detail.
 Changing the display zone preserves your selected snapshot, browsing location
 and in-memory key. Offsets are included to distinguish repeated hours at the
 end of daylight saving time. Undated/current views retain their original label.
+
+## NTFS compression
+
+NTFS LZNT1-compressed files restore automatically in the same way as other files.
+The shared Rust reader handles compressed, verbatim and sparse compression units,
+fragmented attribute lists, partial final units and initialized-length zero fill.
+Disk images stored as compressed NTFS files can also be browsed directly. Standard
+16-cluster units with 512–4096-byte clusters are supported. EFS-encrypted streams
+remain unsupported; this feature does not add WOF/CompactOS decompression.

@@ -398,7 +398,7 @@ The layer support is deliberately explicit:
 | QCOW | Self-contained QCOW2 v2/v3, including sparse, zero, and deflate-compressed clusters |
 | VMDK | Self-contained `monolithicSparse` sparse extent |
 | Partition table | MBR primary and bounded EBR logical partitions; GPT with header and entry CRC validation, 512/4096-byte sectors, and backup-header recovery |
-| NTFS | NTFS 3.x directory browsing and extraction of the unnamed regular-file data stream |
+| NTFS | NTFS 3.x directory browsing and extraction, including LZNT1-compressed unnamed data streams |
 | FAT | FAT12, FAT16, FAT32, and exFAT directory browsing and regular-file extraction |
 | ext | ext4 and compatible ext2 directory browsing and regular-file extraction |
 
@@ -406,11 +406,11 @@ The layer support is deliberately explicit:
 
 The v0.3.0 release gate runs a 63-case cross-product: FAT12, FAT16, FAT32, exFAT, NTFS, ext4, and compatible ext2 are each tested unpartitioned, in MBR, and in GPT; every resulting disk is then tested as raw, sparse QCOW2 v3, and VMDK `monolithicSparse`. Each case detects the layers, lists a real directory, resolves a nested path, extracts through an explicit volume selector, and compares exact bytes.
 
-Focused tests additionally validate resident, non-resident, and sparse NTFS data; a 512-entry NTFS directory index; FAT/exFAT long names, nested paths, and case-insensitive lookup; ext2/ext4 holes; and refusal to follow ext symlinks. Corruption tests cover QCOW1, QCOW2 backing files and encryption, external VMDK descriptors, invalid and backup GPT metadata, out-of-bounds MBR entries, looping EBR chains, unknown filesystems, unsafe paths, multiple-volume selection, and explicit container windows.
+Focused tests additionally validate resident, non-resident, sparse and LZNT1-compressed NTFS data (including fragmented attribute lists and compressed nested images); a 512-entry NTFS directory index; FAT/exFAT long names, nested paths, and case-insensitive lookup; ext2/ext4 holes; and refusal to follow ext symlinks. Corruption tests cover QCOW1, QCOW2 backing files and encryption, external VMDK descriptors, invalid and backup GPT metadata, out-of-bounds MBR entries, looping EBR chains, unknown filesystems, unsafe paths, multiple-volume selection, and explicit container windows.
 
 QCOW2 v2, deflate-compressed QCOW2 clusters, and 4096-byte-sector GPT are implemented reader profiles but are not members of the 63-case cross-product. The Windows UI service layer has automated list/extract coverage and the complete suite runs on native Windows CI; this is distinct from a scripted interactive UI walkthrough for every matrix case. Fixture provenance and hashes are recorded in [`tests/fixtures/inception/README.md`](tests/fixtures/inception/README.md), with detailed results in [`docs/test-evidence.md`](docs/test-evidence.md).
 
-QCOW1, QCOW2 overlays that require a backing file, encrypted QCOW2, multi-file/split/flat/stream-optimized VMDK, NTFS-compressed or EFS-encrypted data, and non-UTF-8 ext names are reported rather than silently misread. ext symlinks are listed but never followed during extraction. Recursive inception extraction recreates directories and regular-file contents but skips symlinks and special entries and does not recreate inner ACLs, alternate NTFS streams, ownership, or permissions.
+QCOW1, QCOW2 overlays that require a backing file, encrypted QCOW2, multi-file/split/flat/stream-optimized VMDK, EFS-encrypted data, and non-UTF-8 ext names are reported rather than silently misread. ext symlinks are listed but never followed during extraction. Recursive inception extraction recreates directories and regular-file contents but skips symlinks and special entries and does not recreate inner ACLs, alternate NTFS streams, ownership, or permissions.
 
 For send streams, the selected snapshot chain is scanned once when the image is opened to build a compact map from virtual ZFS-file ranges to replay payloads. Reads then decode only the blocks requested by the partition and filesystem readers, with a one-block cache. Pool-member reads similarly fetch only the addressed ZFS blocks. Sparse virtual disk capacity therefore does not become an equivalent RAM or temporary-disk requirement.
 
