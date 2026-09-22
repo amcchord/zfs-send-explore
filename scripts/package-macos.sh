@@ -12,6 +12,7 @@ VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
 DEST="${ZFSE_PACKAGE_DIR:-$PWD/target/macos-package}"
 APP="$DEST/ZFS Explore.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp packaging/icons/ZFSExplore.icns "$APP/Contents/Resources/"
 cargo build --release --locked --target "$RUST_TARGET" --bin zfs-send-extract --bin zfs-explore-service
 swiftc -parse-as-library -O -target "$ARCH-apple-macosx13.0" \
   -o "$APP/Contents/MacOS/ZFSExplore" macos/ZFSExplore.swift macos/SnapshotTime.swift
@@ -26,6 +27,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <key>CFBundleName</key><string>ZFS Explore</string>
 <key>CFBundleDisplayName</key><string>ZFS Explore</string>
 <key>CFBundleExecutable</key><string>ZFSExplore</string>
+<key>CFBundleIconFile</key><string>ZFSExplore.icns</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>$VERSION</string>
 <key>CFBundleVersion</key><string>$VERSION</string>

@@ -361,6 +361,10 @@ target\windows-package\zfs-send-explore-windows-x86_64.zip
 
 The native build embeds `packaging/windows/zfs-send-explore-windows.exe.manifest`. It requests Common Controls 6, per-monitor V2 DPI behavior, Windows 10/11 compatibility, long paths, and `asInvoker` execution. Ordinary send work therefore does not trigger elevation; use **Run as administrator** only for a raw physical drive when required.
 
+The app also embeds its full-resolution icon inside the executable. Explorer,
+taskbar and large/small window icons use this resource; no adjacent `.ico` file
+is required when moving the portable executable.
+
 ## Screenshot validation record
 
 The illustrated workflows were exercised on Microsoft Windows 11 Pro build 26100 with the x86-64 GNU cross-build whose SHA-256 was:

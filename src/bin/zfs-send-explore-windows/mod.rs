@@ -63,17 +63,19 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CheckMenuItem, CreateAcceleratorTableW,
     CreateMenu, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyAcceleratorTable,
     DestroyMenu, DestroyWindow, DispatchMessageW, FALT, FCONTROL, FSHIFT, FVIRTKEY, GWLP_USERDATA,
-    GetClientRect, GetMenu, GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW,
-    GetWindowTextW, HACCEL, HMENU, IDC_ARROW, IsDialogMessageW, LoadCursorW, MB_ICONERROR,
-    MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_OKCANCEL, MF_BYCOMMAND, MF_CHECKED, MF_POPUP,
-    MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MessageBoxW, MoveWindow, PostMessageW,
-    PostQuitMessage, RegisterClassW, SW_HIDE, SW_SHOW, SendMessageW, SetForegroundWindow, SetMenu,
-    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TPM_LEFTALIGN, TPM_RETURNCMD,
-    TPM_TOPALIGN, TrackPopupMenu, TranslateAcceleratorW, TranslateMessage, WINDOW_EX_STYLE, WM_APP,
-    WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_NCCREATE, WM_NOTIFY, WM_SETFONT,
-    WM_SETTINGCHANGE, WM_SIZE, WM_TIMECHANGE, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD,
-    WS_CLIPCHILDREN, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW, WS_POPUP,
-    WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    GetClientRect, GetMenu, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
+    GetWindowTextLengthW, GetWindowTextW, HACCEL, HMENU, IDC_ARROW, IMAGE_ICON, IsDialogMessageW,
+    LR_SHARED, LoadCursorW, LoadImageW, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK,
+    MB_OKCANCEL, MF_BYCOMMAND, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG,
+    MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW, RegisterClassW,
+    SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, SW_HIDE, SW_SHOW, SendMessageW,
+    SetForegroundWindow, SetMenu, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
+    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN, TrackPopupMenu, TranslateAcceleratorW,
+    TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY,
+    WM_DPICHANGED, WM_NCCREATE, WM_NOTIFY, WM_SETFONT, WM_SETTINGCHANGE, WM_SIZE, WM_TIMECHANGE,
+    WNDCLASSEXW, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE,
+    WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    WS_VSCROLL,
 };
 use zeroize::{Zeroize, Zeroizing};
 use zfs_send_extract::client::{
@@ -87,6 +89,8 @@ use zfs_send_extract::tree::RecursiveExtraction;
 
 const CLASS_NAME: &str = "ZfsSendExploreWindows";
 const APP_TITLE: &str = "ZFS Send Explorer";
+// Matches the icon group embedded by packaging/windows/zfs-send-explore.rc.
+const IDI_APP: usize = 101;
 
 const ID_SOURCE_PATH: u16 = 100;
 const ID_BROWSE_SOURCE: u16 = 101;
@@ -321,16 +325,36 @@ unsafe fn run_ui() -> Result<()> {
         return Err(std::io::Error::last_os_error()).context("getting application module");
     }
     let class_name = wide(CLASS_NAME);
-    let class = WNDCLASSW {
+    let class = WNDCLASSEXW {
+        cbSize: size_of::<WNDCLASSEXW>() as u32,
         style: CS_HREDRAW | CS_VREDRAW,
         lpfnWndProc: Some(window_proc),
         hInstance: instance,
+        hIcon: LoadImageW(
+            instance,
+            IDI_APP as _,
+            IMAGE_ICON,
+            GetSystemMetrics(SM_CXICON),
+            GetSystemMetrics(SM_CYICON),
+            LR_SHARED,
+        ) as _,
+        hIconSm: LoadImageW(
+            instance,
+            IDI_APP as _,
+            IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON),
+            GetSystemMetrics(SM_CYSMICON),
+            LR_SHARED,
+        ) as _,
         hCursor: LoadCursorW(null_mut(), IDC_ARROW),
         hbrBackground: (COLOR_WINDOW as usize + 1) as _,
         lpszClassName: class_name.as_ptr(),
         ..zeroed()
     };
-    if RegisterClassW(&class) == 0 {
+    if class.hIcon.is_null() || class.hIconSm.is_null() {
+        return Err(std::io::Error::last_os_error()).context("loading application icons");
+    }
+    if RegisterClassExW(&class) == 0 {
         return Err(std::io::Error::last_os_error()).context("registering window class");
     }
 
