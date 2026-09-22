@@ -13,8 +13,14 @@ open 'target/macos-package/ZFS Explore.app'
 The package directory contains the app, standalone `zfs-send-extract` CLI,
 archives, and checksums. `ZFSE_MACOS_ARCH=arm64` (Apple Silicon) or `x86_64`
 (Intel) selects an architecture; the matching Rust target must be installed.
-Builds are ad-hoc signed, not Developer ID signed or notarized. Public customer
-release still requires a signing identity and Apple notarization.
+Local builds are ad-hoc signed. Published v0.6.1 Mac downloads are Developer ID
+signed and Apple-notarized. Use the `.dmg` for your architecture to obtain both
+the app and CLI; it carries a stapled notarization ticket, as does the app.
+The CLI tarball has the same notarized executable but no stapled ticket on the
+standalone binary, so prefer the disk image for offline preparation. Normal
+first-open confirmation and organization device policies still apply.
+
+For maintainers, see the [signing and notarization procedure](macos-signing.md).
 
 ![ZFS Explore on macOS](screenshots/macos-welcome.png)
 
