@@ -74,7 +74,10 @@ staple/package/assessment steps only after the saved submission is accepted.
    It downloads the exact assets on native Apple Silicon and Intel runners,
    checks digests/signatures/tickets/Gatekeeper, and restores a synthetic file
    with both the signed CLI and the signed desktop worker. Both jobs must pass
-   before publishing the draft.
+   before publishing the draft. GitHub requires a token with push access to
+   discover draft releases, so this manual workflow requests `contents: write`.
+   It does not write to the release and checkout does not persist credentials.
+   Explicit Bash execution keeps pipeline failures from being hidden by `tee`.
 
 The disk images are the recommended app + CLI downloads. Bare command-line
 executables and tarballs do not support stapled notarization tickets; the CLI
