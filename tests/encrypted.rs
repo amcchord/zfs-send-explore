@@ -52,3 +52,36 @@ fn unlocks_authenticates_and_decrypts_a_raw_send_fixture() {
     assert_eq!(resolved.object_id, 128);
     assert_eq!(resolved.logical_size, 16);
 }
+
+#[test]
+fn raw_send_authenticates_completely_sparse_indirect_subtrees() {
+    use zfs_send_extract::client::SourceCatalog;
+    let source = SourceCatalog::open_send("tests/fixtures/sparse-indirect-raw.zfs").unwrap();
+    let key = b"public-sparse-regression-passphrase";
+    let entries = source
+        .list_directory_with_key_material(0, "/", Some(key))
+        .unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.name == "sparse.bin" && e.logical_size == Some(512 * 1024 * 1024))
+    );
+    let output = tempfile::tempdir().unwrap();
+    let restored = source
+        .extract_with_key_material(
+            0,
+            "/hello.txt",
+            &output.path().join("hello.txt"),
+            false,
+            Some(key),
+        )
+        .unwrap();
+    assert_eq!(
+        restored.sha256,
+        "2e9979937ed94de4090045ab5f71102891bc0f3c5f69e05979b7e6f660c5fd37"
+    );
+    assert_eq!(
+        std::fs::read(output.path().join("hello.txt")).unwrap(),
+        b"sparse indirect block regression\n"
+    );
+}

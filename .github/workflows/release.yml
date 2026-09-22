@@ -46,14 +46,37 @@ jobs:
           path: dist
           if-no-files-found: error
 
+  macos-clients:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: ./scripts/package-macos.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-release-${{ matrix.arch }}
+          path: |
+            target/macos-package/*.zip
+            target/macos-package/*.tar.gz
+          if-no-files-found: error
+
   publish:
     needs:
       - linux-cli
       - windows-clients
+      - macos-clients
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -65,8 +88,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          test "$GITHUB_REF_NAME" = "v$version"
+          notes=(--generate-notes)
+          if [[ -f "docs/releases/$GITHUB_REF_NAME.md" ]]; then
+            notes=(--notes-file "docs/releases/$GITHUB_REF_NAME.md")
+          fi
           gh release create "$GITHUB_REF_NAME" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --title "ZFS Send Explore $GITHUB_REF_NAME" \
-            --generate-notes
+            --draft \
+            "${notes[@]}"

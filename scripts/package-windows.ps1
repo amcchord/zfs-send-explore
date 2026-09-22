@@ -5,6 +5,9 @@ $Stage = Join-Path $Root "target\windows-package\zfs-send-explore-windows"
 $Archive = Join-Path $Root "target\windows-package\zfs-send-explore-windows-x86_64.zip"
 
 cargo build --release --locked --bin zfs-send-extract --bin zfs-send-explore-windows
+if ($LASTEXITCODE -ne 0) { throw "Windows build failed; no package was created." }
+& (Join-Path $Root "target\release\zfs-send-extract.exe") --version
+if ($LASTEXITCODE -ne 0) { throw "The Windows CLI failed its launch check." }
 
 if (Test-Path $Stage) {
     Remove-Item -Recurse -Force $Stage
@@ -17,6 +20,7 @@ Copy-Item (Join-Path $Root "target\release\zfs-send-extract.exe") $Stage
 Copy-Item (Join-Path $Root "README.md") $Stage
 Copy-Item (Join-Path $Root "docs\windows-client.md") $DocsStage
 Copy-Item (Join-Path $Root "docs\windows-ux-review.md") $DocsStage
+Copy-Item (Join-Path $Root "docs\macos-validation.md") $DocsStage
 Copy-Item (Join-Path $Root "docs\screenshots") (Join-Path $DocsStage "screenshots") -Recurse
 Copy-Item (Join-Path $Root "LICENSE") $Stage
 

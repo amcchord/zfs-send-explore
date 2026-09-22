@@ -3408,7 +3408,7 @@ unsafe fn layout(state: &AppState) {
     x = pad + drive_width + gap;
     MoveWindow(state.controls.open_pool, x, second_y, scale(104), row, 1);
     x += scale(104) + gap;
-    MoveWindow(state.controls.choose_key, x, second_y, scale(132), row, 1);
+    MoveWindow(state.controls.choose_key, x, second_y, scale(210), row, 1);
 
     let third_y = second_y + row + gap;
     let up_width = scale(54);

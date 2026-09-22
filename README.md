@@ -1,11 +1,11 @@
 # zfs-send-extract
 
-`zfs-send-extract` is an experimental, pure-userspace toolkit for browsing and extracting individual files from ZFS backups without importing or mounting a pool. It includes the cross-platform CLI and an additional native Windows desktop client. Both work with ZFS send files and, within a deliberately narrow pool layout, exported ZFS vdev members or images.
+`zfs-send-extract` is an experimental, pure-userspace toolkit for browsing and extracting individual files from ZFS backups without importing or mounting a pool. It includes the cross-platform CLI and native macOS and Windows desktop clients. Both work with ZFS send files and, within a deliberately narrow pool layout, exported ZFS vdev members or images.
 
 The extraction machine does **not** need ZFS, `libzfs`, or a ZFS kernel module. The tool never invokes `zfs` or `zpool`, and pool members are opened read-only.
 
 > [!IMPORTANT]
-> This is an early `0.5.1` implementation. The CLI, Windows UI, sidecar format, and supported on-disk profile may change. Stream and native-encryption pool fixtures are produced on little-endian OpenZFS systems. Linux validates the core end to end, and CI runs the full test suite and release packaging on native Windows.
+> This is an early `0.6.0` implementation. The CLI, desktop UIs, sidecar format, and supported on-disk profile may change. Stream and native-encryption pool fixtures are produced on little-endian OpenZFS systems. CI runs the test suite on Linux, Windows, Apple Silicon macOS, and Intel macOS, and builds native release packages.
 
 Detailed implementation and validation material lives in:
 
@@ -56,11 +56,17 @@ Portable release builds are available from the [GitHub Releases page](https://gi
 
 | Asset | Contents |
 | --- | --- |
+| `zfs-send-explore-macos-arm64.zip` | Native macOS app for Apple Silicon (M1 and later) |
+| `zfs-send-explore-macos-x86_64.zip` | Native macOS app for Intel Macs |
+| `zfs-send-extract-macos-arm64.tar.gz` | macOS Apple Silicon command-line client |
+| `zfs-send-extract-macos-x86_64.tar.gz` | macOS Intel command-line client |
 | `zfs-send-extract-linux-x86_64.tar.gz` | Linux x86-64 command-line client |
 | `zfs-send-extract-windows-x86_64.exe` | Windows x86-64 command-line client |
 | `zfs-send-explore-windows-x86_64.exe` | Native Windows x86-64 desktop client |
 | `zfs-send-explore-windows-x86_64.zip` | Both Windows executables, the illustrated Windows guide, screenshots, README, and license |
 | `SHA256SUMS.txt` | SHA-256 checksums for every downloadable program and archive |
+
+On macOS 13 or later, download the app ZIP for your Mac, extract it, and move **ZFS Explore.app** to Applications. Mac builds are ad-hoc signed and are not Apple-notarized; Gatekeeper may require approval in **System Settings → Privacy & Security → Open Anyway**. Verify the checksum and source before approving. See the [Mac recovery guide](docs/macos-client.md).
 
 Verify a Windows download before running it:
 
@@ -93,6 +99,21 @@ The executable is written to `target/release/zfs-send-extract`. ZFS is needed on
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```
+
+### Native macOS client
+
+On macOS 13 or later, build the SwiftUI app and CLI with Xcode command-line tools:
+
+```sh
+./scripts/package-macos.sh
+open 'target/macos-package/ZFS Explore.app'
+```
+
+Choose a backup, select a snapshot, unlock if needed, and browse folders or nested
+disk images. **Restore…** saves a copy to a new destination and shows its SHA-256.
+The source is read-only and existing destination files are preserved. See the
+[Mac guide](docs/macos-client.md) for packaging, key handling, and current limits.
+Mac builds are ad-hoc signed; Developer ID signing and notarization are pending.
 
 ### Native Windows client
 

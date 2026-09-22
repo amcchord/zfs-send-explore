@@ -646,6 +646,15 @@ fn root_block_pointers(dnode: &RawDnode, crypto_version: u64) -> Result<Vec<Bloc
     for tree_level in 1..dnode.levels {
         let mut parents = Vec::with_capacity(level.len().div_ceil(epb));
         for children in level.chunks(epb) {
+            // A completely sparse subtree has no indirect block on disk.
+            // Its parent authenticates a hole, not a checksum of zero children.
+            if children
+                .iter()
+                .all(|child| child.prop == 0 && child.mac == [0; 16])
+            {
+                parents.push(BlockPointerAuth::HOLE);
+                continue;
+            }
             let mut digest = Sha512::new();
             for child in children {
                 digest.update(child.encode(crypto_version)?);
