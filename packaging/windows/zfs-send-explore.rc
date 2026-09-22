@@ -1,1 +1,2 @@
 1 RT_MANIFEST "packaging/windows/zfs-send-explore-windows.exe.manifest"
+101 ICON "packaging/icons/ZFSExplore.ico"
