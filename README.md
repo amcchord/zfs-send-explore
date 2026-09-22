@@ -1,6 +1,6 @@
 # zfs-send-extract
 
-`zfs-send-extract` is an experimental, pure-userspace toolkit for browsing and extracting individual files from ZFS backups without importing or mounting a pool. It includes the cross-platform CLI and an additional native Windows desktop client. Both work with ZFS send files and, within a deliberately narrow pool layout, exported ZFS vdev members or images.
+`zfs-send-extract` is an experimental, pure-userspace toolkit for browsing and extracting individual files from ZFS backups without importing or mounting a pool. It includes the cross-platform CLI and native macOS and Windows desktop clients. Both work with ZFS send files and, within a deliberately narrow pool layout, exported ZFS vdev members or images.
 
 The extraction machine does **not** need ZFS, `libzfs`, or a ZFS kernel module. The tool never invokes `zfs` or `zpool`, and pool members are opened read-only.
 
@@ -93,6 +93,21 @@ The executable is written to `target/release/zfs-send-extract`. ZFS is needed on
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```
+
+### Native macOS client
+
+On macOS 13 or later, build the SwiftUI app and CLI with Xcode command-line tools:
+
+```sh
+./scripts/package-macos.sh
+open 'target/macos-package/ZFS Explore.app'
+```
+
+Choose a backup, select a snapshot, unlock if needed, and browse folders or nested
+disk images. **Restore…** saves a copy to a new destination and shows its SHA-256.
+The source is read-only and existing destination files are preserved. See the
+[Mac guide](docs/macos-client.md) for packaging, key handling, and current limits.
+Mac builds are ad-hoc signed; Developer ID signing and notarization are pending.
 
 ### Native Windows client
 

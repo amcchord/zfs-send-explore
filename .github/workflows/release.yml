@@ -46,10 +46,32 @@ jobs:
           path: dist
           if-no-files-found: error
 
+  macos-clients:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: ./scripts/package-macos.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-release-${{ matrix.arch }}
+          path: |
+            target/macos-package/*.zip
+            target/macos-package/*.tar.gz
+          if-no-files-found: error
+
   publish:
     needs:
       - linux-cli
       - windows-clients
+      - macos-clients
     runs-on: ubuntu-latest
     permissions:
       contents: write
