@@ -125,3 +125,29 @@ fn desktop_authenticates_keys_and_forgets_them_when_switching_views() {
         ""
     );
 }
+
+#[test]
+fn invalid_device_authorization_preserves_the_existing_backup() {
+    let mut desktop = Desktop::start();
+    assert_eq!(
+        desktop.request(json!({"method":"open", "path":fixture("tiny-full.zfs")}))["ok"],
+        true
+    );
+    assert_eq!(
+        desktop.request(json!({"method":"open", "path":"/dev/null", "authorize":true}))["ok"],
+        false
+    );
+    assert_eq!(
+        desktop.request(json!({"method":"list", "path":"/"}))["result"]["title"],
+        "tiny-full.zfs"
+    );
+    assert_eq!(
+        desktop
+            .request(json!({"method":"open", "path":fixture("tiny-full.zfs"), "authorize":true}))["ok"],
+        false
+    );
+    assert_eq!(
+        desktop.request(json!({"method":"list", "path":"/"}))["ok"],
+        true
+    );
+}

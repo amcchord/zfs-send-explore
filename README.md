@@ -37,6 +37,7 @@ Detailed implementation and validation material lives in:
 | Open standalone images and recursively nested images | Supported without mounting or materializing the complete child image; the UI retains up to eight active layers |
 | Native Windows snapshot browser and extractor | Supported as `zfs-send-explore-windows.exe` |
 | Native Windows physical-drive discovery | Enumerates disk number, model, size, and media type; confirms the exact read-only selection |
+| Native macOS attached-drive discovery | Lists external disks and partitions Finder does not show; the macOS administrator prompt grants read-only access |
 | Direct password/key entry in Windows | ZFS, Datto LUKS, and Datto agent secrets use the non-persisting Windows credential prompt and zeroizing memory; key files remain supported |
 | Open a GPT/MBR whole-disk image or `\\.\PhysicalDriveN` | Supported when exactly one partition resolves to a supported plain or LUKS-wrapped ZFS member |
 | Preserve sparse holes during extraction and incremental updates | Supported; zero ranges are deallocated when the destination filesystem permits it |

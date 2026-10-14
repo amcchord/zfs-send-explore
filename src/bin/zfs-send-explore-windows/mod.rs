@@ -1001,7 +1001,6 @@ unsafe fn handle_notify(state: &mut AppState, lparam: LPARAM) {
 enum OpenMode {
     Auto,
     Send,
-    Pool,
     Image,
 }
 
@@ -1009,10 +1008,6 @@ unsafe fn choose_source(state: &mut AppState, mode: OpenMode) {
     let (title, filter) = match mode {
         OpenMode::Send => ("Choose a ZFS send file", SourceFilter::Send),
         OpenMode::Image => ("Choose a standalone disk image", SourceFilter::Image),
-        OpenMode::Pool => (
-            "Choose a pool member or whole-disk image",
-            SourceFilter::All,
-        ),
         OpenMode::Auto => (
             "Choose a backup, pool member, or disk image",
             SourceFilter::All,
@@ -1044,8 +1039,6 @@ unsafe fn open_source(state: &mut AppState, mode: OpenMode) {
         let pool_key = container_key.as_ref().map(SecretValue::bytes);
         match mode {
             OpenMode::Send => SourceCatalog::open_send(path).map(JobResult::Catalog),
-            OpenMode::Pool => SourceCatalog::open_pool_with_container_key_material(path, pool_key)
-                .map(JobResult::Catalog),
             OpenMode::Image => InceptionCatalog::open_file(&path, 0, None).map(|catalog| {
                 JobResult::InceptionOpened {
                     catalog,
@@ -2003,7 +1996,7 @@ unsafe fn open_physical_drive(state: &mut AppState) {
                 "Select a drive from the Physical drives list first. Press F5 after attaching a new drive.",
             );
         } else {
-            open_source(state, OpenMode::Pool);
+            open_source(state, OpenMode::Auto);
         }
         return;
     };
@@ -2017,7 +2010,7 @@ unsafe fn open_physical_drive(state: &mut AppState) {
             return;
         }
     }
-    open_source(state, OpenMode::Pool);
+    open_source(state, OpenMode::Auto);
 }
 
 unsafe fn refresh_physical_drives(state: &mut AppState) {

@@ -12,6 +12,7 @@ pub mod inception;
 pub mod operations;
 pub mod pool;
 pub mod snapshot_time;
+pub mod source;
 pub mod sparse;
 pub mod stream;
 pub mod tree;

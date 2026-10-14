@@ -303,6 +303,75 @@ fn raw_encrypted_send_lists_and_extracts_with_an_authenticated_key() {
     );
 }
 
+/// A pool member attached as a real macOS block device, which reports a
+/// zero `st_size` and zero `SEEK_END` like a USB drive's partition does.
+#[cfg(target_os = "macos")]
+#[test]
+fn native_encrypted_pool_opens_as_a_macos_disk_device() {
+    struct Attached(String);
+    impl Drop for Attached {
+        fn drop(&mut self) {
+            let _ = Command::new("hdiutil")
+                .args(["detach", "-quiet", &self.0])
+                .status();
+        }
+    }
+
+    let temporary = tempfile::tempdir().unwrap();
+    let member = temporary.path().join("native-encrypted-pool.img");
+    expand_native_encrypted_pool(&member);
+    let attach = Command::new("hdiutil")
+        .args([
+            "attach",
+            "-nomount",
+            "-readonly",
+            "-imagekey",
+            "diskimage-class=CRawDiskImage",
+        ])
+        .arg(&member)
+        .output()
+        .unwrap();
+    assert!(
+        attach.status.success(),
+        "{}",
+        String::from_utf8_lossy(&attach.stderr)
+    );
+    let device = Attached(
+        String::from_utf8_lossy(&attach.stdout)
+            .split_whitespace()
+            .next()
+            .expect("hdiutil printed the device node")
+            .to_owned(),
+    );
+    assert!(device.0.starts_with("/dev/disk"), "{}", device.0);
+
+    let inspect = run(&["pool", "inspect", &device.0]);
+    assert!(
+        inspect.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+    assert!(String::from_utf8_lossy(&inspect.stdout).contains("member bytes: 134217728"));
+
+    let key = temporary.path().join("passphrase");
+    fs::write(&key, b"hunter2!\n").unwrap();
+    let list = run(&[
+        "pool",
+        "list",
+        &device.0,
+        "encpool/secret",
+        "/",
+        "--key-file",
+        key.to_str().unwrap(),
+    ]);
+    assert!(
+        list.status.success(),
+        "{}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert!(String::from_utf8_lossy(&list.stdout).contains("greeting.txt"));
+}
+
 #[test]
 fn native_encrypted_pool_lists_and_extracts_with_an_authenticated_key() {
     let temporary = tempfile::tempdir().unwrap();
@@ -648,4 +717,45 @@ fn pool_commands_reject_a_non_zfs_member() {
     assert!(!output.status.success());
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(error.contains("no readable ZFS vdev label"), "{error}");
+}
+
+#[test]
+fn whole_disk_mbr_tail_labels_resolve_the_partition_before_reading_blocks() {
+    let temporary = tempfile::tempdir().unwrap();
+    let member = temporary.path().join("member.img");
+    expand_native_encrypted_pool(&member);
+    let pool = fs::read(&member).unwrap();
+    let mut disk = vec![0; 1024 * 1024 + pool.len()];
+    disk[510..512].copy_from_slice(&[0x55, 0xaa]);
+    let entry = 446 + 2 * 16; // Reproduce the tester's third MBR partition.
+    disk[entry + 4] = 0x83;
+    disk[entry + 8..entry + 12].copy_from_slice(&2048u32.to_le_bytes());
+    disk[entry + 12..entry + 16].copy_from_slice(&((pool.len() / 512) as u32).to_le_bytes());
+    disk[1024 * 1024..].copy_from_slice(&pool);
+    let whole = temporary.path().join("whole.img");
+    fs::write(&whole, &disk).unwrap();
+    let key = temporary.path().join("key");
+    fs::write(&key, b"hunter2!").unwrap();
+    let output = temporary.path().join("greeting.txt");
+    let result = run(&[
+        "pool",
+        "extract",
+        whole.to_str().unwrap(),
+        "encpool/secret",
+        "/greeting.txt",
+        "--key-file",
+        key.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+    ]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        sha256(&output),
+        "fb13243e8d0033038d1740d8bb6cc0c9f34dd7087f9de133c6813530bb36d042"
+    );
+    assert_eq!(fs::read(&whole).unwrap(), disk);
 }

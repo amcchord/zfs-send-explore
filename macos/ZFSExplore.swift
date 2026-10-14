@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 struct BackupView: Decodable {
@@ -83,6 +84,9 @@ final class Engine: @unchecked Sendable {
     @Published var secret = ""
     @Published var showUnlock = false
     @Published var showPath = false
+    @Published var showDrives = false
+    @Published var drives: [AttachedDrive] = []
+    @Published var driveSelection: String?
     @Published var showPreferences = false
     @Published var sourcePath = ""
     private let engine = Engine()
@@ -114,7 +118,28 @@ final class Engine: @unchecked Sendable {
         panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
         if panel.runModal() == .OK, let url = panel.url { open(url) }
     }
-    func open(_ url: URL) { perform(["method": "open", "path": url.path], activity: "Opening backup…") }
+    func open(_ url: URL) {
+        // Device nodes are root-owned; the engine asks macOS for read access when denied.
+        let device = url.path.hasPrefix("/dev/")
+        perform(["method": "open", "path": url.path, "authorize": device],
+                activity: device ? "Waiting for permission to read \(url.lastPathComponent)…" : "Opening backup…")
+    }
+    func chooseDrive() {
+        refreshDrives()
+        driveSelection = drives.first?.suggested.id
+        showDrives = true
+    }
+    func refreshDrives() {
+        drives = AttachedDrive.scan()
+        let slices = drives.flatMap { [$0.disk] + $0.partitions }
+        // A removed disk must not silently select a different attached drive.
+        if !slices.contains(where: { $0.id == driveSelection }) { driveSelection = nil }
+    }
+    func openDrive() {
+        guard let selected = drives.flatMap({ [$0.disk] + $0.partitions }).first(where: { $0.id == driveSelection }) else { return }
+        showDrives = false
+        open(URL(fileURLWithPath: selected.path))
+    }
     func unlockFile() {
         let panel = NSOpenPanel(); panel.title = "Choose the encryption key"; panel.prompt = "Unlock"
         panel.message = "Choose the key file for this dataset. Slide keys may be 32 raw bytes or 64 hexadecimal characters."
@@ -175,6 +200,8 @@ struct ContentView: View {
             ToolbarItemGroup(placement: .navigation) {
                 Button { model.chooseSource() } label: { Label("Open Backup", systemImage: "folder.badge.plus") }
                     .keyboardShortcut("o").help("Choose a backup or disk image")
+                Button { model.chooseDrive() } label: { Label("Open Drive", systemImage: "externaldrive.badge.plus") }
+                    .help("Open an attached drive, including drives Finder doesn’t show")
                 Button { model.showPath = true } label: { Label("Open Path", systemImage: "text.cursor") }
                     .help("Open a pasted file or device path")
             }
@@ -205,11 +232,12 @@ struct ContentView: View {
         .sheet(isPresented: $model.showPath) {
             VStack(alignment: .leading, spacing: 18) {
                 Text("Open a backup path").font(.title2.bold())
-                Text("Paste the full path to a backup, offline disk image, or readable device.").foregroundStyle(.secondary)
+                Text("Paste the full path to a backup, offline disk image, or device such as /dev/disk4s2.").foregroundStyle(.secondary)
                 TextField("/Volumes/Backups/slide.img", text: $model.sourcePath).textFieldStyle(.roundedBorder)
                 HStack { Spacer(); Button("Cancel") { model.showPath = false }; Button("Open") { model.showPath = false; model.open(URL(fileURLWithPath: (model.sourcePath as NSString).expandingTildeInPath)) }.keyboardShortcut(.defaultAction).disabled(model.sourcePath.isEmpty) }
             }.padding(28).frame(width: 480)
         }
+        .sheet(isPresented: $model.showDrives) { DrivePicker(model: model) }
         .onOpenURL { model.open($0) }
         .sheet(isPresented: $model.showPreferences) {
             TimeZonePreferences(selection: $timeZone)
@@ -274,7 +302,7 @@ struct ContentView: View {
                 Button("Close Backup") { model.perform(["method": "close"], activity: "Closing backup…") }
             } else {
                 VStack(alignment: .leading, spacing: 22) {
-                    step("1", "Choose your backup", "ZFS send or offline disk image")
+                    step("1", "Choose your backup", "ZFS send, disk image, or attached drive")
                     step("2", "Find your files", "Select a snapshot, then browse")
                     step("3", "Restore a copy", "Save files to a new destination")
                 }.padding(.top, 20)
@@ -295,8 +323,11 @@ struct ContentView: View {
             Image(systemName: "externaldrive.fill").font(.system(size: 66, weight: .light)).foregroundStyle(.teal)
             Text("Get your files back.").font(.system(size: 32, weight: .semibold))
             Text("Open a backup, find the file you need, and save a copy.\nBrowse encrypted Slide backups without mounting a disk.").multilineTextAlignment(.center).foregroundStyle(.secondary).lineSpacing(4)
-            Button("Choose Backup…") { model.chooseSource() }.buttonStyle(.borderedProminent).controlSize(.large)
-            Text("ZFS send · ZFS pool image · RAW · QCOW2 · VMDK").font(.caption).foregroundStyle(.secondary)
+            HStack(spacing: 12) {
+                Button("Choose Backup…") { model.chooseSource() }.buttonStyle(.borderedProminent)
+                Button("Open Attached Drive…") { model.chooseDrive() }
+            }.controlSize(.large)
+            Text("ZFS send · ZFS pool image · attached drive · RAW · QCOW2 · VMDK").font(.caption).foregroundStyle(.secondary)
             Spacer()
         }.frame(maxWidth: .infinity).padding(40)
     }
@@ -364,6 +395,63 @@ struct ContentView: View {
     }
 }
 
+/// Attached drives from DiskArbitration, so drives macOS cannot mount (and
+/// Finder never shows) can still be chosen. The selected slice opens read-only.
+struct DrivePicker: View {
+    @ObservedObject var model: Recovery
+    private let refresh = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Label("Open an attached drive", systemImage: "externaldrive.badge.plus").font(.title2.bold())
+            Text("Drives holding ZFS don’t appear in Finder because macOS can’t read them. Choose the drive’s pool partition, or the whole disk and ZFS Explore finds the pool on it.")
+                .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            List(selection: $model.driveSelection) {
+                ForEach(model.drives) { drive in
+                    Section(drive.title) {
+                        ForEach([drive.disk] + drive.partitions) { slice in
+                            row(slice, suggested: slice.id == drive.suggested.id).tag(slice.id)
+                        }
+                    }
+                }
+            }
+            .frame(height: 280)
+            .overlay {
+                if model.drives.isEmpty {
+                    VStack(spacing: 8) {
+                        Image(systemName: "externaldrive.trianglebadge.exclamationmark").font(.system(size: 30)).foregroundStyle(.secondary)
+                        Text("No attached drives found").font(.headline)
+                        Text("Connect the backup drive. It appears here within a few seconds.").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            Label("If needed, macOS asks for permission to read the drive. ZFS Explore opens it read-only without mounting or changing it.", systemImage: "lock.shield")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Button("Refresh") { model.refreshDrives() }
+                Spacer()
+                Button("Cancel") { model.showDrives = false }
+                Button("Open Read-Only") { model.openDrive() }.keyboardShortcut(.defaultAction).disabled(model.driveSelection == nil)
+            }
+        }
+        .padding(28).frame(width: 560)
+        .onReceive(refresh) { _ in model.refreshDrives() }
+    }
+    func row(_ slice: DriveSlice, suggested: Bool) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: slice.whole ? "externaldrive" : slice.kind == .zfs || slice.kind == .linux ? "square.stack.3d.up" : "square.dashed")
+                .frame(width: 18).foregroundStyle(slice.kind == .mounted || slice.kind == .system ? .secondary : Color.teal)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(slice.whole ? "Whole disk" : slice.typeLabel).fontWeight(suggested ? .semibold : .regular)
+                    Text("\(slice.path) · \(slice.sizeLabel)").font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary)
+                    if suggested { Text("Suggested").font(.caption2.bold()).padding(.horizontal, 6).padding(.vertical, 2).background(.teal.opacity(0.15), in: Capsule()) }
+                }
+                Text(slice.hint).font(.caption).foregroundStyle(.secondary)
+            }
+        }.padding(.vertical, 3)
+    }
+}
+
 struct TimeZonePreferences: View {
     @Binding var selection: String
     @Environment(\.dismiss) private var dismiss
@@ -421,7 +509,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .defaultSize(width: 1120, height: 740)
             .commands {
                 CommandGroup(replacing: .appSettings) { Button("Settings…") { model.showPreferences = true }.keyboardShortcut(",").disabled(model.busy) }
-                CommandGroup(replacing: .newItem) { Button("Open Backup…") { model.chooseSource() }.keyboardShortcut("o").disabled(model.busy) }
+                CommandGroup(replacing: .newItem) {
+                    Button("Open Backup…") { model.chooseSource() }.keyboardShortcut("o").disabled(model.busy)
+                    Button("Open Attached Drive…") { model.chooseDrive() }.keyboardShortcut("d", modifiers: [.command, .shift]).disabled(model.busy)
+                    Button("Open Path…") { model.showPath = true }.keyboardShortcut("o", modifiers: [.command, .shift]).disabled(model.busy)
+                }
             }
     }
 }

@@ -45,7 +45,9 @@ python3 scripts/verify-macos-package.py 'target/macos-package/ZFS Explore.app'
 ## Recover a file
 
 1. Choose **Open Backup** (⌘O) and select a ZFS send, exported pool `.img`, or
-   standalone disk image. **Open Path** also accepts a pasted absolute path.
+   standalone disk image. For a drive, choose **Open Attached Drive** (⇧⌘D;
+   see below). **Open Path** (⇧⌘O) also accepts a pasted absolute path,
+   including a device such as `/dev/disk4s2`.
 2. Select the intended snapshot or dataset in the sidebar.
 3. For encrypted backups, use **Enter Key** or **Choose Key File**. Slide's
    64-character raw key and 32-byte binary key files are both accepted.
@@ -64,11 +66,37 @@ Changing snapshots, closing a backup, or quitting discards the active key.
 Swift secure-field contents are cleared on submit/dismiss; Swift/Foundation
 string copies are not guaranteed to be zeroized.
 
-The Mac app supports ZFS native encryption; Datto LUKS and agent-password UI,
-physical disk discovery, and incremental application remain CLI/Windows features.
-A directly supplied device path must already be readable by the current user.
-Use an offline image for normal recovery. Single disk or single top-level mirror
-pool layouts are supported; RAIDZ and striped/multiple-vdev pools are not.
+## Open an attached drive
+
+A drive holding a ZFS pool does not appear in Finder or in the Open Backup panel:
+macOS cannot read its partitions, so it never mounts them. **Open Attached
+Drive** lists external disks directly from DiskArbitration instead, whether or
+not Finder shows them, with each partition's type and size. A ZFS-typed
+partition is suggested first, then the largest partition macOS left unmounted.
+Choosing **Whole disk** also works when exactly one partition holds the pool.
+The list refreshes every two seconds, so a drive connected while it is open
+appears without reopening it. Internal storage and Apple disk images (such as
+this app's own DMG) are hidden. Mounted partitions show their current mount path.
+A suggestion is based on the partition type, not a guarantee that it contains ZFS.
+Removing the selected device clears the selection; reconnecting requires choosing
+it again, even if macOS reuses the same disk number.
+
+Disk devices belong to `root:operator`, so macOS asks for an administrator
+password when the selected device is not already readable. The engine runs
+Apple's `/usr/libexec/authopen`, which shows the standard system prompt for the
+right `sys.openfile.readonly./dev/diskN`, and passes back a read-only file
+descriptor over a private socket. No privileged process stays running, the
+device's permissions are not changed, and the handle is closed when the backup
+is closed or another is opened. **Open Path** uses the same prompt for paths
+under `/dev/` for exact disk nodes. Pool and standalone filesystem devices use
+the same size detection and sector-aligned reads, including `/dev/rdiskN` paths.
+The CLI needs an already readable device or an administrator launch; it does not
+show the desktop authorization prompt.
+
+The Mac app supports ZFS native encryption; Datto LUKS and agent-password UI and
+incremental application remain CLI/Windows features. Single disk or single
+top-level mirror pool layouts are supported; RAIDZ and striped/multiple-vdev
+pools are not.
 
 Long operations show an indeterminate activity indicator and run off the main
 thread. Byte-level progress and cancel/resume are not yet provided.

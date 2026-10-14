@@ -105,35 +105,16 @@ struct FileSource {
     path: PathBuf,
     description: String,
     file: File,
+    block_size: usize,
     base_offset: u64,
     len: u64,
 }
 
 impl FileSource {
     fn open(path: &Path) -> Result<Self> {
-        let file = File::open(path)
+        let file = crate::source::open_read_only(path)
             .with_context(|| format!("opening pool member {} read-only", path.display()))?;
-        let metadata_len = match file.metadata() {
-            Ok(metadata) => metadata.len(),
-            Err(metadata_error) => device_length(&file).with_context(|| {
-                format!(
-                    "reading metadata for {} failed ({metadata_error}); querying the device length",
-                    path.display()
-                )
-            })?,
-        };
-        let len = if metadata_len != 0 {
-            metadata_len
-        } else {
-            device_length(&file).or_else(|_| {
-                // Linux block devices commonly report st_size == 0 but support
-                // lseek(SEEK_END), which yields the actual device size.
-                let mut size_probe = file.try_clone()?;
-                size_probe.seek(SeekFrom::End(0)).with_context(|| {
-                    format!("determining the size of block device {}", path.display())
-                })
-            })?
-        };
+        let len = crate::source::source_length(&file, path)?;
         if len < (4 * LABEL_SIZE) as u64 {
             bail!(
                 "pool member {} is only {len} bytes (too small to contain four ZFS labels)",
@@ -143,6 +124,7 @@ impl FileSource {
         Ok(Self {
             path: path.to_owned(),
             description: path.display().to_string(),
+            block_size: crate::source::source_block_size(&file)?,
             file,
             base_offset: 0,
             len,
@@ -163,6 +145,7 @@ impl FileSource {
                 self.path.display()
             ),
             file: self.file.try_clone()?,
+            block_size: self.block_size,
             base_offset: self
                 .base_offset
                 .checked_add(offset)
@@ -194,34 +177,9 @@ impl ReadAt for FileSource {
             .base_offset
             .checked_add(offset)
             .ok_or_else(|| anyhow!("pool-member physical read offset overflow"))?;
-        let mut filled = 0usize;
-        while filled < buffer.len() {
-            let position = physical_offset + filled as u64;
-            #[cfg(unix)]
-            let count = {
-                use std::os::unix::fs::FileExt;
-                self.file.read_at(&mut buffer[filled..], position)
-            };
-            #[cfg(windows)]
-            let count = {
-                use std::os::windows::fs::FileExt;
-                self.file.seek_read(&mut buffer[filled..], position)
-            };
-            #[cfg(not(any(unix, windows)))]
-            compile_error!("pool-member positioned reads currently require Unix or Windows");
+        crate::source::read_exact_at(&self.file, self.block_size, physical_offset, buffer)
+            .with_context(|| format!("reading {} from {}", buffer.len(), self.description))?;
 
-            let count = count.with_context(|| {
-                format!(
-                    "reading {} bytes at offset {position} from {}",
-                    buffer.len() - filled,
-                    self.description
-                )
-            })?;
-            if count == 0 {
-                bail!("short read at offset {position} from {}", self.description);
-            }
-            filled += count;
-        }
         Ok(())
     }
 }
@@ -524,41 +482,6 @@ fn little_u64(bytes: &[u8], offset: usize) -> Result<u64> {
     Ok(u64::from_le_bytes(value.try_into().unwrap()))
 }
 
-#[cfg(windows)]
-fn device_length(file: &File) -> Result<u64> {
-    use std::mem::size_of;
-    use std::os::windows::io::AsRawHandle;
-    use std::ptr;
-    use windows_sys::Win32::System::IO::DeviceIoControl;
-    use windows_sys::Win32::System::Ioctl::{GET_LENGTH_INFORMATION, IOCTL_DISK_GET_LENGTH_INFO};
-
-    let mut length = GET_LENGTH_INFORMATION::default();
-    let mut returned = 0_u32;
-    // SAFETY: the output is a correctly sized POD structure and the call is
-    // synchronous, so neither the handle nor output pointer can outlive scope.
-    let ok = unsafe {
-        DeviceIoControl(
-            file.as_raw_handle(),
-            IOCTL_DISK_GET_LENGTH_INFO,
-            ptr::null(),
-            0,
-            (&mut length as *mut GET_LENGTH_INFORMATION).cast(),
-            size_of::<GET_LENGTH_INFORMATION>() as u32,
-            &mut returned,
-            ptr::null_mut(),
-        )
-    };
-    if ok == 0 {
-        return Err(std::io::Error::last_os_error()).context("querying physical drive length");
-    }
-    u64::try_from(length.Length).context("physical drive reported a negative length")
-}
-
-#[cfg(not(windows))]
-fn device_length(_file: &File) -> Result<u64> {
-    bail!("platform has no block-device length control")
-}
-
 #[derive(Debug, Clone)]
 struct PoolBlockPointer {
     pointer: Blkptr,
@@ -696,7 +619,13 @@ impl PoolMember {
         let file_source = FileSource::open(path)?;
         let (mut parsed, mut failures) = read_labels(&file_source);
         let mut container_encryption = None;
-        let source = if !parsed.is_empty() {
+        // A partition ending at the disk's end shares the whole disk's rear
+        // label offsets. A valid partition table must take precedence, or the
+        // pool is read at offset zero and every block checksum fails.
+        let partitions = gpt_partitions(&file_source)
+            .or_else(|_| mbr_partitions(&file_source))
+            .unwrap_or_default();
+        let source = if !parsed.is_empty() && partitions.is_empty() {
             if container_key.is_some() {
                 bail!(
                     "a container key was supplied, but {} is not LUKS-encrypted",
@@ -718,23 +647,6 @@ impl PoolMember {
             container_encryption = Some(description);
             source
         } else {
-            let partitions = match gpt_partitions(&file_source) {
-                Ok(partitions) if !partitions.is_empty() => partitions,
-                Ok(_) => {
-                    failures.push("no non-empty GPT partitions were found".to_owned());
-                    mbr_partitions(&file_source).unwrap_or_default()
-                }
-                Err(error) => {
-                    failures.push(format!("GPT scan: {error}"));
-                    match mbr_partitions(&file_source) {
-                        Ok(partitions) => partitions,
-                        Err(error) => {
-                            failures.push(format!("MBR scan: {error}"));
-                            Vec::new()
-                        }
-                    }
-                }
-            };
             let mut candidates = Vec::new();
             let mut locked_luks = 0usize;
             for partition in partitions {
