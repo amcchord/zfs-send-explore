@@ -44,21 +44,33 @@ python3 scripts/verify-macos-package.py 'target/macos-package/ZFS Explore.app'
 
 ## Recover a file
 
-1. Choose **Open Backup** (⌘O) and select a ZFS send, exported pool `.img`, or
-   standalone disk image. For a drive, choose **Open Attached Drive** (⇧⌘D;
-   see below). **Open Path** (⇧⌘O) also accepts a pasted absolute path,
-   including a device such as `/dev/disk4s2`.
-2. Select the intended snapshot or dataset in the sidebar.
-3. For encrypted backups, use **Enter Key** or **Choose Key File**. Slide's
-   64-character raw key and 32-byte binary key files are both accepted.
-4. Double-click folders. For `disk_*.raw`, double-click the image or select
-   **Explore as Disk Image**, then choose the filesystem volume if necessary.
-   Use **Back to outer backup** to return without reopening the source.
-5. Select a regular file or folder and choose **Restore…** (⌘S). Pick a new
-   destination. Existing files are never overwritten by the Mac app.
-6. The completion panel shows the destination, byte count, and SHA-256 for a
-   single file. **Show in Finder** reveals the result. Folder recovery reports
-   skipped symlinks/special files and does not restore filesystem metadata.
+The window guides you through four steps, shown in the step bar at the top:
+**Backup open → Restore point → Unlock → Find files → Restore**.
+
+1. On the welcome screen choose **Open a backup file** (⌘O) or **Open a
+   connected drive** (⇧⌘D; see below). You can also drag a backup file into the
+   window, or use **Open from a path…** (⇧⌘O) for a pasted path such as
+   `/Volumes/Backups/slide.img` or a device such as `/dev/disk4s2`.
+2. The newest restore point is selected for you. Pick another date in the
+   sidebar's **Restore points** list if you need an older copy. Live dataset
+   states and parent datasets are under **Other places in this backup**.
+3. If the restore point is encrypted, paste its key and choose **Unlock**, or
+   choose **Choose Key File…**. Slide's 64-character key and its 32-byte key
+   file both work. A wrong key is reported plainly and nothing else changes.
+4. Browse with double-clicks and the clickable location bar. For a Slide or
+   Datto backup, the banner **The computer's files are inside its disk image**
+   offers **Open Disk Image**. When the disk has several parts, choose the one
+   marked **Recommended** (it is the largest part that holds files).
+5. Select a file or folder and choose **Restore…** (⌘S). The save panel starts
+   on the Desktop. Existing files are never overwritten by the Mac app.
+6. The **Restored** banner shows where the copy was saved; **Show in Finder**
+   reveals it and **Details** shows the full path and SHA-256 of a single file.
+   Folder restores report skipped links or special items and do not restore
+   owners, permissions or timestamps.
+
+Problems are explained in plain words with the engine's original message under
+**Show Details**. Restore point dates are shown in your Mac's time zone; use the
+link at the bottom of the sidebar or **ZFS Explore → Settings…** to change it.
 
 Keys travel through a private child-process pipe, never command-line arguments
 or a local HTTP server. The Rust engine holds key bytes in zeroizing memory.
@@ -69,8 +81,8 @@ string copies are not guaranteed to be zeroized.
 ## Open an attached drive
 
 A drive holding a ZFS pool does not appear in Finder or in the Open Backup panel:
-macOS cannot read its partitions, so it never mounts them. **Open Attached
-Drive** lists external disks directly from DiskArbitration instead, whether or
+macOS cannot read its partitions, so it never mounts them. **Open a
+connected drive** lists external disks directly from DiskArbitration instead, whether or
 not Finder shows them, with each partition's type and size. A ZFS-typed
 partition is suggested first, then the largest partition macOS left unmounted.
 Choosing **Whole disk** also works when exactly one partition holds the pool.

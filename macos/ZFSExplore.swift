@@ -478,26 +478,43 @@ struct StepBar: View {
     let state: BrowserState
     let timeZone: String
     var body: some View {
-        let encrypted = state.selectedView?.encrypted ?? false
-        let current = state.locked ? 2 : model.restored != nil ? 4 : 3
-        HStack(spacing: 0) {
-            step(0, "Backup open", state.description?.components(separatedBy: " · ").first ?? "Ready", current: current)
-            connector
-            step(1, "Restore point", pointLabel, current: current)
-            if encrypted { connector; step(2, state.locked ? "Unlock" : "Unlocked", state.locked ? "Enter the key" : "Key accepted", current: current) }
-            connector
-            step(3, "Find files", state.layers.isEmpty ? "Browse folders" : "Inside a disk image", current: current)
-            connector
-            step(4, model.restored != nil ? "Restored" : "Restore", model.restored != nil ? "Copy saved" : "Save a copy", current: current)
+        // Narrow windows drop the detail lines before anything is clipped.
+        ViewThatFits(in: .horizontal) {
+            row(details: true, titles: true)
+            row(details: false, titles: true)
+            row(details: false, titles: false)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 20).padding(.vertical, 12)
+    }
+    var steps: [(index: Int, title: String, detail: String)] {
+        let restored = model.restored != nil
+        var steps = [
+            (0, "Backup open", state.description?.components(separatedBy: " · ").first ?? "Ready"),
+            (1, "Restore point", pointLabel),
+        ]
+        if state.selectedView?.encrypted ?? false {
+            steps.append((2, state.locked ? "Unlock" : "Unlocked", state.locked ? "Enter the key" : "Key accepted"))
+        }
+        steps.append((3, "Find files", state.layers.isEmpty ? "Browse folders" : "Inside a disk image"))
+        steps.append((4, restored ? "Restored" : "Restore", restored ? "Copy saved" : "Save a copy"))
+        return steps
+    }
+    var current: Int { state.locked ? 2 : model.restored != nil ? 4 : 3 }
+    func row(details: Bool, titles: Bool) -> some View {
+        HStack(spacing: 0) {
+            ForEach(Array(steps.enumerated()), id: \.offset) { offset, step in
+                if offset > 0 { connector }
+                self.step(step.index, titles || step.index == current ? step.title : nil, details ? step.detail : nil)
+            }
+        }
     }
     var pointLabel: String {
         guard let view = state.selectedView else { return "—" }
         return SnapshotTime.compact(view.created_at, zone: timeZone) ?? (view.isCurrent ? "Current files" : view.snapshot ?? view.name ?? view.label)
     }
-    var connector: some View { Rectangle().fill(.quaternary).frame(height: 1).frame(minWidth: 12, maxWidth: 40).padding(.horizontal, 6) }
-    func step(_ index: Int, _ title: String, _ detail: String, current: Int) -> some View {
+    var connector: some View { Rectangle().fill(.quaternary).frame(height: 1).frame(minWidth: 10, maxWidth: 40).padding(.horizontal, 6) }
+    func step(_ index: Int, _ title: String?, _ detail: String?) -> some View {
         let done = index < current || (index == 4 && model.restored != nil)
         let active = index == current && !done
         return HStack(spacing: 8) {
@@ -506,12 +523,14 @@ struct StepBar: View {
                 if done { Image(systemName: "checkmark").font(.system(size: 10, weight: .bold)).foregroundStyle(.white) }
                 else { Circle().fill(active ? Color.teal : Color.secondary.opacity(0.45)).frame(width: 7, height: 7) }
             }.frame(width: 20, height: 20)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(title).font(.caption.weight(.semibold)).foregroundStyle(active || done ? .primary : .secondary)
-                Text(detail).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-            }.fixedSize()
+            if let title {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title).font(.caption.weight(.semibold)).foregroundStyle(active || done ? .primary : .secondary)
+                    if let detail { Text(detail).font(.caption2).foregroundStyle(.secondary) }
+                }
+                .lineLimit(1).fixedSize()
+            }
         }
-        .frame(maxWidth: 190, alignment: .leading)
         .accessibilityElement(children: .combine)
         .accessibilityValue(done ? "Done" : active ? "Current step" : "Not started")
     }
@@ -786,13 +805,13 @@ struct ImageCallout: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(count == 1 ? "The computer’s files are inside its disk image" : "The computer’s files are inside its disk images").font(.headline)
                 Text("Open “\(image.name)” (\(image.sizeLabel)) to browse the computer’s documents and settings.")
-                    .font(.callout).foregroundStyle(.secondary).lineLimit(2).truncationMode(.middle)
+                    .font(.callout).foregroundStyle(.secondary).lineLimit(2)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             Button("Open Disk Image") { model.enter(image) }.buttonStyle(.borderedProminent).controlSize(.large)
         }
         .padding(14)
-        .frame(height: 76)
+        .frame(height: 88)
         .background(Color.teal.opacity(0.09), in: RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.teal.opacity(0.3)))
     }
