@@ -69,7 +69,7 @@ Portable release builds are available from the [GitHub Releases page](https://gi
 | `zfs-send-explore-windows-x86_64.zip` | Both Windows executables, the illustrated Windows guide, screenshots, README, and license |
 | `SHA256SUMS.txt` | SHA-256 checksums for every downloadable program and archive |
 
-On macOS 13 or later, download the disk image for your Mac and drag **ZFS Explore.app** to Applications. The disk image also includes the standalone CLI. Published v0.6.1 Mac apps and CLIs are Developer ID signed and Apple-notarized; the apps and disk images carry stapled tickets. The app ZIP and CLI tarball are also available. macOS may still show its normal first-open confirmation. See the [Mac recovery guide](docs/macos-client.md).
+On macOS 14 or later, download the disk image for your Mac and drag **ZFS Explore.app** to Applications. The disk image also includes the standalone CLI. Published v0.6.1 Mac apps and CLIs are Developer ID signed and Apple-notarized; the apps and disk images carry stapled tickets. The app ZIP and CLI tarball are also available. macOS may still show its normal first-open confirmation. See the [Mac recovery guide](docs/macos-client.md).
 
 Verify a Windows download before running it:
 
@@ -105,7 +105,7 @@ cargo clippy --all-targets -- -D warnings
 
 ### Native macOS client
 
-On macOS 13 or later, build the SwiftUI app and CLI with Xcode command-line tools:
+On macOS 14 or later, build the SwiftUI app and CLI with Xcode command-line tools:
 
 ```sh
 ./scripts/package-macos.sh

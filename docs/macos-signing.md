@@ -87,7 +87,7 @@ ZIP contains an app with its ticket already stapled.
 
 Signing does not remove macOS's normal downloaded-app confirmation, override
 organization policy, or extend support to older macOS versions/wrong CPU types.
-The app requires macOS 13 or later, with separate Apple Silicon and Intel builds.
+The app requires macOS 14 or later, with separate Apple Silicon and Intel builds.
 
 Apple references:
 [Notarizing macOS software](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution),

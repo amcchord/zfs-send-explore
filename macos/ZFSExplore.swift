@@ -1,30 +1,64 @@
 import AppKit
 import Combine
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct BackupView: Decodable {
     let label: String; let encrypted: Bool; let key_format: String?
     let created_at: UInt64?; let selector: String
+    let kind: String?; let name: String?; let snapshot: String?; let parent: Bool?; let detail: String?
+    var isCurrent: Bool { kind == "current" }
+    /// A dated or captured copy that holds files, as opposed to a live dataset
+    /// head or a parent dataset that only contains other backups.
+    var isRestorePoint: Bool { !isCurrent && !(parent ?? false) }
 }
 struct Entry: Decodable, Identifiable {
     let name: String; let directory: Bool; let regular: Bool; let size: UInt64?
     var id: String { name }
-    var image: Bool { ["raw", "img", "vhd", "vmdk", "qcow2", "datto"].contains(URL(fileURLWithPath: name).pathExtension.lowercased()) }
-    var icon: String { directory ? "folder.fill" : image ? "externaldrive.fill" : "doc" }
-    var detail: String { directory ? "Folder" : !regular ? "Special file" : image ? "Disk image" : "File" }
+    var image: Bool { regular && ["raw", "img", "vhd", "vmdk", "qcow2", "datto"].contains(URL(fileURLWithPath: name).pathExtension.lowercased()) }
+    var restorable: Bool { regular || directory }
+    var icon: String { directory ? "folder.fill" : image ? "externaldrive.fill" : regular ? "doc" : "link" }
+    var detail: String { directory ? "Folder" : image ? "Disk image" : regular ? "File" : "Link or special item" }
+    var sizeLabel: String { directory || !regular ? "—" : Sizes.label(size ?? 0) }
 }
 struct Volume: Decodable, Identifiable {
     let selector: String; let label: String; let supported: Bool; let bytes: UInt64; let filesystem: String?
+    let title: String?; let purpose: String?; let partition: UInt32?; let recommended: Bool?
     var id: String { selector }
-    var display: String { "\(selector) · \(filesystem ?? "Unsupported") · \(ByteCountFormatter.string(fromByteCount: Int64(clamping: bytes), countStyle: .file))" }
+    /// "Partition 3 · NTFS · 41.9 GB" — where it is and how big, without repeating its purpose.
+    var placement: String {
+        let place = partition.map { $0 == 0 ? "Whole disk" : "Partition \($0)" } ?? selector
+        return [place, filesystem ?? "unreadable format", Sizes.label(bytes)].joined(separator: " · ")
+    }
 }
 struct BrowserState: Decodable {
-    let title: String; let summary: String?; let views: [BackupView]; let view: Int
+    let title: String; let summary: String?; let description: String?; let views: [BackupView]; let view: Int
     let locked: Bool; let path: String; let entries: [Entry]; let volumes: [Volume]
     let volume: String?; let layers: [String]; let can_back: Bool
+    var selectedView: BackupView? { views.indices.contains(view) ? views[view] : nil }
+    var needsVolume: Bool { !layers.isEmpty && volume == nil && !volumes.isEmpty }
 }
 struct RestoreResult: Decodable { let restored: String; let bytes: UInt64; let files: UInt64; let skipped: UInt64; let sha256: String? }
-struct ServiceError: LocalizedError { let message: String; var errorDescription: String? { message } }
+struct ServiceError: LocalizedError {
+    var title = "That didn’t work"
+    let message: String
+    var details: String? = nil
+    var errorDescription: String? { message }
+}
+
+extension Color {
+    /// Raised surface for cards in both appearances.
+    static let card = Color(nsColor: .controlBackgroundColor)
+}
+
+enum Sizes {
+    static func label(_ bytes: UInt64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        formatter.allowsNonnumericFormatting = false
+        return formatter.string(fromByteCount: Int64(clamping: bytes))
+    }
+}
 
 /// Serial private pipe to the shared Rust engine. Blocking work never runs on the main actor.
 final class Engine: @unchecked Sendable {
@@ -40,7 +74,7 @@ final class Engine: @unchecked Sendable {
                     if self.process == nil {
                         let process = Process()
                         guard let binary = Bundle.main.url(forAuxiliaryExecutable: "zfs-explore-service") else {
-                            throw ServiceError(message: "The recovery engine is missing. Reinstall the complete app bundle.")
+                            throw ServiceError(title: "ZFS Explore is incomplete", message: "The recovery engine is missing. Reinstall the complete app from the disk image.")
                         }
                         process.executableURL = binary
                         let input = Pipe(), output = Pipe()
@@ -52,7 +86,7 @@ final class Engine: @unchecked Sendable {
                     try self.input?.write(contentsOf: data + Data([10]))
                     while !self.pending.contains(10) {
                         guard let chunk = self.output?.availableData, !chunk.isEmpty else {
-                            throw ServiceError(message: "The recovery engine stopped. Close and reopen the app to try again.")
+                            throw ServiceError(title: "The recovery engine stopped", message: "Quit and reopen ZFS Explore to try again. Your backup has not been changed.")
                         }
                         self.pending.append(chunk)
                     }
@@ -63,7 +97,9 @@ final class Engine: @unchecked Sendable {
                         throw ServiceError(message: "The recovery engine returned an invalid response.")
                     }
                     if envelope["ok"] as? Bool != true {
-                        throw ServiceError(message: envelope["error"] as? String ?? "The operation failed.")
+                        let raw = envelope["error"] as? String ?? "The operation failed."
+                        throw ServiceError(title: envelope["title"] as? String ?? "That didn’t work",
+                                           message: envelope["message"] as? String ?? raw, details: raw)
                     }
                     continuation.resume(returning: try JSONSerialization.data(withJSONObject: envelope["result"]!))
                 } catch { continuation.resume(throwing: error) }
@@ -78,11 +114,10 @@ final class Engine: @unchecked Sendable {
     @Published var selection: String?
     @Published var busy = false
     @Published var activity = ""
-    @Published var error: String?
+    @Published var error: ServiceError?
     @Published var restored: RestoreResult?
     @Published var search = ""
     @Published var secret = ""
-    @Published var showUnlock = false
     @Published var showPath = false
     @Published var showDrives = false
     @Published var drives: [AttachedDrive] = []
@@ -90,31 +125,45 @@ final class Engine: @unchecked Sendable {
     @Published var showPreferences = false
     @Published var sourcePath = ""
     private let engine = Engine()
+    var isOpen: Bool { state.map { !$0.title.isEmpty } ?? false }
     var selected: Entry? { state?.entries.first { $0.name == selection } }
     var entries: [Entry] { state?.entries.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) } ?? [] }
-    func perform(_ request: [String: Any], activity: String, restore: Bool = false) {
-        guard !busy else { return }
-        busy = true; self.activity = activity; error = nil
-        restored = nil
-        do {
-            let data = try JSONSerialization.data(withJSONObject: request)
-            Task {
-                defer { busy = false }
-                do {
-                    let result = try await engine.request(data)
-                    if restore { restored = try JSONDecoder().decode(RestoreResult.self, from: result) }
-                    else {
-                        state = try JSONDecoder().decode(BrowserState.self, from: result)
-                        selection = nil; search = ""
-                    }
-                } catch { self.error = error.localizedDescription }
-            }
-        } catch { self.error = error.localizedDescription; busy = false }
+    var canRestore: Bool { selected?.restorable ?? false }
+    /// Disk images in the current folder, largest first, when the user has not yet opened one.
+    var suggestedImages: [Entry] {
+        guard let state, !state.locked, state.layers.isEmpty else { return [] }
+        return state.entries.filter(\.image).sorted { ($0.size ?? 0) > ($1.size ?? 0) }
     }
+
+    @discardableResult
+    func run(_ request: [String: Any], activity: String, restore: Bool = false) async -> Bool {
+        guard !busy else { return false }
+        busy = true; self.activity = activity; error = nil
+        if !restore { restored = nil }
+        defer { busy = false }
+        do {
+            let result = try await engine.request(try JSONSerialization.data(withJSONObject: request))
+            if restore { restored = try JSONDecoder().decode(RestoreResult.self, from: result) }
+            else {
+                state = try JSONDecoder().decode(BrowserState.self, from: result)
+                selection = nil; search = ""
+            }
+            return true
+        } catch let failure as ServiceError {
+            error = failure
+        } catch {
+            self.error = ServiceError(message: error.localizedDescription)
+        }
+        return false
+    }
+    func perform(_ request: [String: Any], activity: String, restore: Bool = false) {
+        Task { await run(request, activity: activity, restore: restore) }
+    }
+
     func chooseSource() {
         let panel = NSOpenPanel()
-        panel.title = "Choose a backup or disk image"; panel.prompt = "Open Backup"
-        panel.message = "Open a ZFS send, an offline pool image, or a raw, QCOW2 or VMDK disk image."
+        panel.title = "Open a Backup"; panel.prompt = "Open"
+        panel.message = "Choose a ZFS send file, a Slide or ZFS pool image, or a virtual disk (RAW, QCOW2 or VMDK)."
         panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
         if panel.runModal() == .OK, let url = panel.url { open(url) }
     }
@@ -122,7 +171,7 @@ final class Engine: @unchecked Sendable {
         // Device nodes are root-owned; the engine asks macOS for read access when denied.
         let device = url.path.hasPrefix("/dev/")
         perform(["method": "open", "path": url.path, "authorize": device],
-                activity: device ? "Waiting for permission to read \(url.lastPathComponent)…" : "Opening backup…")
+                activity: device ? "Waiting for permission to read \(url.lastPathComponent)…" : "Opening \(url.lastPathComponent)…")
     }
     func chooseDrive() {
         refreshDrives()
@@ -140,258 +189,719 @@ final class Engine: @unchecked Sendable {
         showDrives = false
         open(URL(fileURLWithPath: selected.path))
     }
+    func openPath() {
+        showPath = false
+        open(URL(fileURLWithPath: (sourcePath.trimmingCharacters(in: .whitespacesAndNewlines) as NSString).expandingTildeInPath))
+    }
+    func select(_ index: Int) {
+        guard index != state?.view else { return }
+        secret = ""
+        perform(["method": "select", "index": index], activity: "Opening restore point…")
+    }
     func unlockFile() {
-        let panel = NSOpenPanel(); panel.title = "Choose the encryption key"; panel.prompt = "Unlock"
-        panel.message = "Choose the key file for this dataset. Slide keys may be 32 raw bytes or 64 hexadecimal characters."
+        let panel = NSOpenPanel(); panel.title = "Choose the Key File"; panel.prompt = "Unlock"
+        panel.message = "Choose the encryption key file for this backup. Slide key files are 32 bytes or 64 characters long."
         if panel.runModal() == .OK, let url = panel.url {
-            perform(["method": "unlock", "key_file": url.path], activity: "Unlocking backup…")
+            perform(["method": "unlock", "key_file": url.path], activity: "Unlocking…")
         }
     }
     func unlock() {
-        let key = secret; secret = ""; showUnlock = false
-        perform(["method": "unlock", "key": key], activity: "Unlocking backup…")
+        guard !secret.isEmpty else { return }
+        let key = secret; secret = ""
+        perform(["method": "unlock", "key": key], activity: "Unlocking…")
     }
-    func browse(_ entry: Entry) {
-        if entry.directory {
-            let path = state?.path ?? "/"
-            perform(["method": "list", "path": (path == "/" ? "" : path) + "/" + entry.name], activity: "Opening folder…")
-        } else if entry.image { enter(entry) }
+    func open(_ entry: Entry) {
+        if entry.directory { list(child(entry.name)) }
+        else if entry.image { enter(entry) }
+        else { selection = entry.name; restore() }
     }
-    func enter(_ entry: Entry) { perform(["method": "enter", "name": entry.name], activity: "Finding filesystems…") }
+    func child(_ name: String) -> String {
+        let path = state?.path ?? "/"
+        return (path == "/" ? "" : path) + "/" + name
+    }
+    func list(_ path: String) { perform(["method": "list", "path": path], activity: "Opening folder…") }
+    func enter(_ entry: Entry) { perform(["method": "enter", "name": entry.name], activity: "Looking inside \(entry.name)…") }
+    func chooseVolume(_ volume: Volume) { perform(["method": "volume", "selector": volume.selector], activity: "Opening \(volume.purpose ?? "partition")…") }
     func up() {
-        guard let path = state?.path else { return }
-        perform(["method": "list", "path": (path as NSString).deletingLastPathComponent], activity: "Opening parent folder…")
+        guard let path = state?.path, path != "/" else { return }
+        list((path as NSString).deletingLastPathComponent)
     }
+    /// Leave nested disk images until `depth` layers remain open.
+    func leave(toDepth depth: Int) {
+        Task {
+            while let state, state.layers.count > depth, state.can_back {
+                guard await run(["method": "back"], activity: "Returning…") else { return }
+            }
+        }
+    }
+    func close() { perform(["method": "close"], activity: "Closing backup…"); restored = nil }
     func restore() {
-        guard let entry = selected else { return }
-        let panel = NSSavePanel(); panel.title = entry.directory ? "Restore folder" : "Restore file"
+        guard let entry = selected, entry.restorable else { return }
+        let panel = NSSavePanel(); panel.title = entry.directory ? "Restore Folder" : "Restore File"
         panel.prompt = "Restore"; panel.nameFieldStringValue = entry.name
-        panel.message = "Choose where to save the recovered \(entry.directory ? "folder" : "file"). Existing files are kept."
+        panel.message = "Choose where to save a copy of “\(entry.name)”. Existing files are never replaced."
         panel.canCreateDirectories = true
+        panel.directoryURL = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
         if panel.runModal() == .OK, let url = panel.url {
             perform(["method": "extract", "name": entry.name, "destination": url.path], activity: "Restoring \(entry.name)…", restore: true)
         }
     }
 }
 
+// MARK: - Window
+
 struct ContentView: View {
     @ObservedObject var model: Recovery
     @AppStorage("snapshotTimeZone") private var timeZone = "local"
     @State private var timeZoneRevision = 0
+    @State private var columns = NavigationSplitViewVisibility.detailOnly
+    @State private var dropTargeted = false
     var body: some View {
         // Read this state so system time-zone notifications refresh visible dates.
         let _ = timeZoneRevision
-        HStack(spacing: 0) {
-            sidebar.frame(width: 270)
-            Divider()
-            VStack(spacing: 0) {
-                if let state = model.state, !state.title.isEmpty { browser(state) } else { welcome }
-                Divider()
-                HStack(spacing: 9) {
-                    if model.busy { ProgressView().controlSize(.small); Text(model.activity) }
-                    else { Image(systemName: "lock.shield").foregroundStyle(.green); Text("Read-only source · No ZFS installation needed") }
-                    Spacer()
-                    if let state = model.state, !state.locked { Text("\(model.entries.count) \(model.entries.count == 1 ? "item" : "items")").foregroundStyle(.secondary) }
-                }.font(.system(size: 12)).padding(.horizontal, 22).frame(height: 38)
-            }
+        NavigationSplitView(columnVisibility: $columns) {
+            Sidebar(model: model, timeZone: timeZone)
+                .navigationSplitViewColumnWidth(min: 250, ideal: 280, max: 360)
+        } detail: {
+            Detail(model: model, timeZone: timeZone)
+                .navigationSplitViewColumnWidth(min: 620, ideal: 820)
         }
-        .frame(minWidth: 1000, minHeight: 660)
+        .frame(minWidth: 920, minHeight: 620)
+        .navigationTitle("ZFS Explore")
+        .navigationSubtitle(model.isOpen ? model.state!.title : "")
         .toolbar {
-            ToolbarItemGroup(placement: .navigation) {
-                Button { model.chooseSource() } label: { Label("Open Backup", systemImage: "folder.badge.plus") }
-                    .keyboardShortcut("o").help("Choose a backup or disk image")
-                Button { model.chooseDrive() } label: { Label("Open Drive", systemImage: "externaldrive.badge.plus") }
-                    .help("Open an attached drive, including drives Finder doesn’t show")
-                Button { model.showPath = true } label: { Label("Open Path", systemImage: "text.cursor") }
-                    .help("Open a pasted file or device path")
+            ToolbarItem(placement: .navigation) {
+                Menu {
+                    Button("Open Backup File…") { model.chooseSource() }
+                    Button("Open Connected Drive…") { model.chooseDrive() }
+                    Button("Open from a Path…") { model.showPath = true }
+                    if model.isOpen { Divider(); Button("Close Backup") { model.close() } }
+                } label: { Label("Open", systemImage: "folder.badge.plus").labelStyle(.titleAndIcon) }
+                .help("Open a backup file or a connected backup drive")
             }
             ToolbarItem(placement: .primaryAction) {
-                Button { model.restore() } label: { Label("Restore…", systemImage: "arrow.down.to.line") }
-                    .keyboardShortcut("s").disabled(model.selected == nil || !(model.selected!.regular || model.selected!.directory))
+                Button { model.restore() } label: { Label("Restore…", systemImage: "square.and.arrow.down").labelStyle(.titleAndIcon) }
+                    .disabled(!model.canRestore)
+                    .help("Save a copy of the selected file or folder")
             }
         }
         .disabled(model.busy)
-        .overlay(alignment: .top) {
-            if let error = model.error {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack { Label("Couldn’t complete that step", systemImage: "exclamationmark.triangle.fill").font(.headline); Spacer(); Button("Dismiss") { model.error = nil } }
-                    ScrollView { Text(error).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }.frame(maxHeight: 140)
-                }.padding(18).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-                    .overlay(RoundedRectangle(cornerRadius: 12).stroke(.orange.opacity(0.5))).padding(20).shadow(radius: 8)
-            }
-        }
-        .sheet(isPresented: $model.showUnlock, onDismiss: { model.secret = "" }) {
-            VStack(alignment: .leading, spacing: 18) {
-                Label("Unlock this backup", systemImage: "lock.open").font(.title2.bold())
-                Text(model.state?.views[model.state?.view ?? 0].key_format == "raw" ? "Enter the 64-character Slide key, or choose a raw key file from the previous screen." : "Enter the passphrase or hexadecimal key for this dataset.").foregroundStyle(.secondary)
-                SecureField("Encryption key or passphrase", text: $model.secret).textFieldStyle(.roundedBorder).onSubmit { if !model.secret.isEmpty { model.unlock() } }
-                Text("Used only for this session. Never saved to settings or recovery reports.").font(.caption).foregroundStyle(.secondary)
-                HStack { Spacer(); Button("Cancel") { model.secret = ""; model.showUnlock = false }; Button("Unlock") { model.unlock() }.keyboardShortcut(.defaultAction).disabled(model.secret.isEmpty) }
-            }.padding(28).frame(width: 450)
-        }
-        .sheet(isPresented: $model.showPath) {
-            VStack(alignment: .leading, spacing: 18) {
-                Text("Open a backup path").font(.title2.bold())
-                Text("Paste the full path to a backup, offline disk image, or device such as /dev/disk4s2.").foregroundStyle(.secondary)
-                TextField("/Volumes/Backups/slide.img", text: $model.sourcePath).textFieldStyle(.roundedBorder)
-                HStack { Spacer(); Button("Cancel") { model.showPath = false }; Button("Open") { model.showPath = false; model.open(URL(fileURLWithPath: (model.sourcePath as NSString).expandingTildeInPath)) }.keyboardShortcut(.defaultAction).disabled(model.sourcePath.isEmpty) }
-            }.padding(28).frame(width: 480)
-        }
-        .sheet(isPresented: $model.showDrives) { DrivePicker(model: model) }
+        .onChange(of: model.isOpen) { _, open in withAnimation { columns = open ? .all : .detailOnly } }
+        .sheet(isPresented: $model.showPath) { OpenPathSheet(model: model).tint(.teal) }
+        .sheet(isPresented: $model.showDrives) { DrivePicker(model: model).tint(.teal) }
+        .sheet(isPresented: $model.showPreferences) { TimeZonePreferences(selection: $timeZone).tint(.teal) }
         .onOpenURL { model.open($0) }
-        .sheet(isPresented: $model.showPreferences) {
-            TimeZonePreferences(selection: $timeZone)
+        .onDrop(of: [.fileURL], isTargeted: $dropTargeted) { providers in
+            guard let provider = providers.first else { return false }
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                if let url { Task { @MainActor in model.open(url) } }
+            }
+            return true
+        }
+        .overlay {
+            if dropTargeted {
+                RoundedRectangle(cornerRadius: 14).strokeBorder(Color.teal, style: StrokeStyle(lineWidth: 3, dash: [10, 6]))
+                    .background(Color.teal.opacity(0.06), in: RoundedRectangle(cornerRadius: 14)).padding(10)
+                    .overlay(Label("Drop to open this backup", systemImage: "arrow.down.doc").font(.title2.bold()).foregroundStyle(.teal))
+                    .allowsHitTesting(false)
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .NSSystemTimeZoneDidChange)) { _ in
             timeZoneRevision += 1
         }
     }
-    var sidebar: some View {
-        VStack(alignment: .leading, spacing: 22) {
-            HStack(spacing: 10) {
-                Image(systemName: "externaldrive.badge.timemachine").font(.system(size: 29)).foregroundStyle(.teal)
-                VStack(alignment: .leading) { Text("ZFS Explore").font(.title3.bold()); Text("File recovery").font(.caption).foregroundStyle(.secondary) }
-            }.padding(.top, 18)
-            if let state = model.state, !state.title.isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("BACKUP").font(.caption.bold()).foregroundStyle(.secondary)
-                    Text(state.title).font(.headline).lineLimit(3).textSelection(.enabled)
-                    if let summary = state.summary { Text(summary).font(.caption).foregroundStyle(.secondary) }
-                }
-                if !state.views.isEmpty {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("SNAPSHOTS & DATASETS").font(.caption.bold()).foregroundStyle(.secondary)
-                        Button {
-                            model.showPreferences = true
-                        } label: {
-                            Label("Times: \(SnapshotTime.zoneLabel(timeZone))", systemImage: "globe")
-                                .font(.caption).lineLimit(2)
-                        }.buttonStyle(.plain).foregroundStyle(.secondary)
-                            .help("Change the time zone used for snapshot dates")
-                        ScrollView {
-                            VStack(spacing: 4) {
-                                ForEach(Array(state.views.enumerated()), id: \.offset) { i, item in
-                                    Button {
-                                        model.perform(["method": "select", "index": i], activity: "Opening snapshot…")
-                                    } label: {
-                                        HStack(alignment: .top, spacing: 8) {
-                                            Image(systemName: item.encrypted ? "lock" : "clock").frame(width: 16)
-                                            VStack(alignment: .leading, spacing: 5) {
-                                                if let date = SnapshotTime.label(item.created_at, zone: timeZone) {
-                                                    Text(date).font(.system(size: 12, weight: .medium)).fixedSize(horizontal: false, vertical: true)
-                                                    Text(item.label).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(2)
-                                                } else {
-                                                    Text(item.label).font(.system(size: 12)).lineLimit(4)
-                                                }
-                                            }.frame(maxWidth: .infinity, alignment: .leading)
-                                        }.padding(10).background(state.view == i ? Color.accentColor.opacity(0.13) : .clear, in: RoundedRectangle(cornerRadius: 7))
-                                    }.buttonStyle(.plain).help(item.label)
-                                }
+}
+
+// MARK: - Sidebar
+
+struct Sidebar: View {
+    @ObservedObject var model: Recovery
+    let timeZone: String
+    @State private var showOthers = false
+    var body: some View {
+        Group {
+            if let state = model.state, model.isOpen {
+                List(selection: Binding(get: { state.view }, set: { if let index = $0 { model.select(index) } })) {
+                    Section {
+                        BackupSummary(state: state)
+                    }
+                    let points = state.views.indices.filter { state.views[$0].isRestorePoint }
+                    if !points.isEmpty {
+                        Section("Restore points") {
+                            ForEach(Array(points.enumerated()), id: \.element) { order, index in
+                                RestorePointRow(view: state.views[index], timeZone: timeZone, newest: order == 0 && points.count > 1 && state.views[index].created_at != nil)
+                                    .tag(index)
+                            }
+                        }
+                    }
+                    let others = state.views.indices.filter { !state.views[$0].isRestorePoint }
+                    if !others.isEmpty {
+                        Section("Other places in this backup (\(others.count))", isExpanded: $showOthers) {
+                            ForEach(others, id: \.self) { index in
+                                RestorePointRow(view: state.views[index], timeZone: timeZone, newest: false).tag(index)
                             }
                         }
                     }
                 }
-                if !state.layers.isEmpty {
-                    VStack(alignment: .leading, spacing: 7) {
-                        Text("INSIDE DISK IMAGE").font(.caption.bold()).foregroundStyle(.secondary)
-                        ForEach(Array(state.layers.enumerated()), id: \.offset) { _, layer in Text((layer as NSString).lastPathComponent).font(.caption).lineLimit(2) }
-                        if state.can_back { Button("Back to outer backup") { model.perform(["method": "back"], activity: "Returning to backup…") } }
+                .listStyle(.sidebar)
+                .onAppear { showOthers = state.views.indices.contains(state.view) && !state.views[state.view].isRestorePoint }
+            } else {
+                List {
+                    Section("How it works") {
+                        HowItWorksRow(number: 1, title: "Open your backup", detail: "A backup file or a connected drive")
+                        HowItWorksRow(number: 2, title: "Pick a restore point", detail: "The date you want files from")
+                        HowItWorksRow(number: 3, title: "Restore your files", detail: "Save copies anywhere you like")
+                    }
+                }.listStyle(.sidebar)
+            }
+        }
+        .safeAreaInset(edge: .bottom) {
+            VStack(alignment: .leading, spacing: 8) {
+                if model.isOpen {
+                    Button { model.showPreferences = true } label: {
+                        Label("Times in \(SnapshotTime.zoneName(timeZone))", systemImage: "globe").lineLimit(1)
+                    }.buttonStyle(.link).font(.caption).help("Change the time zone used for restore point dates")
+                }
+                Label("Read-only: your backup is never changed", systemImage: "checkmark.shield.fill")
+                    .font(.caption).foregroundStyle(.secondary)
+            }.frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16).padding(.vertical, 12)
+        }
+    }
+}
+
+struct BackupSummary: View {
+    let state: BrowserState
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "externaldrive.fill.badge.timemachine").font(.system(size: 22)).foregroundStyle(.teal).frame(width: 30)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(state.title).font(.headline).lineLimit(2).truncationMode(.middle)
+                Text(state.description ?? state.summary ?? "").font(.caption).foregroundStyle(.secondary).lineLimit(2)
+            }
+        }.padding(.vertical, 4).selectionDisabled()
+    }
+}
+
+struct RestorePointRow: View {
+    let view: BackupView
+    let timeZone: String
+    let newest: Bool
+    var body: some View {
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: view.encrypted ? "lock.fill" : view.isCurrent ? "circle.dashed" : view.parent == true ? "folder" : "clock.arrow.circlepath")
+                .foregroundStyle(.teal).frame(width: 16).padding(.top, 2)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(title).fontWeight(.medium).lineLimit(1)
+                    if newest {
+                        Text("Newest").font(.caption2.bold()).foregroundStyle(.teal)
+                            .padding(.horizontal, 5).padding(.vertical, 1).background(.teal.opacity(0.14), in: Capsule())
                     }
                 }
-                Spacer(minLength: 0)
-                Button("Close Backup") { model.perform(["method": "close"], activity: "Closing backup…") }
-            } else {
-                VStack(alignment: .leading, spacing: 22) {
-                    step("1", "Choose your backup", "ZFS send, disk image, or attached drive")
-                    step("2", "Find your files", "Select a snapshot, then browse")
-                    step("3", "Restore a copy", "Save files to a new destination")
-                }.padding(.top, 20)
-                Spacer()
+                Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
-            Label("Your backup stays unchanged", systemImage: "checkmark.shield").font(.caption).foregroundStyle(.secondary)
-        }.padding(.horizontal, 20).padding(.bottom, 20).background(Color(nsColor: .controlBackgroundColor))
+        }
+        .padding(.vertical, 2)
+        .help([SnapshotTime.label(view.created_at, zone: timeZone), view.label].compactMap { $0 }.joined(separator: "\n"))
     }
-    func step(_ number: String, _ title: String, _ detail: String) -> some View {
+    var title: String {
+        if let date = SnapshotTime.short(view.created_at, zone: timeZone) { return date }
+        if view.isCurrent { return "Current files" }
+        if view.parent == true { return view.name ?? view.label }
+        return view.snapshot ?? view.name ?? view.label
+    }
+    var subtitle: String {
+        if view.parent == true { return "Holds other backups" }
+        return view.detail ?? view.label
+    }
+}
+
+struct HowItWorksRow: View {
+    let number: Int; let title: String; let detail: String
+    var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            Text(number).font(.caption.bold()).frame(width: 23, height: 23).background(.teal.opacity(0.12), in: Circle())
-            VStack(alignment: .leading, spacing: 4) { Text(title).font(.subheadline.bold()); Text(detail).font(.caption).foregroundStyle(.secondary) }
+            Text("\(number)").font(.caption.bold()).foregroundStyle(.teal)
+                .frame(width: 22, height: 22).background(.teal.opacity(0.14), in: Circle())
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).fontWeight(.medium)
+                Text(detail).font(.caption).foregroundStyle(.secondary)
+            }
+        }.padding(.vertical, 3)
+    }
+}
+
+// MARK: - Detail
+
+struct Detail: View {
+    @ObservedObject var model: Recovery
+    let timeZone: String
+    @State private var showBusy = false
+    var body: some View {
+        VStack(spacing: 0) {
+            if let state = model.state, model.isOpen {
+                StepBar(model: model, state: state, timeZone: timeZone)
+                Divider()
+                if state.locked { UnlockView(model: model, view: state.selectedView) }
+                else if state.needsVolume { VolumeChooser(model: model, state: state) }
+                else { BrowserView(model: model, state: state) }
+            } else {
+                WelcomeView(model: model)
+            }
+        }
+        .overlay(alignment: .top) {
+            if let error = model.error { ProblemBanner(error: error) { model.error = nil }.padding(16) }
+        }
+        .overlay {
+            if showBusy {
+                VStack(spacing: 12) {
+                    ProgressView().controlSize(.large)
+                    Text(model.activity).font(.headline)
+                    Text("Large backups can take a minute.").font(.caption).foregroundStyle(.secondary)
+                }
+                .padding(28).frame(minWidth: 260)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                .shadow(radius: 12, y: 4)
+                .transition(.opacity)
+            }
+        }
+        .onChange(of: model.busy) { _, busy in
+            if busy {
+                Task { try? await Task.sleep(nanoseconds: 350_000_000); if model.busy { withAnimation { showBusy = true } } }
+            } else { withAnimation { showBusy = false } }
         }
     }
-    var welcome: some View {
-        VStack(spacing: 20) {
-            Spacer()
-            Image(systemName: "externaldrive.fill").font(.system(size: 66, weight: .light)).foregroundStyle(.teal)
-            Text("Get your files back.").font(.system(size: 32, weight: .semibold))
-            Text("Open a backup, find the file you need, and save a copy.\nBrowse encrypted Slide backups without mounting a disk.").multilineTextAlignment(.center).foregroundStyle(.secondary).lineSpacing(4)
-            HStack(spacing: 12) {
-                Button("Choose Backup…") { model.chooseSource() }.buttonStyle(.borderedProminent)
-                Button("Open Attached Drive…") { model.chooseDrive() }
-            }.controlSize(.large)
-            Text("ZFS send · ZFS pool image · attached drive · RAW · QCOW2 · VMDK").font(.caption).foregroundStyle(.secondary)
-            Spacer()
-        }.frame(maxWidth: .infinity).padding(40)
+}
+
+/// Where the user is in the recovery: open → restore point → unlock → find → restore.
+struct StepBar: View {
+    @ObservedObject var model: Recovery
+    let state: BrowserState
+    let timeZone: String
+    var body: some View {
+        let encrypted = state.selectedView?.encrypted ?? false
+        let current = state.locked ? 2 : model.restored != nil ? 4 : 3
+        HStack(spacing: 0) {
+            step(0, "Backup open", state.description?.components(separatedBy: " · ").first ?? "Ready", current: current)
+            connector
+            step(1, "Restore point", pointLabel, current: current)
+            if encrypted { connector; step(2, state.locked ? "Unlock" : "Unlocked", state.locked ? "Enter the key" : "Key accepted", current: current) }
+            connector
+            step(3, "Find files", state.layers.isEmpty ? "Browse folders" : "Inside a disk image", current: current)
+            connector
+            step(4, model.restored != nil ? "Restored" : "Restore", model.restored != nil ? "Copy saved" : "Save a copy", current: current)
+        }
+        .padding(.horizontal, 20).padding(.vertical, 12)
     }
-    func browser(_ state: BrowserState) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
+    var pointLabel: String {
+        guard let view = state.selectedView else { return "—" }
+        return SnapshotTime.compact(view.created_at, zone: timeZone) ?? (view.isCurrent ? "Current files" : view.snapshot ?? view.name ?? view.label)
+    }
+    var connector: some View { Rectangle().fill(.quaternary).frame(height: 1).frame(minWidth: 12, maxWidth: 40).padding(.horizontal, 6) }
+    func step(_ index: Int, _ title: String, _ detail: String, current: Int) -> some View {
+        let done = index < current || (index == 4 && model.restored != nil)
+        let active = index == current && !done
+        return HStack(spacing: 8) {
+            ZStack {
+                Circle().fill(done ? Color.teal : active ? Color.teal.opacity(0.16) : Color.secondary.opacity(0.12))
+                if done { Image(systemName: "checkmark").font(.system(size: 10, weight: .bold)).foregroundStyle(.white) }
+                else { Circle().fill(active ? Color.teal : Color.secondary.opacity(0.45)).frame(width: 7, height: 7) }
+            }.frame(width: 20, height: 20)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).font(.caption.weight(.semibold)).foregroundStyle(active || done ? .primary : .secondary)
+                Text(detail).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+            }.fixedSize()
+        }
+        .frame(maxWidth: 190, alignment: .leading)
+        .accessibilityElement(children: .combine)
+        .accessibilityValue(done ? "Done" : active ? "Current step" : "Not started")
+    }
+}
+
+struct WelcomeView: View {
+    @ObservedObject var model: Recovery
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 26) {
+                Spacer(minLength: 30)
+                Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 96, height: 96)
+                VStack(spacing: 10) {
+                    Text("Get your files back").font(.system(size: 34, weight: .bold))
+                    Text("Open a backup, pick the date you want, and save copies of the files you need.\nZFS Explore only reads your backup. It never changes it.")
+                        .multilineTextAlignment(.center).foregroundStyle(.secondary).lineSpacing(3)
+                }
+                HStack(spacing: 16) {
+                    ChoiceCard(icon: "doc.badge.clock", title: "Open a backup file", detail: "A ZFS send file, a Slide or ZFS pool image, or a RAW, QCOW2 or VMDK disk", shortcut: "⌘O", prominent: true) { model.chooseSource() }
+                    ChoiceCard(icon: "externaldrive.connected.to.line.below", title: "Open a connected drive", detail: "A USB drive from a Slide or Datto device, even when Finder can’t show it", shortcut: "⇧⌘D", prominent: false) { model.chooseDrive() }
+                }.frame(maxWidth: 680)
+                HStack(spacing: 6) {
+                    Button("Open from a path…") { model.showPath = true }.buttonStyle(.link)
+                    Text("·").foregroundStyle(.tertiary)
+                    Text("or drag a backup file into this window").foregroundStyle(.secondary)
+                }.font(.callout)
+                Spacer(minLength: 20)
+                HStack(spacing: 28) {
+                    HowItWorksStep(number: 1, title: "Open your backup")
+                    Image(systemName: "chevron.right").foregroundStyle(.tertiary)
+                    HowItWorksStep(number: 2, title: "Pick a restore point")
+                    Image(systemName: "chevron.right").foregroundStyle(.tertiary)
+                    HowItWorksStep(number: 3, title: "Restore your files")
+                }.padding(.bottom, 26)
+            }.frame(maxWidth: .infinity).padding(.horizontal, 40)
+        }
+    }
+}
+
+struct HowItWorksStep: View {
+    let number: Int; let title: String
+    var body: some View {
+        HStack(spacing: 8) {
+            Text("\(number)").font(.caption.bold()).foregroundStyle(.teal)
+                .frame(width: 22, height: 22).background(.teal.opacity(0.14), in: Circle())
+            Text(title).font(.callout).foregroundStyle(.secondary)
+        }
+    }
+}
+
+struct ChoiceCard: View {
+    let icon: String; let title: String; let detail: String; let shortcut: String; let prominent: Bool
+    let action: () -> Void
+    @State private var hover = false
+    var body: some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 12) {
+                Image(systemName: icon).font(.system(size: 24, weight: .medium))
+                    .foregroundStyle(prominent ? .white : .teal)
+                    .frame(width: 48, height: 48)
+                    .background(prominent ? AnyShapeStyle(Color.teal) : AnyShapeStyle(Color.teal.opacity(0.14)), in: RoundedRectangle(cornerRadius: 12))
                 VStack(alignment: .leading, spacing: 5) {
-                    Text(state.layers.isEmpty ? "Browse backup" : "Browse disk image").font(.title2.bold())
-                    Text(state.path.isEmpty ? "/" : state.path).font(.system(.subheadline, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled).lineLimit(2)
+                    HStack { Text(title).font(.title3.weight(.semibold)); Spacer(); Text(shortcut).font(.caption).foregroundStyle(.tertiary) }
+                    Text(detail).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
-                Spacer()
-                if !state.locked { TextField("Find in this folder", text: $model.search).onChange(of: model.search) { _ in model.selection = nil }.textFieldStyle(.roundedBorder).frame(width: 190) }
-            }.padding(22)
-            if state.locked {
-                VStack(spacing: 18) {
-                    Image(systemName: "lock.shield").font(.system(size: 46)).foregroundStyle(.teal)
-                    Text("This backup is encrypted").font(.title2.bold())
-                    Text("Unlock the selected dataset to browse and recover its files.").foregroundStyle(.secondary)
-                    HStack { Button("Enter Key…") { model.showUnlock = true }.buttonStyle(.borderedProminent); Button("Choose Key File…") { model.unlockFile() } }
-                    Text("Your key is kept only for this session.").font(.caption).foregroundStyle(.secondary)
-                }.frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                HStack {
-                    Button { model.up() } label: { Label("Up", systemImage: "arrow.up") }.disabled(state.path == "/")
-                    if !state.volumes.isEmpty {
-                        Picker("Volume", selection: Binding(get: { state.volume ?? "" }, set: { model.perform(["method": "volume", "selector": $0], activity: "Opening volume…") })) {
-                            Text("Choose a volume…").tag("")
-                            ForEach(state.volumes) { volume in Text(volume.display).tag(volume.selector).disabled(!volume.supported) }
-                        }
+            }
+            .padding(20).frame(maxWidth: .infinity, minHeight: 170, alignment: .topLeading)
+            .background(RoundedRectangle(cornerRadius: 16).fill(Color.card))
+            .overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(hover || prominent ? Color.teal.opacity(hover ? 0.9 : 0.45) : Color.secondary.opacity(0.2), lineWidth: hover ? 2 : 1))
+            .contentShape(RoundedRectangle(cornerRadius: 16))
+        }
+        .buttonStyle(.plain)
+        .onHover { hover = $0 }
+        .accessibilityHint(detail)
+    }
+}
+
+struct UnlockView: View {
+    @ObservedObject var model: Recovery
+    let view: BackupView?
+    @FocusState private var focused: Bool
+    var body: some View {
+        VStack(spacing: 18) {
+            Spacer()
+            Image(systemName: "lock.fill").font(.system(size: 30, weight: .semibold)).foregroundStyle(.white)
+                .frame(width: 72, height: 72).background(Color.teal, in: Circle())
+            Text("This restore point is encrypted").font(.title.bold())
+            Text(prompt).multilineTextAlignment(.center).foregroundStyle(.secondary).frame(maxWidth: 480)
+            HStack(spacing: 10) {
+                SecureField(placeholder, text: $model.secret).textFieldStyle(.roundedBorder).frame(width: 340)
+                    .focused($focused).onSubmit { model.unlock() }
+                Button("Unlock") { model.unlock() }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction).disabled(model.secret.isEmpty)
+            }.controlSize(.large)
+            Button("Choose Key File…") { model.unlockFile() }
+            Label("Your key is used only while ZFS Explore is open and is never saved.", systemImage: "hand.raised.fill")
+                .font(.caption).foregroundStyle(.secondary).padding(.top, 6)
+            Spacer()
+        }.padding(40).frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onAppear { focused = true }
+    }
+    var placeholder: String { view?.key_format == "passphrase" ? "Passphrase" : "Encryption key" }
+    var prompt: String {
+        switch view?.key_format {
+        case "raw": return "Paste the 64-character encryption key from your Slide console, or choose the key file you downloaded."
+        case "hex": return "Enter the 64-character encryption key for this backup, or choose a file that contains it."
+        case "passphrase": return "Enter the passphrase for this backup, or choose a file that contains it."
+        default: return "Enter the encryption key or passphrase for this backup, or choose its key file."
+        }
+    }
+}
+
+struct VolumeChooser: View {
+    @ObservedObject var model: Recovery
+    let state: BrowserState
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                BreadcrumbBar(model: model, state: state).padding(.bottom, 4)
+                Text("Choose where to look").font(.title2.bold())
+                Text("This disk image has \(state.volumes.count) parts. The recommended one usually holds the computer’s documents, programs and settings.")
+                    .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                VStack(spacing: 10) {
+                    ForEach(state.volumes) { volume in
+                        Button { model.chooseVolume(volume) } label: { VolumeRow(volume: volume) }
+                            .buttonStyle(.plain).disabled(!volume.supported)
                     }
-                    Spacer()
-                    if let entry = model.selected, entry.image {
-                        Button("Explore as Disk Image") { model.enter(entry) }
-                    }
-                    Button("Restore…") { model.restore() }.buttonStyle(.borderedProminent)
-                        .disabled(model.selected == nil || !(model.selected!.regular || model.selected!.directory))
-                }.padding(.horizontal, 22).padding(.bottom, 14)
-                Table(model.entries, selection: $model.selection) {
-                    TableColumn("Name") { entry in
-                        HStack { Image(systemName: entry.icon).foregroundStyle(entry.directory ? .teal : .secondary).frame(width: 20); Text(entry.name).lineLimit(1) }
-                            .contextMenu { if entry.directory { Button("Open Folder") { model.browse(entry) } }; if entry.regular { Button("Explore as Disk Image") { model.enter(entry) } }; Button("Restore…") { model.selection = entry.name; model.restore() }.disabled(!entry.regular && !entry.directory) }
-                    }.width(min: 220, ideal: 330)
-                    TableColumn("Kind") { entry in Text(entry.detail).foregroundStyle(.secondary) }.width(85)
-                    TableColumn("Size") { entry in Text((entry.directory ? nil : entry.size).map { ByteCountFormatter.string(fromByteCount: Int64(clamping: $0), countStyle: .file) } ?? "—").monospacedDigit().foregroundStyle(.secondary) }.width(90)
-                }.contextMenu(forSelectionType: String.self) { _ in } primaryAction: { ids in
-                    if let name = ids.first, let entry = state.entries.first(where: { $0.name == name }) { model.browse(entry) }
                 }
-                .overlay {
-                    if model.entries.isEmpty {
-                        Text(state.volume == nil && !state.volumes.isEmpty ? "Choose a supported volume above to browse its files." : model.search.isEmpty ? "This folder is empty." : "No files match your search.").foregroundStyle(.secondary).padding()
+            }.padding(24).frame(maxWidth: 720, alignment: .leading).frame(maxWidth: .infinity)
+        }
+    }
+}
+
+struct VolumeRow: View {
+    let volume: Volume
+    @State private var hover = false
+    var body: some View {
+        let recommended = volume.recommended == true
+        HStack(spacing: 14) {
+            Image(systemName: volume.supported ? "internaldrive.fill" : "internaldrive")
+                .font(.title2).foregroundStyle(volume.supported ? Color.teal : Color.secondary).frame(width: 34)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 8) {
+                    Text(volume.purpose ?? volume.label).font(.headline)
+                    if recommended {
+                        Text("Recommended").font(.caption.bold()).foregroundStyle(.white)
+                            .padding(.horizontal, 7).padding(.vertical, 2).background(Color.teal, in: Capsule())
                     }
                 }
-                if let result = model.restored {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack { Label("Restore complete", systemImage: "checkmark.circle.fill").font(.headline).foregroundStyle(.green); Spacer(); Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: result.restored)]) } }
-                        Text("\(result.files) \(result.files == 1 ? "file" : "files") · \(ByteCountFormatter.string(fromByteCount: Int64(clamping: result.bytes), countStyle: .file)) saved to \(result.restored)").font(.caption).textSelection(.enabled)
-                        if let hash = result.sha256 { Text("SHA-256  \(hash)").font(.system(size: 10, design: .monospaced)).textSelection(.enabled) }
-                        if result.skipped > 0 { Text("\(result.skipped) links or special entries were skipped.").font(.caption).foregroundStyle(.orange) }
-                    }.padding(18).background(.green.opacity(0.07))
-                } else {
-                    HStack { Image(systemName: "info.circle"); Text("Double-click folders or disk images to explore. Select a file or folder, then Restore.") }.font(.caption).foregroundStyle(.secondary).padding(16)
+                Text(volume.placement).font(.callout).foregroundStyle(.secondary)
+                if !volume.supported { Text("ZFS Explore can’t read this part.").font(.caption).foregroundStyle(.secondary) }
+            }
+            Spacer()
+            if volume.supported { Image(systemName: "chevron.right").foregroundStyle(.tertiary) }
+        }
+        .padding(16)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color.card))
+        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(recommended || hover ? Color.teal.opacity(hover ? 0.9 : 0.5) : Color.secondary.opacity(0.18), lineWidth: hover ? 2 : 1))
+        .opacity(volume.supported ? 1 : 0.6)
+        .contentShape(Rectangle())
+        .onHover { hover = $0 && volume.supported }
+    }
+}
+
+/// Clickable location: outer backup › disk images › folders.
+struct BreadcrumbBar: View {
+    @ObservedObject var model: Recovery
+    let state: BrowserState
+    var body: some View {
+        let hasSource = !state.views.isEmpty
+        let layerNames = state.layers.map { ($0 as NSString).lastPathComponent }
+        let parts = state.path.split(separator: "/").map(String.init)
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 4) {
+                if hasSource {
+                    crumb(state.title, icon: "externaldrive.fill.badge.timemachine", current: layerNames.isEmpty && parts.isEmpty) {
+                        if layerNames.isEmpty { model.list("/") } else { model.leave(toDepth: 0) }
+                    }
+                }
+                ForEach(Array(layerNames.enumerated()), id: \.offset) { index, name in
+                    if hasSource || index > 0 { separator }
+                    crumb(name, icon: "externaldrive.fill", current: index == layerNames.count - 1 && parts.isEmpty) {
+                        if index == layerNames.count - 1 { model.list("/") } else { model.leave(toDepth: index + 1) }
+                    }
+                }
+                ForEach(Array(parts.enumerated()), id: \.offset) { index, name in
+                    separator
+                    crumb(name, icon: "folder.fill", current: index == parts.count - 1) {
+                        model.list("/" + parts[...index].joined(separator: "/"))
+                    }
                 }
             }
         }
+    }
+    var separator: some View { Image(systemName: "chevron.right").font(.caption2.weight(.semibold)).foregroundStyle(.tertiary) }
+    func crumb(_ title: String, icon: String, current: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: icon).lineLimit(1).truncationMode(.middle)
+                .font(.callout.weight(current ? .semibold : .regular))
+                .foregroundStyle(current ? .primary : .secondary)
+                .padding(.horizontal, 8).padding(.vertical, 4)
+                .background(current ? Color.secondary.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 6))
+                .frame(maxWidth: 240)
+        }.buttonStyle(.plain).disabled(current)
+    }
+}
+
+struct BrowserView: View {
+    @ObservedObject var model: Recovery
+    let state: BrowserState
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 10) {
+                Button { model.up() } label: { Image(systemName: "arrow.up").frame(width: 16, height: 16) }
+                    .buttonStyle(.bordered).help("Go to the enclosing folder").disabled(state.path == "/")
+                BreadcrumbBar(model: model, state: state)
+                Spacer(minLength: 8)
+                HStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                    TextField("Search this folder", text: $model.search).textFieldStyle(.plain)
+                        .onChange(of: model.search) { model.selection = nil }
+                    if !model.search.isEmpty { Button { model.search = "" } label: { Image(systemName: "xmark.circle.fill") }.buttonStyle(.plain).foregroundStyle(.secondary) }
+                }
+                .padding(.horizontal, 8).padding(.vertical, 5)
+                .background(RoundedRectangle(cornerRadius: 7).fill(Color.card))
+                .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(.quaternary))
+                .frame(width: 210)
+            }.padding(.horizontal, 16).padding(.vertical, 10)
+            if let image = model.suggestedImages.first {
+                ImageCallout(model: model, image: image, count: model.suggestedImages.count).padding(.horizontal, 16).padding(.bottom, 10)
+            }
+            Table(model.entries, selection: $model.selection) {
+                TableColumn("Name") { entry in
+                    HStack(spacing: 8) {
+                        Image(systemName: entry.icon).foregroundStyle(entry.directory || entry.image ? Color.teal : Color.secondary).frame(width: 18)
+                        Text(entry.name).lineLimit(1).truncationMode(.middle)
+                    }
+                }.width(min: 220, ideal: 380)
+                TableColumn("Kind") { entry in Text(entry.detail).foregroundStyle(.secondary) }.width(min: 80, ideal: 110)
+                TableColumn("Size") { entry in Text(entry.sizeLabel).monospacedDigit().foregroundStyle(.secondary) }.width(min: 70, ideal: 90)
+            }
+            .contextMenu(forSelectionType: String.self) { ids in
+                if let name = ids.first, let entry = state.entries.first(where: { $0.name == name }) {
+                    if entry.directory { Button("Open Folder") { model.open(entry) } }
+                    if entry.regular { Button("Look Inside as a Disk Image") { model.enter(entry) } }
+                    Button("Restore…") { model.selection = entry.name; model.restore() }.disabled(!entry.restorable)
+                }
+            } primaryAction: { ids in
+                if let name = ids.first, let entry = state.entries.first(where: { $0.name == name }) { model.open(entry) }
+            }
+            .overlay {
+                if model.entries.isEmpty {
+                    VStack(spacing: 8) {
+                        Image(systemName: model.search.isEmpty ? "folder" : "magnifyingglass").font(.system(size: 30)).foregroundStyle(.tertiary)
+                        Text(model.search.isEmpty ? "This folder is empty" : "No items match “\(model.search)”").font(.headline).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            Divider()
+            if let result = model.restored { RestoredBanner(model: model, result: result) }
+            else { ActionBar(model: model, state: state) }
+        }
+    }
+}
+
+struct ImageCallout: View {
+    @ObservedObject var model: Recovery
+    let image: Entry
+    let count: Int
+    var body: some View {
+        HStack(spacing: 14) {
+            Image(systemName: "externaldrive.fill").font(.title2).foregroundStyle(.teal).frame(width: 34)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(count == 1 ? "The computer’s files are inside its disk image" : "The computer’s files are inside its disk images").font(.headline)
+                Text("Open “\(image.name)” (\(image.sizeLabel)) to browse the computer’s documents and settings.")
+                    .font(.callout).foregroundStyle(.secondary).lineLimit(2).truncationMode(.middle)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            Button("Open Disk Image") { model.enter(image) }.buttonStyle(.borderedProminent).controlSize(.large)
+        }
+        .padding(14)
+        .frame(height: 76)
+        .background(Color.teal.opacity(0.09), in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.teal.opacity(0.3)))
+    }
+}
+
+struct ActionBar: View {
+    @ObservedObject var model: Recovery
+    let state: BrowserState
+    var body: some View {
+        HStack(spacing: 12) {
+            if let entry = model.selected {
+                Image(systemName: entry.icon).foregroundStyle(.teal).frame(width: 18)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(entry.name).fontWeight(.medium).lineLimit(1).truncationMode(.middle)
+                    Text(entry.directory ? "Folder · restores everything inside it" : "\(entry.detail) · \(entry.sizeLabel)").font(.caption).foregroundStyle(.secondary)
+                }
+            } else {
+                Image(systemName: "hand.tap").foregroundStyle(.secondary).frame(width: 18)
+                Text("Select a file or folder to restore it. Double-click a folder to open it.").foregroundStyle(.secondary)
+            }
+            Spacer()
+            Text("\(model.entries.count) \(model.entries.count == 1 ? "item" : "items")").font(.caption).foregroundStyle(.tertiary)
+            if let entry = model.selected, entry.directory || entry.image {
+                Button(entry.directory ? "Open Folder" : "Open Disk Image") { model.open(entry) }.controlSize(.large)
+            }
+            Button("Restore…") { model.restore() }.buttonStyle(.borderedProminent).controlSize(.large)
+                .keyboardShortcut("s").disabled(!model.canRestore)
+        }.padding(.horizontal, 16).padding(.vertical, 12)
+    }
+}
+
+struct RestoredBanner: View {
+    @ObservedObject var model: Recovery
+    let result: RestoreResult
+    @State private var details = false
+    var body: some View {
+        let url = URL(fileURLWithPath: result.restored)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 12) {
+                Image(systemName: "checkmark.circle.fill").font(.title).foregroundStyle(.green)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Restored “\(url.lastPathComponent)”").font(.headline)
+                    Text(summary(url)).font(.callout).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                }
+                Spacer()
+                Button(details ? "Hide Details" : "Details") { details.toggle() }.buttonStyle(.link)
+                Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([url]) }.buttonStyle(.borderedProminent).controlSize(.large)
+                Button { model.restored = nil } label: { Image(systemName: "xmark") }.buttonStyle(.borderless).help("Dismiss")
+            }
+            if details {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(result.restored).font(.caption).textSelection(.enabled)
+                    if let hash = result.sha256 { Text("SHA-256  \(hash)").font(.system(size: 11, design: .monospaced)).textSelection(.enabled) }
+                    Text("Only file contents are restored; owners, permissions and timestamps are not.").font(.caption).foregroundStyle(.secondary)
+                }.padding(.leading, 44)
+            }
+            if result.skipped > 0 {
+                Label("\(result.skipped) links or special items were skipped.", systemImage: "info.circle").font(.caption).foregroundStyle(.orange).padding(.leading, 44)
+            }
+        }
+        .padding(.horizontal, 16).padding(.vertical, 12).background(Color.green.opacity(0.08))
+    }
+    func summary(_ url: URL) -> String {
+        let place = url.deletingLastPathComponent().path.replacingOccurrences(of: NSHomeDirectory(), with: "~")
+        let files = result.files == 1 ? "1 file" : "\(result.files) files"
+        return "\(files) · \(Sizes.label(result.bytes)) · saved in \(place)"
+    }
+}
+
+struct ProblemBanner: View {
+    let error: ServiceError
+    let dismiss: () -> Void
+    @State private var details = false
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "exclamationmark.triangle.fill").font(.title2).foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(error.title).font(.headline)
+                    Text(error.message).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
+                if error.details != nil && error.details != error.message {
+                    Button(details ? "Hide Details" : "Show Details") { details.toggle() }.buttonStyle(.link)
+                }
+                Button("OK", action: dismiss).keyboardShortcut(.cancelAction)
+            }
+            if details, let text = error.details {
+                ScrollView { Text(text).font(.system(size: 11, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
+                    .frame(maxHeight: 130).padding(10).background(Color.card, in: RoundedRectangle(cornerRadius: 8))
+            }
+        }
+        .padding(16).frame(maxWidth: 680)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Color.orange.opacity(0.45)))
+        .shadow(color: .black.opacity(0.15), radius: 12, y: 4)
+    }
+}
+
+struct OpenPathSheet: View {
+    @ObservedObject var model: Recovery
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Label("Open from a path", systemImage: "text.cursor").font(.title2.bold())
+            Text("Paste the full path to a backup file, disk image or disk device, such as /Volumes/Backups/slide.img or /dev/disk4s2.")
+                .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            TextField("/Volumes/Backups/slide.img", text: $model.sourcePath).textFieldStyle(.roundedBorder).onSubmit { if !model.sourcePath.isEmpty { model.openPath() } }
+            HStack { Spacer(); Button("Cancel") { model.showPath = false }.keyboardShortcut(.cancelAction); Button("Open") { model.openPath() }.keyboardShortcut(.defaultAction).disabled(model.sourcePath.isEmpty) }
+        }.padding(26).frame(width: 500)
     }
 }
 
@@ -402,8 +912,8 @@ struct DrivePicker: View {
     private let refresh = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Label("Open an attached drive", systemImage: "externaldrive.badge.plus").font(.title2.bold())
-            Text("Drives holding ZFS don’t appear in Finder because macOS can’t read them. Choose the drive’s pool partition, or the whole disk and ZFS Explore finds the pool on it.")
+            Label("Open a connected drive", systemImage: "externaldrive.connected.to.line.below").font(.title2.bold())
+            Text("Backup drives from Slide or Datto devices don’t appear in Finder because macOS can’t read them. Choose the drive below; ZFS Explore suggests the part that holds the backup.")
                 .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             List(selection: $model.driveSelection) {
                 ForEach(model.drives) { drive in
@@ -414,26 +924,26 @@ struct DrivePicker: View {
                     }
                 }
             }
-            .frame(height: 280)
+            .frame(height: 260)
             .overlay {
                 if model.drives.isEmpty {
                     VStack(spacing: 8) {
-                        Image(systemName: "externaldrive.trianglebadge.exclamationmark").font(.system(size: 30)).foregroundStyle(.secondary)
-                        Text("No attached drives found").font(.headline)
-                        Text("Connect the backup drive. It appears here within a few seconds.").font(.caption).foregroundStyle(.secondary)
+                        ProgressView().controlSize(.small)
+                        Text("Waiting for a backup drive…").font(.headline)
+                        Text("Connect the drive. It appears here within a few seconds.").font(.caption).foregroundStyle(.secondary)
                     }
                 }
             }
-            Label("If needed, macOS asks for permission to read the drive. ZFS Explore opens it read-only without mounting or changing it.", systemImage: "lock.shield")
+            Label("If needed, macOS asks for an administrator password to read the drive. ZFS Explore opens it read-only and never mounts or changes it.", systemImage: "lock.shield")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             HStack {
                 Button("Refresh") { model.refreshDrives() }
                 Spacer()
-                Button("Cancel") { model.showDrives = false }
-                Button("Open Read-Only") { model.openDrive() }.keyboardShortcut(.defaultAction).disabled(model.driveSelection == nil)
+                Button("Cancel") { model.showDrives = false }.keyboardShortcut(.cancelAction)
+                Button("Open Drive") { model.openDrive() }.keyboardShortcut(.defaultAction).disabled(model.driveSelection == nil)
             }
         }
-        .padding(28).frame(width: 560)
+        .padding(26).frame(width: 580)
         .onReceive(refresh) { _ in model.refreshDrives() }
     }
     func row(_ slice: DriveSlice, suggested: Bool) -> some View {
@@ -443,8 +953,8 @@ struct DrivePicker: View {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
                     Text(slice.whole ? "Whole disk" : slice.typeLabel).fontWeight(suggested ? .semibold : .regular)
-                    Text("\(slice.path) · \(slice.sizeLabel)").font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary)
-                    if suggested { Text("Suggested").font(.caption2.bold()).padding(.horizontal, 6).padding(.vertical, 2).background(.teal.opacity(0.15), in: Capsule()) }
+                    Text("\(slice.sizeLabel) · \(slice.path)").font(.caption).foregroundStyle(.secondary)
+                    if suggested { Text("Suggested").font(.caption2.bold()).foregroundStyle(.white).padding(.horizontal, 6).padding(.vertical, 2).background(Color.teal, in: Capsule()) }
                 }
                 Text(slice.hint).font(.caption).foregroundStyle(.secondary)
             }
@@ -463,9 +973,9 @@ struct TimeZonePreferences: View {
     }
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("Snapshot time zone").font(.title2.bold())
-            Text("Show backup dates in the time zone that makes sense to you. This changes how dates appear; the backup stays unchanged.")
-                .foregroundStyle(.secondary)
+            Text("Restore point time zone").font(.title2.bold())
+            Text("Choose the time zone used to show when each restore point was made. This only changes how dates appear.")
+                .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             choice("local", "Use my Mac’s time zone", detail: TimeZone.autoupdatingCurrent.identifier)
             choice("UTC", "UTC", detail: "Coordinated Universal Time")
             Divider()
@@ -478,14 +988,13 @@ struct TimeZonePreferences: View {
                     if zones.isEmpty { Text("No matching time zones").foregroundStyle(.secondary).padding() }
                 }
             }.frame(height: 220)
-            Text("Selected: \(SnapshotTime.zoneLabel(selection))").font(.caption)
-            HStack { Text("Saved automatically for future sessions.").font(.caption).foregroundStyle(.secondary); Spacer(); Button("Done") { dismiss() }.keyboardShortcut(.defaultAction) }
+            HStack { Text("Selected: \(SnapshotTime.zoneLabel(selection)) · saved automatically").font(.caption).foregroundStyle(.secondary); Spacer(); Button("Done") { dismiss() }.keyboardShortcut(.defaultAction) }
         }.padding(26).frame(width: 510)
     }
     func choice(_ identifier: String, _ title: String, detail: String? = nil) -> some View {
         Button { selection = identifier } label: {
             HStack(spacing: 10) {
-                Image(systemName: selection == identifier ? "checkmark.circle.fill" : "circle").foregroundStyle(selection == identifier ? Color.accentColor : .secondary)
+                Image(systemName: selection == identifier ? "checkmark.circle.fill" : "circle").foregroundStyle(selection == identifier ? Color.teal : .secondary)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(title)
                     if let detail { Text(detail).font(.caption).foregroundStyle(.secondary) }
@@ -506,13 +1015,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @StateObject private var model = Recovery()
     var body: some Scene {
         Window("ZFS Explore", id: "recovery") { ContentView(model: model).tint(.teal) }
-            .defaultSize(width: 1120, height: 740)
+            .defaultSize(width: 1180, height: 760)
             .commands {
                 CommandGroup(replacing: .appSettings) { Button("Settings…") { model.showPreferences = true }.keyboardShortcut(",").disabled(model.busy) }
                 CommandGroup(replacing: .newItem) {
-                    Button("Open Backup…") { model.chooseSource() }.keyboardShortcut("o").disabled(model.busy)
-                    Button("Open Attached Drive…") { model.chooseDrive() }.keyboardShortcut("d", modifiers: [.command, .shift]).disabled(model.busy)
-                    Button("Open Path…") { model.showPath = true }.keyboardShortcut("o", modifiers: [.command, .shift]).disabled(model.busy)
+                    Button("Open Backup File…") { model.chooseSource() }.keyboardShortcut("o").disabled(model.busy)
+                    Button("Open Connected Drive…") { model.chooseDrive() }.keyboardShortcut("d", modifiers: [.command, .shift]).disabled(model.busy)
+                    Button("Open from a Path…") { model.showPath = true }.keyboardShortcut("o", modifiers: [.command, .shift]).disabled(model.busy)
+                    Divider()
+                    Button("Close Backup") { model.close() }.disabled(model.busy || !model.isOpen)
+                }
+                CommandGroup(replacing: .help) {
+                    Button("ZFS Explore Help") {
+                        NSWorkspace.shared.open(URL(string: "https://github.com/amcchord/zfs-send-explore/blob/main/docs/macos-client.md")!)
+                    }
                 }
             }
     }

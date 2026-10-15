@@ -36,7 +36,7 @@ for binary in "$APP/Contents/MacOS/ZFSExplore" "$SERVICE" "$CLI"; do
 done
 VERSION=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$APP/Contents/Info.plist")
 cat > "$STAGE/README.txt" <<README
-ZFS Explore $VERSION for macOS 13 or later ($ARCH)
+ZFS Explore $VERSION for macOS 14 or later ($ARCH)
 
 App: drag ZFS Explore.app to Applications, then open it normally.
 CLI: copy zfs-send-extract to a writable folder and run it from Terminal.

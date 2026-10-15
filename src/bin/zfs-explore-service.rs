@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 use zfs_send_extract::client::{InceptionCatalog, SourceCatalog, child_path};
 use zfs_send_extract::filesystem::DirectoryEntry;
+use zfs_send_extract::presentation;
 #[cfg(target_os = "macos")]
 use zfs_send_extract::source::register_authorized_source;
 use zfs_send_extract::source::release_authorized_sources;
@@ -133,20 +134,28 @@ impl Session {
                 .map(|v| {
                     json!({
                         "label": v.label, "encrypted": v.encrypted, "key_format": v.key_format,
-                        "created_at": v.created_at, "selector": v.selector,
+                        "created_at": v.created_at, "selector": v.selector, "kind": v.kind,
+                        "dataset": v.dataset, "snapshot": v.snapshot, "parent": v.parent,
+                        "name": presentation::short_name(&v.dataset),
+                        "detail": presentation::view_detail(v),
                     })
                 })
                 .collect()
         });
         let layer = self.layers.last();
         let volumes: Vec<Value> = layer.map_or(vec![], |l| {
-            l.catalog.volumes.iter().map(|v| json!({
-            "selector": v.selector, "label": v.label(), "supported": v.filesystem.is_some(),
+            let recommended = presentation::recommended_volume(&l.catalog.volumes);
+            l.catalog.volumes.iter().enumerate().map(|(index, v)| json!({
+                "selector": v.selector, "label": v.label(), "supported": v.filesystem.is_some(),
                 "bytes": v.length, "filesystem": v.filesystem.map(|f| f.to_string()),
-        })).collect()
+                "title": presentation::volume_title(v), "purpose": presentation::volume_purpose(v),
+                "partition": v.partition, "recommended": recommended == Some(index),
+            })).collect()
         });
         Ok(json!({
             "title": self.title, "summary": self.source.as_ref().map(|s| &s.summary),
+            "description": self.source.as_ref().map(presentation::source_description),
+            "recommended_view": self.source.as_ref().and_then(|s| presentation::recommended_view(&s.views)),
             "views": views, "view": self.view, "locked": self.locked(),
             "path": self.current_path(), "entries": entries, "volumes": volumes,
             "volume": layer.and_then(|l| l.volume.as_ref()),
@@ -199,6 +208,15 @@ impl Session {
             .is_some_and(|s| s.views.is_empty())
         {
             bail!("This backup contains no browsable filesystem views");
+        }
+        // Start where a first-time user most likely wants to be: the newest
+        // restore point that holds files.
+        if let Some(index) = candidate
+            .source
+            .as_ref()
+            .and_then(|s| presentation::recommended_view(&s.views))
+        {
+            candidate.view = index;
         }
         let state = candidate.state()?;
         Ok((candidate, state))
@@ -576,7 +594,11 @@ fn main() -> Result<()> {
         let response = match result {
             Ok(value) => json!({"ok": true, "result": value}),
             // Do not echo the original JSON request (it may contain credentials).
-            Err(error) => json!({"ok": false, "error": format!("{error:#}")}),
+            Err(error) => {
+                let raw = format!("{error:#}");
+                let friendly = presentation::friendly_error(&raw);
+                json!({"ok": false, "error": raw, "title": friendly.title, "message": friendly.message})
+            }
         };
         serde_json::to_writer(&mut output, &response)?;
         output.write_all(b"\n")?;

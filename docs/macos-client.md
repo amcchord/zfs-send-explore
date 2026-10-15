@@ -1,6 +1,6 @@
 # macOS client
 
-ZFS Explore is a native SwiftUI app for macOS 13 or later, with the same Rust
+ZFS Explore is a native SwiftUI app for macOS 14 or later, with the same Rust
 recovery engine as the CLI and Windows app. No ZFS driver or pool mount is needed.
 
 Build on a Mac with Xcode command-line tools and Rust 1.87 or later:

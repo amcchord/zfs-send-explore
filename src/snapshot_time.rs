@@ -43,6 +43,26 @@ impl SnapshotTimeZone {
                 .to_string(),
         })
     }
+
+    /// Compact form for lists, such as "Sep 21, 2026 · 2:00 PM". A chosen
+    /// zone keeps its abbreviation; the full form above stays available for
+    /// details where repeated daylight-saving hours must be distinguished.
+    pub fn format_short(self, timestamp: u64) -> Option<String> {
+        if timestamp == 0 {
+            return None;
+        }
+        let utc = DateTime::<Utc>::from_timestamp(i64::try_from(timestamp).ok()?, 0)?;
+        Some(match self {
+            Self::Local => utc
+                .with_timezone(&Local)
+                .format("%b %-d, %Y · %-I:%M %p")
+                .to_string(),
+            Self::Named(zone) => utc
+                .with_timezone(&zone)
+                .format("%b %-d, %Y · %-I:%M %p %Z")
+                .to_string(),
+        })
+    }
 }
 
 #[cfg(test)]
