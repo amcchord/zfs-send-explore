@@ -97,6 +97,15 @@ final class CaptureWindow: NSWindow {
                 await pause(); snap("25-slide-restored")
             }
         }
+        // ZFSE_CAPTURE_DRIVE=1 opens the first attached drive (for example a
+        // pool image attached with `hdiutil attach -nomount -readonly`).
+        if env["ZFSE_CAPTURE_DRIVE"] == "1", let key = env["ZFSE_CAPTURE_SLIDE_KEY"] {
+            model.search = ""; model.restored = nil
+            model.chooseDrive(); await pause(1.2); snap("30-drive-picker")
+            model.openDrive(); await settle(model); snap("31-drive-opened")
+            await model.run(["method": "unlock", "key_file": key], activity: "Unlocking…"); await pause(); snap("32-drive-unlocked")
+            print("drive title:", model.title)
+        }
         exit(0)
     }
 }

@@ -124,7 +124,15 @@ final class Engine: @unchecked Sendable {
     @Published var driveSelection: String?
     @Published var showPreferences = false
     @Published var sourcePath = ""
+    /// Name of the drive chosen in the picker, shown instead of its device node.
+    @Published var driveTitle: (path: String, title: String)?
     private let engine = Engine()
+    /// The open backup's name: a drive's model, or the file name.
+    var title: String {
+        guard let state else { return "" }
+        if let drive = driveTitle, (drive.path as NSString).lastPathComponent == state.title { return drive.title }
+        return state.title
+    }
     var isOpen: Bool { state.map { !$0.title.isEmpty } ?? false }
     var selected: Entry? { state?.entries.first { $0.name == selection } }
     var entries: [Entry] { state?.entries.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) } ?? [] }
@@ -165,7 +173,7 @@ final class Engine: @unchecked Sendable {
         panel.title = "Open a Backup"; panel.prompt = "Open"
         panel.message = "Choose a ZFS send file, a Slide or ZFS pool image, or a virtual disk (RAW, QCOW2 or VMDK)."
         panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
-        if panel.runModal() == .OK, let url = panel.url { open(url) }
+        if panel.runModal() == .OK, let url = panel.url { driveTitle = nil; open(url) }
     }
     func open(_ url: URL) {
         // Device nodes are root-owned; the engine asks macOS for read access when denied.
@@ -185,12 +193,15 @@ final class Engine: @unchecked Sendable {
         if !slices.contains(where: { $0.id == driveSelection }) { driveSelection = nil }
     }
     func openDrive() {
-        guard let selected = drives.flatMap({ [$0.disk] + $0.partitions }).first(where: { $0.id == driveSelection }) else { return }
+        guard let drive = drives.first(where: { ([$0.disk] + $0.partitions).contains { $0.id == driveSelection } }),
+              let selected = ([drive.disk] + drive.partitions).first(where: { $0.id == driveSelection }) else { return }
         showDrives = false
+        driveTitle = (selected.path, selected.whole ? drive.name : "\(drive.name) · \(selected.typeLabel)")
         open(URL(fileURLWithPath: selected.path))
     }
     func openPath() {
         showPath = false
+        driveTitle = nil
         open(URL(fileURLWithPath: (sourcePath.trimmingCharacters(in: .whitespacesAndNewlines) as NSString).expandingTildeInPath))
     }
     func select(_ index: Int) {
@@ -268,7 +279,7 @@ struct ContentView: View {
         }
         .frame(minWidth: 920, minHeight: 620)
         .navigationTitle("ZFS Explore")
-        .navigationSubtitle(model.isOpen ? model.state!.title : "")
+        .navigationSubtitle(model.isOpen ? model.title : "")
         .toolbar {
             ToolbarItem(placement: .navigation) {
                 Menu {
@@ -323,7 +334,7 @@ struct Sidebar: View {
             if let state = model.state, model.isOpen {
                 List(selection: Binding(get: { state.view }, set: { if let index = $0 { model.select(index) } })) {
                     Section {
-                        BackupSummary(state: state)
+                        BackupSummary(state: state, title: model.title)
                     }
                     let points = state.views.indices.filter { state.views[$0].isRestorePoint }
                     if !points.isEmpty {
@@ -371,11 +382,12 @@ struct Sidebar: View {
 
 struct BackupSummary: View {
     let state: BrowserState
+    let title: String
     var body: some View {
         HStack(spacing: 10) {
             Image(systemName: "externaldrive.fill.badge.timemachine").font(.system(size: 22)).foregroundStyle(.teal).frame(width: 30)
             VStack(alignment: .leading, spacing: 2) {
-                Text(state.title).font(.headline).lineLimit(2).truncationMode(.middle)
+                Text(title).font(.headline).lineLimit(2).truncationMode(.middle)
                 Text(state.description ?? state.summary ?? "").font(.caption).foregroundStyle(.secondary).lineLimit(2)
             }
         }.padding(.vertical, 4).selectionDisabled()
@@ -705,7 +717,7 @@ struct BreadcrumbBar: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 4) {
                 if hasSource {
-                    crumb(state.title, icon: "externaldrive.fill.badge.timemachine", current: layerNames.isEmpty && parts.isEmpty) {
+                    crumb(model.title, icon: "externaldrive.fill.badge.timemachine", current: layerNames.isEmpty && parts.isEmpty) {
                         if layerNames.isEmpty { model.list("/") } else { model.leave(toDepth: 0) }
                     }
                 }

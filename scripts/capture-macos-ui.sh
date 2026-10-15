@@ -4,6 +4,7 @@
 #   ZFSE_CAPTURE_DARK=1                 capture in Dark Mode
 #   ZFSE_CAPTURE_WIDTH / _HEIGHT        window size (default 1180x760)
 #   ZFSE_CAPTURE_SLIDE / _SLIDE_KEY     optional real Slide pool image and key file
+#   ZFSE_CAPTURE_DRIVE=1                also open the first attached drive (needs _SLIDE_KEY)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 OUTPUT=$(mkdir -p "${1:-target/macos-ui}" && cd "${1:-target/macos-ui}" && pwd)

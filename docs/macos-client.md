@@ -80,6 +80,8 @@ string copies are not guaranteed to be zeroized.
 
 ## Open an attached drive
 
+![Choosing a connected drive](screenshots/macos/connected-drive.png)
+
 A drive holding a ZFS pool does not appear in Finder or in the Open Backup panel:
 macOS cannot read its partitions, so it never mounts them. **Open a
 connected drive** lists external disks directly from DiskArbitration instead, whether or
@@ -90,7 +92,7 @@ The list refreshes every two seconds, so a drive connected while it is open
 appears without reopening it. Internal storage and Apple disk images (such as
 this app's own DMG) are hidden. Mounted partitions show their current mount path.
 A suggestion is based on the partition type, not a guarantee that it contains ZFS.
-Removing the selected device clears the selection; reconnecting requires choosing
+Once open, the backup is shown by the drive's name rather than its device node. Removing the selected device clears the selection; reconnecting requires choosing
 it again, even if macOS reuses the same disk number.
 
 Disk devices belong to `root:operator`, so macOS asks for an administrator
