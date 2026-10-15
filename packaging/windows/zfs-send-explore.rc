@@ -1,2 +1,5 @@
-1 RT_MANIFEST "packaging/windows/zfs-send-explore-windows.exe.manifest"
+// Resource type 24 is RT_MANIFEST. The numeric form does not depend on
+// windows.h being included, which rc.exe needs to resolve the macro; an
+// unresolved name is stored as a custom type that Windows ignores.
+1 24 "packaging/windows/zfs-send-explore-windows.exe.manifest"
 101 ICON "packaging/icons/ZFSExplore.ico"

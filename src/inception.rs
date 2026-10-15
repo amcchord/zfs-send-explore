@@ -535,20 +535,21 @@ impl InceptionSession {
 }
 
 struct FileImage {
-    file: Mutex<File>,
+    file: File,
+    block_size: usize,
     len: u64,
 }
 
 impl FileImage {
     fn open(path: &Path) -> Result<Self> {
-        let file = File::open(path)
-            .with_context(|| format!("opening standalone disk image {}", path.display()))?;
-        let len = file
-            .metadata()
-            .with_context(|| format!("reading disk-image size for {}", path.display()))?
-            .len();
+        let file = crate::source::open_read_only(path).with_context(|| {
+            format!("opening standalone disk image {} read-only", path.display())
+        })?;
+        let len = crate::source::source_length(&file, path)?;
+        let block_size = crate::source::source_block_size(&file)?;
         Ok(Self {
-            file: Mutex::new(file),
+            file,
+            block_size,
             len,
         })
     }
@@ -569,12 +570,7 @@ impl ImageRead for FileImage {
                 self.len
             );
         }
-        let mut file = self
-            .file
-            .lock()
-            .map_err(|_| anyhow!("standalone image file lock was poisoned"))?;
-        file.seek(SeekFrom::Start(offset))?;
-        file.read_exact(buffer)?;
+        crate::source::read_exact_at(&self.file, self.block_size, offset, buffer)?;
         Ok(())
     }
 }

@@ -1,6 +1,6 @@
 # macOS client
 
-ZFS Explore is a native SwiftUI app for macOS 13 or later, with the same Rust
+ZFS Explore is a native SwiftUI app for macOS 14 or later, with the same Rust
 recovery engine as the CLI and Windows app. No ZFS driver or pool mount is needed.
 
 Build on a Mac with Xcode command-line tools and Rust 1.87 or later:
@@ -44,19 +44,33 @@ python3 scripts/verify-macos-package.py 'target/macos-package/ZFS Explore.app'
 
 ## Recover a file
 
-1. Choose **Open Backup** (⌘O) and select a ZFS send, exported pool `.img`, or
-   standalone disk image. **Open Path** also accepts a pasted absolute path.
-2. Select the intended snapshot or dataset in the sidebar.
-3. For encrypted backups, use **Enter Key** or **Choose Key File**. Slide's
-   64-character raw key and 32-byte binary key files are both accepted.
-4. Double-click folders. For `disk_*.raw`, double-click the image or select
-   **Explore as Disk Image**, then choose the filesystem volume if necessary.
-   Use **Back to outer backup** to return without reopening the source.
-5. Select a regular file or folder and choose **Restore…** (⌘S). Pick a new
-   destination. Existing files are never overwritten by the Mac app.
-6. The completion panel shows the destination, byte count, and SHA-256 for a
-   single file. **Show in Finder** reveals the result. Folder recovery reports
-   skipped symlinks/special files and does not restore filesystem metadata.
+The window guides you through four steps, shown in the step bar at the top:
+**Backup open → Restore point → Unlock → Find files → Restore**.
+
+1. On the welcome screen choose **Open a backup file** (⌘O) or **Open a
+   connected drive** (⇧⌘D; see below). You can also drag a backup file into the
+   window, or use **Open from a path…** (⇧⌘O) for a pasted path such as
+   `/Volumes/Backups/slide.img` or a device such as `/dev/disk4s2`.
+2. The newest restore point is selected for you. Pick another date in the
+   sidebar's **Restore points** list if you need an older copy. Live dataset
+   states and parent datasets are under **Other places in this backup**.
+3. If the restore point is encrypted, paste its key and choose **Unlock**, or
+   choose **Choose Key File…**. Slide's 64-character key and its 32-byte key
+   file both work. A wrong key is reported plainly and nothing else changes.
+4. Browse with double-clicks and the clickable location bar. For a Slide or
+   Datto backup, the banner **The computer's files are inside its disk image**
+   offers **Open Disk Image**. When the disk has several parts, choose the one
+   marked **Recommended** (it is the largest part that holds files).
+5. Select a file or folder and choose **Restore…** (⌘S). The save panel starts
+   on the Desktop. Existing files are never overwritten by the Mac app.
+6. The **Restored** banner shows where the copy was saved; **Show in Finder**
+   reveals it and **Details** shows the full path and SHA-256 of a single file.
+   Folder restores report skipped links or special items and do not restore
+   owners, permissions or timestamps.
+
+Problems are explained in plain words with the engine's original message under
+**Show Details**. Restore point dates are shown in your Mac's time zone; use the
+link at the bottom of the sidebar or **ZFS Explore → Settings…** to change it.
 
 Keys travel through a private child-process pipe, never command-line arguments
 or a local HTTP server. The Rust engine holds key bytes in zeroizing memory.
@@ -64,11 +78,39 @@ Changing snapshots, closing a backup, or quitting discards the active key.
 Swift secure-field contents are cleared on submit/dismiss; Swift/Foundation
 string copies are not guaranteed to be zeroized.
 
-The Mac app supports ZFS native encryption; Datto LUKS and agent-password UI,
-physical disk discovery, and incremental application remain CLI/Windows features.
-A directly supplied device path must already be readable by the current user.
-Use an offline image for normal recovery. Single disk or single top-level mirror
-pool layouts are supported; RAIDZ and striped/multiple-vdev pools are not.
+## Open an attached drive
+
+![Choosing a connected drive](screenshots/macos/connected-drive.png)
+
+A drive holding a ZFS pool does not appear in Finder or in the Open Backup panel:
+macOS cannot read its partitions, so it never mounts them. **Open a
+connected drive** lists external disks directly from DiskArbitration instead, whether or
+not Finder shows them, with each partition's type and size. A ZFS-typed
+partition is suggested first, then the largest partition macOS left unmounted.
+Choosing **Whole disk** also works when exactly one partition holds the pool.
+The list refreshes every two seconds, so a drive connected while it is open
+appears without reopening it. Internal storage and Apple disk images (such as
+this app's own DMG) are hidden. Mounted partitions show their current mount path.
+A suggestion is based on the partition type, not a guarantee that it contains ZFS.
+Once open, the backup is shown by the drive's name rather than its device node. Removing the selected device clears the selection; reconnecting requires choosing
+it again, even if macOS reuses the same disk number.
+
+Disk devices belong to `root:operator`, so macOS asks for an administrator
+password when the selected device is not already readable. The engine runs
+Apple's `/usr/libexec/authopen`, which shows the standard system prompt for the
+right `sys.openfile.readonly./dev/diskN`, and passes back a read-only file
+descriptor over a private socket. No privileged process stays running, the
+device's permissions are not changed, and the handle is closed when the backup
+is closed or another is opened. **Open Path** uses the same prompt for paths
+under `/dev/` for exact disk nodes. Pool and standalone filesystem devices use
+the same size detection and sector-aligned reads, including `/dev/rdiskN` paths.
+The CLI needs an already readable device or an administrator launch; it does not
+show the desktop authorization prompt.
+
+The Mac app supports ZFS native encryption; Datto LUKS and agent-password UI and
+incremental application remain CLI/Windows features. Single disk or single
+top-level mirror pool layouts are supported; RAIDZ and striped/multiple-vdev
+pools are not.
 
 Long operations show an indeterminate activity indicator and run off the main
 thread. Byte-level progress and cancel/resume are not yet provided.

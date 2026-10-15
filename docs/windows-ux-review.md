@@ -1,5 +1,8 @@
 # Windows UI/UX review and v0.5.0–v0.5.1 design
 
+> [!NOTE]
+> This is the historical v0.5 review. The v0.9.0 redesign of both desktop apps is described in the [desktop UX audit](desktop-ux-audit.md).
+
 This pass treats the Windows client as a recovery tool for two audiences: an operator who has a backup or drive and wants the safest obvious next action, and a power user who needs exact source selection, nested-image control, and keyboard speed. The backend safety model remains unchanged: sources are read-only, untrusted structures are bounded and validated, and extraction publishes only after successful completion.
 
 ## v0.5.1 contextual-action follow-up

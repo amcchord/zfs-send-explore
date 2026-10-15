@@ -37,6 +37,7 @@ Detailed implementation and validation material lives in:
 | Open standalone images and recursively nested images | Supported without mounting or materializing the complete child image; the UI retains up to eight active layers |
 | Native Windows snapshot browser and extractor | Supported as `zfs-send-explore-windows.exe` |
 | Native Windows physical-drive discovery | Enumerates disk number, model, size, and media type; confirms the exact read-only selection |
+| Native macOS attached-drive discovery | Lists external disks and partitions Finder does not show; the macOS administrator prompt grants read-only access |
 | Direct password/key entry in Windows | ZFS, Datto LUKS, and Datto agent secrets use the non-persisting Windows credential prompt and zeroizing memory; key files remain supported |
 | Open a GPT/MBR whole-disk image or `\\.\PhysicalDriveN` | Supported when exactly one partition resolves to a supported plain or LUKS-wrapped ZFS member |
 | Preserve sparse holes during extraction and incremental updates | Supported; zero ranges are deallocated when the destination filesystem permits it |
@@ -68,7 +69,7 @@ Portable release builds are available from the [GitHub Releases page](https://gi
 | `zfs-send-explore-windows-x86_64.zip` | Both Windows executables, the illustrated Windows guide, screenshots, README, and license |
 | `SHA256SUMS.txt` | SHA-256 checksums for every downloadable program and archive |
 
-On macOS 13 or later, download the disk image for your Mac and drag **ZFS Explore.app** to Applications. The disk image also includes the standalone CLI. Published v0.6.1 Mac apps and CLIs are Developer ID signed and Apple-notarized; the apps and disk images carry stapled tickets. The app ZIP and CLI tarball are also available. macOS may still show its normal first-open confirmation. See the [Mac recovery guide](docs/macos-client.md).
+On macOS 14 or later, download the disk image for your Mac and drag **ZFS Explore.app** to Applications. The disk image also includes the standalone CLI. Published v0.6.1 Mac apps and CLIs are Developer ID signed and Apple-notarized; the apps and disk images carry stapled tickets. The app ZIP and CLI tarball are also available. macOS may still show its normal first-open confirmation. See the [Mac recovery guide](docs/macos-client.md).
 
 Verify a Windows download before running it:
 
@@ -104,22 +105,27 @@ cargo clippy --all-targets -- -D warnings
 
 ### Native macOS client
 
-On macOS 13 or later, build the SwiftUI app and CLI with Xcode command-line tools:
+On macOS 14 or later, build the SwiftUI app and CLI with Xcode command-line tools:
 
 ```sh
 ./scripts/package-macos.sh
 open 'target/macos-package/ZFS Explore.app'
 ```
 
-Choose a backup, select a snapshot, unlock if needed, and browse folders or nested
-disk images. **Restore…** saves a copy to a new destination and shows its SHA-256.
-The source is read-only and existing destination files are preserved. See the
+![ZFS Explore on macOS showing a Slide backup and its disk image](docs/screenshots/macos/slide-backup.png)
+
+The app walks through four steps: open a backup (or connected drive), pick a
+restore point, unlock it if needed, then find and restore files. The newest
+restore point is selected automatically, Slide and Datto backups point straight
+to the protected computer's disk image, and the recommended partition is marked.
+**Restore…** saves a copy to a new destination. The source is read-only and
+existing destination files are preserved. See the
 [Mac guide](docs/macos-client.md) for packaging, key handling, and current limits.
 Local development builds are ad-hoc signed. The [Mac release signing procedure](docs/macos-signing.md) signs and notarizes the CI-built archives before publication.
 
 ### Native Windows client
 
-![The native Windows client selecting a snapshot from a compound send](docs/screenshots/windows/snapshot-selector.jpg)
+![ZFS Explore for Windows inside a Slide backup's disk image](docs/screenshots/windows/inside-disk-image.png)
 
 On Windows 10 or 11, build the GUI with the stable MSVC Rust toolchain and the Windows SDK:
 
@@ -130,7 +136,7 @@ cargo build --release --bin zfs-send-explore-windows
 
 The GUI binary is `target\release\zfs-send-explore-windows.exe`; the packaging script also builds `zfs-send-extract.exe` and creates a distributable ZIP containing both clients and the illustrated documentation. It uses Win32 common controls, Windows file dialogs, the Segoe UI system typeface, per-monitor DPI scaling, and background workers so long stream scans do not block the window.
 
-Use **Choose** for one-step selection and automatic send, pool-member, or standalone-image detection; **Open path** handles pasted/manual paths. Attached disks appear in a physical-drive picker with disk number, model, capacity, and media type; the exact read-only choice is confirmed before opening. Physical-drive access may require starting the client as Administrator. Encrypted views present format-aware direct-entry and key-file actions together, including an explicit 32-byte raw-file path. See the [Windows client guide](docs/windows-client.md) and [UI/UX review](docs/windows-ux-review.md) for the complete workflow, shortcuts, settings, and safety constraints.
+Start from **Open a backup file**, **Open a connected drive** or **Open from a path** on the welcome page. The newest restore point is selected, a guidance bar suggests the next step (unlock, or open the computer's disk image), and the recommended part of a disk image is chosen automatically. **Open drive…** lists drives by model and size and labels the computer's own Windows disk; reading a drive may require **Run as administrator**. Encrypted restore points open a single unlock dialog that accepts a pasted key or a key file. See the [Windows client guide](docs/windows-client.md) and the [desktop UX audit](docs/desktop-ux-audit.md) for the complete workflow, shortcuts, settings, and safety constraints.
 
 ## Browse and extract from a send file
 

@@ -7,7 +7,8 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 $Executable = Join-Path $Root "target\release\zfs-send-explore-windows.exe"
 $Output = Join-Path $Root $OutputDirectory
-$Trace = Join-Path $env:RUNNER_TEMP "zfse-ui-startup.txt"
+$TempRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
+$Trace = Join-Path $TempRoot "zfse-ui-startup.txt"
 $env:ZFSE_UI_TRACE = $Trace
 
 if (-not (Test-Path $Executable)) {
@@ -141,8 +142,19 @@ function Stop-Client([System.Diagnostics.Process]$Process) {
     }
 }
 
+Write-Host "Capturing the welcome page"
+$Welcome = Start-Process -FilePath $Executable -PassThru
+try {
+    $WelcomeWindow = Wait-MainWindow $Welcome
+    Start-Sleep -Seconds 3
+    Save-Window $WelcomeWindow (Join-Path $Output "welcome.png")
+}
+finally {
+    Stop-Client $Welcome
+}
+
 $SendFixture = Join-Path $Root "tests\fixtures\multi-snapshot.zfs"
-Write-Host "Capturing the ordinary source browser"
+Write-Host "Capturing the source browser"
 $Browser = Start-Process -FilePath $Executable -ArgumentList ('"' + $SendFixture + '"') -PassThru
 try {
     $BrowserWindow = Wait-MainWindow $Browser
@@ -154,36 +166,32 @@ finally {
 }
 
 $EncryptedFixture = Join-Path $Root "tests\fixtures\encrypted-raw-s1.zfs"
-Write-Host "Capturing the contextual credential flow"
-$CredentialFlow = Start-Process -FilePath $Executable -ArgumentList ('"' + $EncryptedFixture + '"') -PassThru
+Write-Host "Capturing the unlock flow"
+$UnlockFlow = Start-Process -FilePath $Executable -ArgumentList ('"' + $EncryptedFixture + '"') -PassThru
 try {
-    $CredentialMainWindow = Wait-MainWindow $CredentialFlow
+    $UnlockMainWindow = Wait-MainWindow $UnlockFlow
     Start-Sleep -Seconds 5
-    $CredentialMethodWindow = [ZfseWindowCapture]::GetForegroundWindow()
-    $CredentialMethodTitle = Get-WindowTitle $CredentialMethodWindow
-    if ($CredentialMethodTitle -ne "ZFS Send Explorer") {
-        throw "Expected the credential-method dialog, found '$CredentialMethodTitle'."
+    $UnlockWindow = [ZfseWindowCapture]::GetForegroundWindow()
+    if ($UnlockWindow -eq $UnlockMainWindow -or (Get-WindowTitle $UnlockWindow) -ne "ZFS Explore") {
+        throw "Expected the unlock dialog, found '$(Get-WindowTitle $UnlockWindow)'."
     }
-    Save-Window $CredentialMethodWindow (Join-Path $Output "credential-method.png")
-
-    [ZfseWindowCapture]::SetForegroundWindow($CredentialMethodWindow) | Out-Null
-    [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
-    Start-Sleep -Seconds 2
-    $CredentialWindow = [ZfseWindowCapture]::GetForegroundWindow()
-    $CredentialTitle = Get-WindowTitle $CredentialWindow
-    if ($CredentialTitle -ne "ZFS dataset key") {
-        throw "Expected the secure ZFS credential prompt, found '$CredentialTitle'."
-    }
-    Save-Window $CredentialWindow (Join-Path $Output "credential-entry.png")
-    [System.Windows.Forms.SendKeys]::SendWait("{ESC}")
+    Save-Window $UnlockWindow (Join-Path $Output "unlock.png")
+    [ZfseWindowCapture]::SetForegroundWindow($UnlockWindow) | Out-Null
+    # Public test-fixture passphrase from tests/desktop_service.rs.
+    [System.Windows.Forms.SendKeys]::SendWait("zfs-send-fixture-passphrase{ENTER}")
+    Start-Sleep -Seconds 4
+    Save-Window $UnlockMainWindow (Join-Path $Output "encrypted-browse.png")
 }
 finally {
-    Stop-Client $CredentialFlow
+    Stop-Client $UnlockFlow
 }
 
-$Compressed = Join-Path $Root "tests\fixtures\inception\ext4.img.zst.b64"
-$StandaloneImage = Join-Path $env:RUNNER_TEMP "zfse-ext4.img"
-@"
+# ZFSE_CAPTURE_EXT4 may name an already decoded image (for machines without Python).
+$StandaloneImage = $env:ZFSE_CAPTURE_EXT4
+if (-not $StandaloneImage) {
+    $Compressed = Join-Path $Root "tests\fixtures\inception\ext4.img.zst.b64"
+    $StandaloneImage = Join-Path $TempRoot "zfse-ext4.img"
+    $Decoder = @"
 import base64
 import io
 import pathlib
@@ -194,9 +202,11 @@ target = pathlib.Path(r'$StandaloneImage')
 compressed = io.BytesIO(base64.b64decode(source.read_bytes()))
 with zstandard.ZstdDecompressor().stream_reader(compressed) as reader:
     target.write_bytes(reader.read())
-"@ | python -
-if ($LASTEXITCODE -ne 0) {
-    throw "Could not decode the standalone image fixture."
+"@
+    $Decoder | python -
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not decode the standalone image fixture."
+    }
 }
 
 $ImageBrowser = Start-Process -FilePath $Executable -ArgumentList ('"' + $StandaloneImage + '"') -PassThru

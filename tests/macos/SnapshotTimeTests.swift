@@ -20,6 +20,13 @@ import Foundation
         assert(SnapshotTime.label(UInt64.max, zone: "UTC") == nil)
         assert(SnapshotTime.zone("local") == .autoupdatingCurrent)
         assert(SnapshotTime.zone("Removed/Zone") == .autoupdatingCurrent)
+        let short = SnapshotTime.short(1_758_477_600, zone: "UTC", locale: Locale(identifier: "en_US"))!
+        assert(short.contains("2025") && short.contains("6:00"), short)
+        let today = SnapshotTime.short(UInt64(Date().timeIntervalSince1970), zone: "local", locale: Locale(identifier: "en_US"))!
+        assert(today.hasPrefix("Today"), today)
+        assert(SnapshotTime.short(nil, zone: "UTC") == nil)
+        assert(SnapshotTime.zoneName("UTC") == "UTC")
+        assert(SnapshotTime.zoneName("America/New_York") == "New York time")
         print("Snapshot date tests passed: DST, date boundaries, fractional offsets, local default and missing timestamps.")
     }
 }

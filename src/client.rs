@@ -25,6 +25,20 @@ pub enum SourceKind {
     PoolMember,
 }
 
+/// How a view was captured. Clients use this to describe it in plain words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewKind {
+    /// A dated pool snapshot.
+    Snapshot,
+    /// A dataset's live (head) state, opened read-only.
+    Current,
+    /// A complete send substream.
+    FullSend,
+    /// A send substream that depends on an earlier one in the same file.
+    IncrementalSend,
+}
+
 /// One selectable filesystem view in a source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceView {
@@ -43,6 +57,14 @@ pub struct SourceView {
     /// Configured ZFS key format (`raw`, `hex`, or `passphrase`) when the view
     /// is encrypted. UIs use this to offer the right input methods in place.
     pub key_format: Option<String>,
+    pub kind: ViewKind,
+    /// Dataset name without the snapshot suffix.
+    pub dataset: String,
+    /// Snapshot name after `@`, when the view is a snapshot.
+    pub snapshot: Option<String>,
+    /// True when another dataset is nested below this one. Such parents hold
+    /// child backups and usually no files of their own.
+    pub parent: bool,
 }
 
 impl SourceView {
@@ -179,6 +201,7 @@ impl SourceCatalog {
             .snapshots
             .iter()
             .map(|snapshot| {
+                let (dataset, name) = split_snapshot(&snapshot.dataset_name);
                 let mode = if snapshot.features & FEATURE_RAW != 0 {
                     "raw encrypted"
                 } else {
@@ -198,6 +221,14 @@ impl SourceCatalog {
                     key_format: requirements
                         .get(&snapshot.to_guid)
                         .map(|requirement| requirement.key_format.clone()),
+                    kind: if snapshot.from_guid == 0 {
+                        ViewKind::FullSend
+                    } else {
+                        ViewKind::IncrementalSend
+                    },
+                    dataset,
+                    snapshot: name,
+                    parent: false,
                 }
             })
             .collect::<Vec<_>>();
@@ -272,9 +303,16 @@ impl SourceCatalog {
                 pool.encryption_requirement(&dataset.name)?,
             );
         }
+        let is_parent = |name: &str| {
+            datasets.iter().any(|other| {
+                other.name.len() > name.len() + 1 && other.name.starts_with(&format!("{name}/"))
+            })
+        };
         let mut views = Vec::with_capacity(datasets.len() + snapshots.len());
         for snapshot in snapshots {
             let requirement = encrypted_datasets.get(&snapshot.dataset).cloned().flatten();
+            let (_, name) = split_snapshot(&snapshot.full_name);
+            let parent = is_parent(&snapshot.dataset);
             views.push(SourceView {
                 label: format!("{}  —  snapshot", snapshot.full_name),
                 created_at: (snapshot.creation_time > 0).then_some(snapshot.creation_time),
@@ -282,17 +320,29 @@ impl SourceCatalog {
                 update_eligible: true,
                 encrypted: requirement.is_some(),
                 key_format: requirement.map(|value| value.key_format),
+                kind: ViewKind::Snapshot,
+                dataset: snapshot.dataset,
+                snapshot: name,
+                parent,
             });
         }
-        for dataset in datasets {
+        let parents: Vec<bool> = datasets
+            .iter()
+            .map(|dataset| is_parent(&dataset.name))
+            .collect();
+        for (dataset, parent) in datasets.into_iter().zip(parents) {
             let requirement = encrypted_datasets.get(&dataset.name).cloned().flatten();
             views.push(SourceView {
                 label: format!("{}  —  current (read-only)", dataset.name),
                 created_at: None,
-                selector: dataset.name,
+                selector: dataset.name.clone(),
                 update_eligible: false,
                 encrypted: requirement.is_some(),
                 key_format: requirement.map(|value| value.key_format),
+                kind: ViewKind::Current,
+                dataset: dataset.name,
+                snapshot: None,
+                parent,
             });
         }
         if views.is_empty() {
@@ -730,6 +780,14 @@ pub fn apply_incremental_with_key_material(
 
 /// Join a displayed directory with a child name while preserving normalized
 /// absolute ZFS paths.
+/// Split `pool/dataset@snapshot` into its dataset and snapshot parts.
+fn split_snapshot(full_name: &str) -> (String, Option<String>) {
+    match full_name.split_once('@') {
+        Some((dataset, snapshot)) => (dataset.to_owned(), Some(snapshot.to_owned())),
+        None => (full_name.to_owned(), None),
+    }
+}
+
 pub fn child_path(directory: &str, name: &str) -> Result<String> {
     if name.is_empty() || name.contains('/') || matches!(name, "." | "..") {
         bail!("invalid directory entry name {name:?}");
