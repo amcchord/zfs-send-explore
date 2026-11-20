@@ -88,17 +88,25 @@ function Visible([string]$Kind, [string]$Title = '') {
     $handle = [PackageUI]::Window($Client.Id, $Kind, $Title)
     if ($handle -ne [IntPtr]::Zero) { $handle }
 }
-function Save-Window([IntPtr]$Window, [string]$Name) {
+function Save-Window([IntPtr]$Window, [string]$Name, [switch]$Desktop) {
     $size = New-Object PackageUI+Rect
     if (![PackageUI]::GetWindowRect($Window, [ref]$size)) { throw 'Cannot measure the application window' }
     $bitmap = New-Object Drawing.Bitmap(($size.Right - $size.Left), ($size.Bottom - $size.Top))
     try {
         $graphics = [Drawing.Graphics]::FromImage($bitmap)
         try {
-            $dc = $graphics.GetHdc()
-            try {
-                if (![PackageUI]::PrintWindow($Window, $dc, 2)) { throw 'Cannot capture the application window' }
-            } finally { $graphics.ReleaseHdc($dc) }
+            if ($Desktop) {
+                # PrintWindow can paint stale combo-box text over the current selection.
+                # Capture the visible desktop pixels after the normal application repaint.
+                Wait-For 'the application foreground window' { [PackageUI]::GetForegroundWindow() -eq $Window } | Out-Null
+                Start-Sleep -Milliseconds 400
+                $graphics.CopyFromScreen($size.Left, $size.Top, 0, 0, $bitmap.Size)
+            } else {
+                $dc = $graphics.GetHdc()
+                try {
+                    if (![PackageUI]::PrintWindow($Window, $dc, 2)) { throw 'Cannot capture the application window' }
+                } finally { $graphics.ReleaseHdc($dc) }
+            }
         } finally { $graphics.Dispose() }
         $bitmap.Save((Join-Path $OutputDirectory "$Name.png"), [Drawing.Imaging.ImageFormat]::Png)
     } finally { $bitmap.Dispose() }
@@ -229,7 +237,7 @@ try {
     [PackageUI]::SendMessage($combo, 0x14e, [IntPtr]$older[0], [IntPtr]::Zero) | Out-Null
     [PackageUI]::PostMessage($Main, 0x111, [IntPtr](0x10000 + 104), $combo) | Out-Null
     Wait-For 'the older version.txt' { List-Item 'version.txt' } | Out-Null
-    Save-Window $Main '06-older-snapshot'
+    Save-Window $Main '06-older-snapshot' -Desktop
     Restore-And-Check 'version.txt' (Join-Path $OutputDirectory 'version.txt') '490f9cafcac339449f3c241818c4798a7515c5f39832d213e1d79cac88f2ebf2' '07-older-copy'
 
     Step 'Attempt another restore to an occupied name and check the sentinel'
