@@ -8,7 +8,10 @@ param(
     [Parameter(Mandatory)][string]$OutputDirectory,
     [Parameter(Mandatory)][string]$ExpectedPackageSha256,
     [int]$MinimumDpi = 120,
-    [int]$MaximumDpi = 192
+    [int]$MaximumDpi = 192,
+    [string]$StripeDirectory,
+    [string]$StripeDataset,
+    [string]$StripeExpectedSha256
 )
 
 $ErrorActionPreference = 'Stop'
@@ -127,7 +130,7 @@ function Labels([IntPtr]$Window) {
     $nodes = $root.FindAll([Windows.Automation.TreeScope]::Descendants, [Windows.Automation.Condition]::TrueCondition)
     ($nodes | ForEach-Object { $_.Current.Name }) -join ' '
 }
-function Enter-Filename([IntPtr]$Dialog, [string]$Path) {
+function Enter-Filename([IntPtr]$Dialog, [string]$Path, [string]$BeforeAccept) {
     [PackageUI]::SetForegroundWindow($Dialog) | Out-Null
     Wait-For 'the file dialog keyboard focus' { [PackageUI]::GetForegroundWindow() -eq $Dialog } | Out-Null
     [System.Windows.Forms.SendKeys]::SendWait('%n') # File name mnemonic
@@ -144,6 +147,7 @@ function Enter-Filename([IntPtr]$Dialog, [string]$Path) {
     $value = $edit.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern)
     Wait-For 'the requested full file name to appear' { $value.Current.Value -eq $Path } | Out-Null
     if ([PackageUI]::GetForegroundWindow() -ne $Dialog) { throw 'The file dialog lost keyboard focus' }
+    if ($BeforeAccept) { Save-Window $Dialog $BeforeAccept -Desktop }
     [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
 }
 function Open-Backup([string]$Name, [string]$Screenshot) {
@@ -183,6 +187,46 @@ function Restore-And-Check([string]$Name, [string]$Path, [string]$Expected, [str
     $close.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
     Wait-For 'restore confirmation to close' { !(Visible '#32770' 'ZFS Explore') } | Out-Null
 }
+function Test-Stripe {
+    if (!$StripeDirectory -or !$StripeDataset -or $StripeExpectedSha256 -notmatch '^[0-9a-fA-F]{64}$') {
+        throw 'Supply -StripeDirectory, -StripeDataset and -StripeExpectedSha256 together'
+    }
+    $left = (Resolve-Path -LiteralPath (Join-Path $StripeDirectory 'left.img')).Path
+    $right = (Resolve-Path -LiteralPath (Join-Path $StripeDirectory 'right.img')).Path
+    $before = @((Get-FileHash -LiteralPath $left).Hash, (Get-FileHash -LiteralPath $right).Hash)
+    Step 'Open both stripe members together in the native file dialog'
+    Click-Button $Main 101
+    $dialog = Wait-For 'Open a backup' { Visible '#32770' 'Open a backup' }
+    Enter-Filename $dialog ('"{0}" "{1}"' -f $left,$right) '09-stripe-members'
+    $chooser = Wait-For 'the striped pool dataset chooser' {
+        $form = Visible 'ZfsExploreFormDialog'
+        if ($form -and (Labels $form) -match 'Choose a computer or dataset') { $form }
+    }
+    $combo = [PackageUI]::GetDlgItem($chooser, 200)
+    $count = [PackageUI]::SendMessage($combo, 0x146, [IntPtr]::Zero, [IntPtr]::Zero).ToInt32()
+    $rows = @(for ($i = 0; $i -lt $count; $i++) { if ([PackageUI]::ComboItem($combo, $i) -eq $StripeDataset) { $i } })
+    if ($rows.Count -ne 1) { throw "Dataset missing from chooser: $StripeDataset" }
+    [PackageUI]::SendMessage($combo, 0x14e, [IntPtr]$rows[0], [IntPtr]::Zero) | Out-Null
+    Click-Button $chooser 1
+    Wait-For 'across.bin in the assembled pool' { List-Item 'across.bin' } | Out-Null
+    Save-Window $Main '10-stripe-browser' -Desktop
+
+    Step 'Open one stripe member and check that the previous pool remains usable'
+    Click-Button $Main 101
+    $dialog = Wait-For 'Open a backup' { Visible '#32770' 'Open a backup' }
+    Enter-Filename $dialog $left
+    $incomplete = Wait-For 'missing member guidance' {
+        $form = Visible '#32770' 'ZFS Explore'
+        if ($form -and (Labels $form) -match 'Open all members|Missing stripe members') { $form }
+    }
+    Save-Window $incomplete '11-stripe-incomplete'
+    [PackageUI]::PostMessage($incomplete, 0x10, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+    Wait-For 'the incomplete pool message to close' { !(Visible '#32770' 'ZFS Explore') } | Out-Null
+    Restore-And-Check 'across.bin' (Join-Path $OutputDirectory 'across.bin') $StripeExpectedSha256 '12-stripe-restored'
+    $after = @((Get-FileHash -LiteralPath $left).Hash, (Get-FileHash -LiteralPath $right).Hash)
+    if (Compare-Object $before $after -SyncWindow 0) { throw 'A source member changed during the restore' }
+    $Report.stripe = @{ dataset = $StripeDataset; before = $before; after = $after }
+}
 function Enter-FixtureKey([IntPtr]$Dialog, [string]$Value) {
     $edit = [PackageUI]::GetDlgItem($Dialog, 200)
     if ($edit -eq [IntPtr]::Zero) { throw 'Missing masked credential field' }
@@ -208,6 +252,8 @@ try {
     Step "Application window DPI is $($Report.dpi)"
     Save-Window $Main '01-welcome'
     if ($Report.dpi -lt $MinimumDpi -or $Report.dpi -gt $MaximumDpi) { throw 'Display scale outside required range' }
+
+    if ($StripeDirectory -or $StripeDataset -or $StripeExpectedSha256) { Test-Stripe }
 
     Open-Backup 'encrypted-raw-s1.zfs' '02-open-backup'
     $unlock = Wait-For 'the unlock dialog' { Visible 'ZfsExploreFormDialog' }

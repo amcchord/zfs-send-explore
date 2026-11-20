@@ -201,6 +201,11 @@ For a physical drive:
 2. Choose **Open drive…** (Ctrl+D). Each drive is listed with its disk number,
    model, size and type; the computer's own Windows disk is labelled and asks
    for a second confirmation. Choose **Refresh the list** after connecting a drive.
+   Review the selected drive, then choose **Open read-only**. For a striped pool,
+   choose **Add another member** until every disk is listed, then choose **Open
+   read-only**. The app verifies the selected drives are still present before
+   opening them. For a device that reports neither an ID nor a serial number,
+   use offline images to assemble multiple members.
 3. Choose the drive. It opens read-only.
 4. If Windows reports that access was denied, close ZFS Explore, right-click it,
    choose **Run as administrator**, and open the drive again.
@@ -229,10 +234,11 @@ Direct pool support is intentionally conservative:
 
 - one top-level disk or file vdev;
 - one healthy leaf from one top-level mirror;
+- a complete stripe of ordinary disk or file vdevs, matched by their ZFS labels;
 - plaintext or native-encrypted little-endian ZFS filesystem datasets; and
 - the checksum, compression, ZAP, System Attribute, and indirection profiles listed in the main README.
 
-RAIDZ/dRAID, several top-level vdevs, encrypted big-endian pools, special/dedup allocation classes, device-removal maps, gang blocks, and ZVOL file browsing are rejected. A send file can still be used when the direct member reader cannot assemble the pool layout.
+RAIDZ/dRAID, stripes of mirrors, encrypted big-endian pools, special/dedup allocation classes, device-removal maps, gang blocks, and ZVOL file browsing are rejected. A send file can still be used when the direct member reader cannot assemble the pool layout.
 
 ## Recover a Slide Box
 
@@ -248,8 +254,12 @@ RAIDZ/dRAID, several top-level vdevs, encrypted big-endian pools, special/dedup 
 5. The recommended part of the disk is selected. Browse to the file or folder
    and choose **Restore…**.
 
-The current direct-pool constraints still apply. A Slide Box using RAIDZ or
-several top-level vdevs cannot yet be reconstructed from multiple members.
+For an offline stripe of ordinary disks or file vdevs, Ctrl-click every member
+image in **Open backup…**. Use **Open from a path…** for members in different
+folders or physical disk paths, one per line. Each top-level group needs its
+own member. A missing or unrelated member produces a diagnostic, and the
+previous backup stays available. RAIDZ and stripes of mirrors require a
+different recovery source.
 
 ## Recover a Datto Reverse RoundTrip drive
 
@@ -460,3 +470,5 @@ two public backup fixtures, retries an incorrect key, and restores an older
 snapshot. It hashes each recovered file and checks that a same-name retry
 preserves an existing file. The result and screenshots are saved in the output
 directory.
+
+For a two-member striped pool, also supply `-StripeDirectory` (containing `left.img` and `right.img`), `-StripeDataset` (such as `pool/files`), and `-StripeExpectedSha256` (the SHA-256 of `across.bin` in its newest restore point). The check opens both members in the system file dialog, checks the missing-member message, restores from the original session and verifies both source images remain unchanged.

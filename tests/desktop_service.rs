@@ -250,3 +250,87 @@ fn a_multi_dataset_backup_requires_a_choice_and_keeps_history_in_its_dataset() {
     let history = desktop.request(json!({"method":"versions","name":"version.txt"}));
     assert_eq!(history["result"]["versions"].as_array().unwrap().len(), 3);
 }
+
+#[test]
+#[ignore = "uses a locally generated OpenZFS pool and independent source hashes"]
+fn desktop_restores_versions_and_nested_files_from_a_stripe() {
+    use sha2::{Digest, Sha256};
+    use std::path::PathBuf;
+
+    let fixture = PathBuf::from(std::env::var_os("ZFSE_STRIPE_FIXTURE").unwrap());
+    let key = std::env::var_os("ZFSE_STRIPE_KEY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| fixture.join("dataset.key"));
+    let pool = std::fs::read_to_string(fixture.join("pool-name")).unwrap();
+    let members = fixture.join("members");
+    let output = tempfile::tempdir().unwrap();
+    let mut desktop = Desktop::start();
+    let mut request = |args: Value| -> Value {
+        let response = desktop.request(args);
+        assert_eq!(response["ok"], true, "{response}");
+        response["result"].clone()
+    };
+    let check = |name: &str, destination: &str, manifest: &str| {
+        let hashes = std::fs::read_to_string(fixture.join(manifest)).unwrap();
+        let expected = hashes
+            .lines()
+            .find_map(|line| {
+                let (hash, path) = line.split_once(char::is_whitespace)?;
+                (path.trim_start() == name).then_some(hash)
+            })
+            .unwrap();
+        let restored = std::fs::read(output.path().join(destination)).unwrap();
+        assert_eq!(format!("{:x}", Sha256::digest(restored)), expected);
+    };
+
+    let opened = request(
+        json!({"method":"open","paths":[members.join("right.img"),members.join("left.img")]}),
+    );
+    let choices = opened["dataset_choices"].as_array().unwrap();
+    let select_dataset = |name: &str| {
+        let full_name = format!("{}/{name}", pool.trim());
+        choices.iter().find(|c| c["name"] == full_name).unwrap()["index"]
+            .as_u64()
+            .unwrap()
+    };
+    let state = request(json!({"method":"select","index":select_dataset("files")}));
+    assert!(
+        state["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["name"] == "across.bin")
+    );
+    let history = request(json!({"method":"versions","name":"across.bin"}));
+    let versions = history["versions"].as_array().unwrap();
+    assert_eq!(versions.len(), 2);
+    for version in versions {
+        let snapshot = version["snapshot"].as_str().unwrap();
+        assert!(matches!(snapshot, "early" | "late"));
+        request(json!({"method":"open_version","name":"across.bin","index":version["index"]}));
+        request(
+            json!({"method":"extract","name":"across.bin","destination":output.path().join(snapshot)}),
+        );
+        check("across.bin", snapshot, &format!("{snapshot}.sha256"));
+    }
+    request(json!({"method":"enter","name":"guest.img"}));
+    request(json!({"method":"list","path":"/etc"}));
+    let history = request(json!({"method":"versions","name":"hostname"}));
+    let nested = history["versions"].as_array().unwrap();
+    assert_eq!(nested.len(), 2);
+    for version in nested {
+        request(json!({"method":"open_version","name":"hostname","index":version["index"]}));
+        let name = format!("hostname-{}", version["snapshot"].as_str().unwrap());
+        request(
+            json!({"method":"extract","name":"hostname","destination":output.path().join(&name)}),
+        );
+        check("etc/hostname", &name, "nested.sha256");
+    }
+    let state = request(json!({"method":"select","index":select_dataset("locked")}));
+    assert_eq!(state["locked"], true);
+    request(json!({"method":"unlock","key_file":key}));
+    request(
+        json!({"method":"extract","name":"private.txt","destination":output.path().join("private")}),
+    );
+    check("private.txt", "private", "locked.sha256");
+}

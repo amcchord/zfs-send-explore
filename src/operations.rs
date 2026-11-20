@@ -11,7 +11,7 @@ use crate::sparse;
 use crate::stream::{
     BeginRecord, DMU_SUBSTREAM, FEATURE_RAW, ObjectRecord, RecordKind, StreamReader,
 };
-use crate::tree::{RecursiveExtraction, extract_directory_tree};
+use crate::tree::{RecursiveExtraction, extract_directory_tree_from_sources};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -159,7 +159,7 @@ fn extract_resolved_snapshot(
         bail!("{} is not a regular file", resolved.normalized_path);
     }
     let publication = if write_sidecar {
-        RestoreDestination::prepare(Some(stream), output, force, true)?
+        RestoreDestination::prepare_sources(&[stream], output, force, true)?
     } else {
         RestoreDestination::staged_member(output)
     };
@@ -236,8 +236,8 @@ pub fn extract_tree_snapshot_with_key(
         }
     }
     let images = crate::inception::StreamImage::build_many(stream, &plan, &sizes, key_material)?;
-    extract_directory_tree(
-        Some(stream),
+    extract_directory_tree_from_sources(
+        &[stream],
         &format!(
             "{} · {} ({})",
             stream.display(),
@@ -356,7 +356,7 @@ pub fn apply_incremental_with_key(
     target: &Path,
     key_material: Option<&[u8]>,
 ) -> Result<Sidecar> {
-    let publication = RestoreDestination::prepare(Some(stream), target, true, true)?;
+    let publication = RestoreDestination::prepare_sources(&[stream], target, true, true)?;
     let sidecar_path = sidecar_path(target);
     let sidecar_file = File::open(&sidecar_path).with_context(|| {
         format!(

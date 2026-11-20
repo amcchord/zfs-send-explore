@@ -70,8 +70,13 @@ pub fn source_description(catalog: &SourceCatalog) -> String {
         .iter()
         .filter(|view| view.kind != ViewKind::Current && !view.parent)
         .count();
+    let kind = if catalog.paths.len() > 1 {
+        format!("{kind} · {} pool members", catalog.paths.len())
+    } else {
+        kind.to_owned()
+    };
     match points {
-        0 => kind.to_owned(),
+        0 => kind,
         1 => format!("{kind} · 1 restore point"),
         count => format!("{kind} · {count} restore points"),
     }
@@ -215,7 +220,16 @@ pub struct FriendlyError {
 /// Turn an engine error into a headline, a next step, and retained details.
 pub fn friendly_error(raw: &str) -> FriendlyError {
     let lower = raw.to_ascii_lowercase();
-    let (title, message) = if lower.starts_with("pool layout for ") {
+    let (title, message) = if lower.contains("reopen the backup before restoring") {
+        (
+            "A backup member moved or changed",
+            "Open the backup again with its current member files, then choose the restore destination.",
+        )
+    } else if lower.contains("missing stripe members") {
+        ("Open all members of this pool together", raw)
+    } else if lower.starts_with("could not assemble the selected pool members") {
+        ("Check the selected pool members", raw)
+    } else if lower.starts_with("pool layout for ") {
         ("This pool layout needs a different recovery source", raw)
     } else if lower.contains("compressed backup download") {
         (
@@ -227,7 +241,7 @@ pub fn friendly_error(raw: &str) -> FriendlyError {
     {
         (
             "This file isn't a backup ZFS Explore can open",
-            "Choose a ZFS send file, a Slide or ZFS pool image, or a virtual disk (RAW, QCOW2 or VMDK). Single-disk and mirrored pools are supported.",
+            "Choose a ZFS send file, a Slide or ZFS pool image, or a virtual disk (RAW, QCOW2 or VMDK). For a striped pool, select its member images together.",
         )
     } else if lower.contains("already exists") {
         (
@@ -400,6 +414,13 @@ mod tests {
         assert_eq!(
             friendly_error("A file or folder already exists there.").title,
             "Something with that name is already there"
+        );
+        assert_eq!(
+            friendly_error(
+                "Source disk-b.img moved or changed. Reopen the backup before restoring."
+            )
+            .title,
+            "A backup member moved or changed"
         );
         assert_eq!(friendly_error("unexpected").title, "That didn't work");
     }

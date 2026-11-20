@@ -31,27 +31,44 @@ struct Identity {
 
 #[cfg(unix)]
 fn identity(path: &Path) -> io::Result<Identity> {
+    Ok(metadata_identity(&fs::symlink_metadata(path)?))
+}
+
+#[cfg(unix)]
+fn handle_identity(file: &File) -> io::Result<Identity> {
+    Ok(metadata_identity(&file.metadata()?))
+}
+
+#[cfg(unix)]
+fn metadata_identity(m: &fs::Metadata) -> Identity {
     use std::os::unix::fs::MetadataExt;
-    let m = fs::symlink_metadata(path)?;
-    Ok(Identity {
+    Identity {
         volume: m.dev(),
         file: m.ino(),
         size: m.len(),
         modified: i128::from(m.mtime()) * 1_000_000_000 + i128::from(m.mtime_nsec()),
-    })
+    }
 }
 
 #[cfg(windows)]
 fn identity(path: &Path) -> io::Result<Identity> {
-    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        GetFileInformationByHandle,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     };
     let file = File::options()
         .access_mode(0)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
+    handle_identity(&file)
+}
+
+#[cfg(windows)]
+fn handle_identity(file: &File) -> io::Result<Identity> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: the output is writable and the handle remains open until return.
     if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut info) } == 0 {
@@ -69,6 +86,100 @@ fn identity(path: &Path) -> io::Result<Identity> {
     })
 }
 
+/// The file descriptor used to read a backup can outlive its original name.
+/// Keep the identity and ancestry that destination protection must still see.
+#[derive(Clone, Debug)]
+pub(crate) struct PinnedSource {
+    path: PathBuf,
+    location: Option<SourceLocation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SourceLocation {
+    file: Identity,
+    parents: Vec<(u64, u64)>,
+}
+
+impl SourceLocation {
+    fn read(path: &Path) -> Result<Self> {
+        // Resolve the target *and* the named path's own parent. A symlink may
+        // live outside its target tree; both are protected restore ancestors.
+        let target = fs::canonicalize(path)?;
+        let alias_parent = fs::canonicalize(parent(path))?;
+        let mut parents = Vec::new();
+        for ancestor in target.ancestors().skip(1).chain(alias_parent.ancestors()) {
+            let id = identity(ancestor)?;
+            parents.push((id.volume, id.file));
+        }
+        Ok(Self {
+            file: identity(&target)?,
+            parents,
+        })
+    }
+}
+
+impl PinnedSource {
+    pub(crate) fn capture(path: &Path, file: &File) -> Result<Self> {
+        #[cfg(windows)]
+        let device = path
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .starts_with(r"\\.\physicaldrive");
+        #[cfg(not(windows))]
+        let device = false;
+        let regular = if device {
+            false
+        } else {
+            match file.metadata() {
+                Ok(metadata) => metadata.is_file(),
+                // Some Windows volume handles provide disk geometry only.
+                #[cfg(windows)]
+                Err(_) if crate::source::source_block_size(file).is_ok_and(|size| size > 1) => {
+                    false
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let location = if regular {
+            let location = SourceLocation::read(path)?;
+            ensure!(
+                location.file == handle_identity(file)?,
+                "Source {} changed while opening. Reopen the backup before restoring.",
+                path.display()
+            );
+            Some(location)
+        } else {
+            None
+        };
+        Ok(Self {
+            path: path.to_owned(),
+            location,
+        })
+    }
+
+    pub(crate) fn checked(sources: &[Self]) -> Result<&[Self]> {
+        for source in sources {
+            if let Some(pinned) = &source.location {
+                let message = || {
+                    format!(
+                        "Source {} moved or changed. Reopen the backup before restoring.",
+                        source.path.display()
+                    )
+                };
+                let current = SourceLocation::read(&source.path).with_context(message)?;
+                ensure!(current == *pinned, "{}", message());
+            }
+        }
+        Ok(sources)
+    }
+}
+
+impl AsRef<Path> for PinnedSource {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
 fn existing(path: &Path) -> Result<Option<Identity>> {
     match identity(path) {
         Ok(id) => Ok(Some(id)),
@@ -79,7 +190,7 @@ fn existing(path: &Path) -> Result<Option<Identity>> {
 
 /// Compare canonical ancestors as well as filesystem IDs (hard links and
 /// case-insensitive aliases). Physical devices themselves cannot be a target.
-fn protect_source(source: Option<&Path>, path: &Path) -> Result<()> {
+fn protect_sources(sources: &[impl AsRef<Path>], path: &Path) -> Result<()> {
     let Some(id) = existing(path)? else {
         return Ok(());
     };
@@ -89,14 +200,15 @@ fn protect_source(source: Option<&Path>, path: &Path) -> Result<()> {
         "destination {} is a link or special file",
         path.display()
     );
-    if let Some(source) = source {
+    for source in sources {
+        let source = source.as_ref();
         #[cfg(windows)]
         if source
             .to_string_lossy()
             .to_ascii_lowercase()
             .starts_with(r"\\.\physicaldrive")
         {
-            return Ok(()); // Device targets were excluded above.
+            continue; // Device targets were excluded above.
         }
         let resolved = fs::canonicalize(source)
             .with_context(|| format!("checking source identity for {}", source.display()))?;
@@ -421,13 +533,13 @@ impl RestoreDestination {
         }
     }
 
-    pub(crate) fn prepare(
-        source: Option<&Path>,
+    pub(crate) fn prepare_sources(
+        sources: &[impl AsRef<Path>],
         path: &Path,
         force: bool,
         companion: bool,
     ) -> Result<Self> {
-        Self::recover(source, path)?;
+        Self::recover(sources, path)?;
         let data = existing(path)?;
         ensure!(
             force || data.is_none(),
@@ -436,7 +548,7 @@ impl RestoreDestination {
         );
         let metadata = if companion {
             let side = sidecar_path(path);
-            protect_source(source, &side)?;
+            protect_sources(sources, &side)?;
             let existing = existing(&side)?;
             ensure!(
                 existing.is_none() || (force && data.is_some()),
@@ -468,14 +580,14 @@ impl RestoreDestination {
         })
     }
 
-    pub(crate) fn recover(source: Option<&Path>, target: &Path) -> Result<bool> {
-        protect_source(source, target)?;
+    fn recover(sources: &[impl AsRef<Path>], target: &Path) -> Result<bool> {
+        protect_sources(sources, target)?;
         let journal = journal_name(target)?;
         let Some(id) = existing(&journal)? else {
             return Ok(false);
         };
-        protect_source(source, &journal)?;
-        protect_source(source, &sidecar_path(target))?;
+        protect_sources(sources, &journal)?;
+        protect_sources(sources, &sidecar_path(target))?;
         ensure!(
             fs::symlink_metadata(&journal)?.file_type().is_file(),
             "invalid pending restore at {}",
@@ -491,7 +603,7 @@ impl RestoreDestination {
             .with_context(|| {
                 format!("unrecognized pending restore record {}", journal.display())
             })?;
-        protect_source(source, &intent.staged(target)?)?;
+        protect_sources(sources, &intent.staged(target)?)?;
         intent.commit(target, &journal, file)?;
         Ok(true)
     }
@@ -611,6 +723,80 @@ impl RestoreDestination {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_checks_every_pinned_member_before_using_a_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left");
+        let right = dir.path().join("right");
+        let moved = dir.path().join("moved-right");
+        fs::write(&left, b"first member").unwrap();
+        fs::write(&right, b"second member").unwrap();
+        let left_handle = File::open(&left).unwrap();
+        let right_handle = File::open(&right).unwrap();
+        let pins = [
+            PinnedSource::capture(&left, &left_handle).unwrap(),
+            PinnedSource::capture(&right, &right_handle).unwrap(),
+        ];
+        assert!(PinnedSource::checked(&pins).is_ok());
+        fs::rename(&right, &moved).unwrap();
+        assert!(
+            PinnedSource::checked(&pins)
+                .unwrap_err()
+                .to_string()
+                .contains("Reopen")
+        );
+        fs::write(&right, b"replacement!!").unwrap();
+        assert!(
+            PinnedSource::checked(&pins)
+                .unwrap_err()
+                .to_string()
+                .contains("Reopen")
+        );
+        assert_eq!(fs::read(&moved).unwrap(), b"second member");
+    }
+
+    #[test]
+    fn renamed_source_ancestor_is_detected_even_if_the_member_still_has_the_same_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("selected");
+        let moved = dir.path().join("relocated");
+        fs::create_dir(&folder).unwrap();
+        let path = folder.join("member");
+        fs::write(&path, b"backup").unwrap();
+        let handle = File::open(&path).unwrap();
+        let pins = [PinnedSource::capture(&path, &handle).unwrap()];
+        let file_id = handle_identity(&handle).unwrap();
+        drop(handle);
+        fs::rename(&folder, &moved).unwrap();
+        fs::create_dir(&folder).unwrap();
+        fs::hard_link(moved.join("member"), &path).unwrap();
+        assert_eq!(file_id, identity(&path).unwrap());
+        assert!(
+            PinnedSource::checked(&pins)
+                .unwrap_err()
+                .to_string()
+                .contains("Reopen")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_source_follows_its_target_until_it_is_replaced() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("image");
+        let link = dir.path().join("selected");
+        fs::write(&image, b"backup").unwrap();
+        symlink(&image, &link).unwrap();
+        let handle = File::open(&link).unwrap();
+        let pins = [PinnedSource::capture(&link, &handle).unwrap()];
+        assert!(PinnedSource::checked(&pins).is_ok());
+        fs::rename(&image, dir.path().join("moved")).unwrap();
+        fs::write(&image, b"replacement").unwrap();
+        assert!(PinnedSource::checked(&pins).is_err());
+    }
+
     use crate::operations::{apply_incremental, extract};
     use std::sync::{Arc, Barrier};
 
@@ -633,8 +819,13 @@ mod tests {
                         let gate = barrier.clone();
                         let output = &output;
                         scope.spawn(move || {
-                            let ready =
-                                RestoreDestination::prepare(None, output, false, false).unwrap();
+                            let ready = RestoreDestination::prepare_sources(
+                                &[] as &[&Path],
+                                output,
+                                false,
+                                false,
+                            )
+                            .unwrap();
                             let parent = output.parent().unwrap();
                             if directory {
                                 let stage = tempfile::tempdir_in(parent).unwrap();
@@ -663,6 +854,27 @@ mod tests {
             };
             assert_eq!(fs::read(payload).unwrap(), winner);
         }
+    }
+
+    #[test]
+    fn every_selected_member_is_protected_including_aliases_and_sidecars() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("other-disk");
+        fs::create_dir(&directory).unwrap();
+        let first = temp.path().join("first.img");
+        let second = directory.join("second.img");
+        fs::write(&first, b"first member").unwrap();
+        fs::write(&second, b"second member").unwrap();
+        let members = [first, second.clone()];
+        let alias = temp.path().join("alias");
+        fs::hard_link(&second, &alias).unwrap();
+        for forbidden in [&second, &directory, &alias] {
+            assert!(RestoreDestination::prepare_sources(&members, forbidden, true, true).is_err());
+        }
+        let output = temp.path().join("restored");
+        fs::hard_link(&second, sidecar_path(&output)).unwrap();
+        assert!(RestoreDestination::prepare_sources(&members, &output, true, true).is_err());
+        assert_eq!(fs::read(&second).unwrap(), b"second member");
     }
 
     #[test]

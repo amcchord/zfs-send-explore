@@ -27,13 +27,14 @@ use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EN_CHANGE,
-    ES_AUTOHSCROLL, ES_PASSWORD, GWLP_USERDATA, GetClientRect, GetMessageW, GetWindowLongPtrW,
-    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IDC_ARROW, IsDialogMessageW, LoadCursorW,
-    MB_ICONERROR, MB_OK, MSG, MessageBoxW, MoveWindow, PostQuitMessage, RegisterClassW, SW_SHOW,
-    SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowTextW, ShowWindow,
-    TranslateMessage, WM_CLOSE, WM_COMMAND, WM_CTLCOLORSTATIC, WM_DESTROY, WM_NCCREATE, WM_SETFONT,
-    WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CONTROLPARENT,
-    WS_EX_DLGMODALFRAME, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_PASSWORD, ES_WANTRETURN, GWLP_USERDATA,
+    GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW,
+    GetWindowTextW, IDC_ARROW, IsDialogMessageW, LoadCursorW, MB_ICONERROR, MB_OK, MSG,
+    MessageBoxW, MoveWindow, PostQuitMessage, RegisterClassW, SW_SHOW, SendMessageW,
+    SetForegroundWindow, SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage, WM_CLOSE,
+    WM_COMMAND, WM_CTLCOLORSTATIC, WM_DESTROY, WM_NCCREATE, WM_SETFONT, WNDCLASSW, WS_BORDER,
+    WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_POPUP,
+    WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 use zeroize::Zeroizing;
 
@@ -313,7 +314,7 @@ unsafe extern "system" fn form_proc(
 /// A compact modal form with one text field. Password fields are masked and
 /// cleared before the dialog closes.
 pub(super) unsafe fn form_dialog(owner: HWND, form: &Form) -> FormResult {
-    run_form(owner, form, &[]).0
+    run_form(owner, form, &[], false).0
 }
 
 /// A keyboard-accessible selector using the same modal window as the credentials form.
@@ -336,10 +337,19 @@ pub(super) unsafe fn choose_row(
         primary: "Open",
         secondary: None,
     };
-    run_form(owner, &form, rows).1
+    run_form(owner, &form, rows, false).1
 }
 
-unsafe fn run_form(owner: HWND, form: &Form, rows: &[String]) -> (FormResult, Option<usize>) {
+pub(super) unsafe fn path_dialog(owner: HWND, form: &Form) -> FormResult {
+    run_form(owner, form, &[], true).0
+}
+
+unsafe fn run_form(
+    owner: HWND,
+    form: &Form,
+    rows: &[String],
+    multiline: bool,
+) -> (FormResult, Option<usize>) {
     let instance = GetModuleHandleW(null());
     let class_name = wide("ZfsExploreFormDialog");
     let class = WNDCLASSW {
@@ -391,7 +401,8 @@ unsafe fn run_form(owner: HWND, form: &Form, rows: &[String]) -> (FormResult, Op
     // Grow the window so the client area fits the content at this DPI.
     let mut client = RECT::default();
     GetClientRect(dialog, &mut client);
-    let needed = scale(252);
+    let extra = if multiline { 48 } else { 0 };
+    let needed = scale(252 + extra);
     MoveWindow(dialog, x, y, width, height + needed - client.bottom, 0);
     GetClientRect(dialog, &mut client);
     let inner = client.right - scale(48);
@@ -431,7 +442,12 @@ unsafe fn run_form(owner: HWND, form: &Form, rows: &[String]) -> (FormResult, Op
     MoveWindow(label, pad, scale(124), inner, scale(20), 1);
     SendMessageW(label, WM_SETFONT, fonts.strong as usize, 1);
     if rows.is_empty() {
-        let mut style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL as u32;
+        let mut style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER;
+        style |= if multiline {
+            (ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL) as u32 | super::WS_VSCROLL
+        } else {
+            ES_AUTOHSCROLL as u32
+        };
         if form.password {
             style |= ES_PASSWORD as u32;
         }
@@ -444,7 +460,7 @@ unsafe fn run_form(owner: HWND, form: &Form, rows: &[String]) -> (FormResult, Op
             0,
             FORM_EDIT,
         );
-        MoveWindow(state.edit, pad, scale(146), inner, scale(30), 1);
+        MoveWindow(state.edit, pad, scale(146), inner, scale(30 + extra), 1);
     } else {
         state.edit = control(
             dialog,
@@ -467,7 +483,7 @@ unsafe fn run_form(owner: HWND, form: &Form, rows: &[String]) -> (FormResult, Op
         MoveWindow(state.edit, pad, scale(146), inner, scale(240), 1);
     }
     SendMessageW(state.edit, WM_SETFONT, fonts.body as usize, 1);
-    let buttons_y = scale(198);
+    let buttons_y = scale(198 + extra);
     state.ok = button(dialog, instance, form.primary, IDOK, true);
     let cancel = button(dialog, instance, "Cancel", IDCANCEL, false);
     MoveWindow(

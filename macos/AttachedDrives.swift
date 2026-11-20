@@ -69,6 +69,16 @@ struct AttachedDrive: Identifiable {
             ?? disk
     }
 
+    /// Resolve the exact media instances together. Removing any selected member
+    /// invalidates the set, even if a replacement has inherited its BSD name.
+    static func resolve(_ ids: Set<String>, in drives: [AttachedDrive]) -> [(AttachedDrive, DriveSlice)]? {
+        guard !ids.isEmpty else { return nil }
+        let choices = drives.flatMap { drive in
+            ([drive.disk] + drive.partitions).filter { ids.contains($0.id) }.map { (drive, $0) }
+        }
+        return choices.count == ids.count ? choices : nil
+    }
+
     /// External and attached-image disks from DiskArbitration, including disks
     /// whose partitions macOS cannot mount and Finder therefore never shows.
     static func scan() -> [AttachedDrive] {
@@ -96,7 +106,7 @@ struct AttachedDrive: Identifiable {
                 size: (info[kDADiskDescriptionMediaSizeKey as String] as? NSNumber)?.int64Value ?? 0,
                 content: content, mountPath: mount,
                 whole: info[kDADiskDescriptionMediaWholeKey as String] as? Bool ?? false)
-            IORegistryEntryGetRegistryEntryID(service, &slice.mediaID)
+            guard IORegistryEntryGetRegistryEntryID(service, &slice.mediaID) == KERN_SUCCESS else { continue }
             var wholeName = bsd
             // Keep the whole-disk object alive while its BSD name is copied.
             if let wholeDisk = DADiskCopyWholeDisk(disk), let name = DADiskGetBSDName(wholeDisk) {

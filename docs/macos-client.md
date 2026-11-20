@@ -51,6 +51,10 @@ The window guides you through four steps, shown in the step bar at the top:
    connected drive** (⇧⌘D; see below). You can also drag a backup file into the
    window, or use **Open from a path…** (⇧⌘O) for a pasted path such as
    `/Volumes/Backups/slide.img` or a device such as `/dev/disk4s2`.
+   For an offline stripe of ordinary disk/file vdevs, Command-click all member
+   images in the Open panel, drop them together, or enter one path per line.
+   Every top-level group is required. The app identifies members from ZFS labels,
+   and asks for read access to each selected device that needs authorization.
 2. If the backup contains several computers or datasets, choose the one you need.
    The newest restore point in that dataset opens. Pick another date in the
    sidebar's **Restore points** list if you need an older copy. Live dataset
@@ -95,6 +99,10 @@ connected drive** lists external disks directly from DiskArbitration instead, wh
 not Finder shows them, with each partition's type and size. A ZFS-typed
 partition is suggested first, then the largest partition macOS left unmounted.
 Choosing **Whole disk** also works when exactly one partition holds the pool.
+For a striped pool, check the box beside one member on each external
+drive, then choose **Open 2 Members** (the number reflects your selection).
+The picker rechecks the selected devices immediately before opening them. If a
+member is unplugged or replaced, select the full set again.
 The list refreshes every two seconds, so a drive connected while it is open
 appears without reopening it. Internal storage and Apple disk images (such as
 this app's own DMG) are hidden. Mounted partitions show their current mount path.
@@ -115,9 +123,9 @@ The CLI needs an already readable device or an administrator launch; it does not
 show the desktop authorization prompt.
 
 The Mac app supports ZFS native encryption; Datto LUKS and agent-password UI and
-incremental application remain CLI/Windows features. Single disk or single
-top-level mirror pool layouts are supported; RAIDZ and striped/multiple-vdev
-pools are not.
+incremental application remain CLI/Windows features. Direct recovery supports a single disk, a healthy leaf of a single mirror,
+and a stripe of ordinary disks or image files with every member present.
+RAIDZ, stripes of mirrors, and special allocation classes require another recovery source.
 
 Long operations run in a background worker. The progress panel shows bytes
 read, bytes written, and completed files. **Cancel** stops at the next safe
@@ -158,3 +166,5 @@ On a Mac with Xcode, an active desktop session, and permission for Xcode UI test
 ```
 
 The external UI test opens the archived app, chooses public fixtures through its file dialog, retries a wrong passphrase, saves a file, attempts a same-name restore over a distinctive test file, and recovers the middle of three snapshots. It compares the output bytes to independently recorded SHA-256 values. The evidence directory contains the archive and executable hashes, screenshots, restored files, per-file comparisons and the Xcode test result. This check uses ordinary files and requires no administrator prompt.
+
+Pass three additional arguments to exercise a two-member striped pool: the folder containing `left.img` and `right.img`, the full dataset name (such as `pool/files`), and the SHA-256 of `across.bin` in its newest restore point. The check opens both members in the system file dialog, checks the missing-member message, restores from the original session and verifies both source images remain unchanged.

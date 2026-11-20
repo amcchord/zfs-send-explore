@@ -48,6 +48,14 @@ pub fn release_authorized_sources(keep: Option<&Path>) {
         .retain(|path, _| Some(path.as_path()) == keep);
 }
 
+/// Keep exactly the handles needed by the active desktop source.
+pub fn retain_authorized_sources(keep: &[PathBuf]) {
+    AUTHORIZED_SOURCES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .retain(|path, _| keep.contains(path));
+}
+
 pub(crate) fn open_read_only(path: &Path) -> std::io::Result<File> {
     let authorized = AUTHORIZED_SOURCES
         .lock()
