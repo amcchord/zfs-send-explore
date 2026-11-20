@@ -47,8 +47,7 @@ python3 scripts/verify-macos-package.py 'target/macos-package/ZFS Explore.app'
 The window guides you through four steps, shown in the step bar at the top:
 **Backup open → Restore point → Unlock → Find files → Restore**.
 
-1. On the welcome screen choose **Open a backup file** (⌘O) or **Open a
-   connected drive** (⇧⌘D; see below). You can also drag a backup file into the
+1. On the welcome screen choose **Connected drives** (⇧⌘D) or **Open a backup file** (⌘O). You can also drag a backup file into the
    window, or use **Open from a path…** (⇧⌘O) for a pasted path such as
    `/Volumes/Backups/slide.img` or a device such as `/dev/disk4s2`.
    For an offline stripe of ordinary disk/file vdevs, Command-click all member
@@ -91,24 +90,24 @@ string copies are not guaranteed to be zeroized.
 
 ## Open an attached drive
 
-![Choosing a connected drive](screenshots/macos/connected-drive.png)
+Choose **Connected drives** on the welcome screen or in the toolbar while browsing
+a backup. The picker lists each attached external disk once, including backup
+drives Finder cannot show. Use the model, capacity and disk identifier (such as
+`disk4`) to distinguish devices. **Likely ZFS** appears when macOS reports a
+ZFS partition type. The picker keeps internal storage and mounted Apple disk
+images out of this list.
 
-A drive holding a ZFS pool does not appear in Finder or in the Open Backup panel:
-macOS cannot read its partitions, so it never mounts them. **Open a
-connected drive** lists external disks directly from DiskArbitration instead, whether or
-not Finder shows them, with each partition's type and size. A ZFS-typed
-partition is suggested first, then the largest partition macOS left unmounted.
-Choosing **Whole disk** also works when exactly one partition holds the pool.
-For a striped pool, check the box beside one member on each external
-drive, then choose **Open 2 Members** (the number reflects your selection).
-The picker rechecks the selected devices immediately before opening them. If a
-member is unplugged or replaced, select the full set again.
-The list refreshes every two seconds, so a drive connected while it is open
-appears without reopening it. Internal storage and Apple disk images (such as
-this app's own DMG) are hidden. Mounted partitions show their current mount path.
-A suggestion is based on the partition type, not a guarantee that it contains ZFS.
-Once open, the backup is shown by the drive's name rather than its device node. Removing the selected device clears the selection; reconnecting requires choosing
-it again, even if macOS reuses the same disk number.
+Check the drive you want. For a striped pool, check each member and choose
+**Open 2 Drives** (the number reflects your selection). Nothing is checked when
+the picker opens. To inspect partitions or override the suggested source, use the
+arrow at the right of a drive and choose **Read from**. The suggestion prefers
+a ZFS partition, then the largest eligible unmounted data partition, then the
+whole disk. Picking a partition on an unchecked drive leaves it unchecked.
+
+The list refreshes automatically. If a selected drive or partition disappears,
+opening is paused while the other selections stay checked. **Remove unavailable**
+clears the missing selection. Check a reconnected drive explicitly, even when
+macOS has reused its disk number.
 
 Disk devices belong to `root:operator`, so macOS asks for an administrator
 password when the selected device is not already readable. The engine runs

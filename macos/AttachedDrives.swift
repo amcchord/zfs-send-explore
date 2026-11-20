@@ -53,7 +53,7 @@ struct DriveSlice: Identifiable, Hashable {
 }
 
 /// A physical (or attached image) disk and its partitions.
-struct AttachedDrive: Identifiable {
+struct AttachedDrive: Identifiable, Equatable {
     let disk: DriveSlice
     let name: String
     let bus: String
@@ -69,15 +69,8 @@ struct AttachedDrive: Identifiable {
             ?? disk
     }
 
-    /// Resolve the exact media instances together. Removing any selected member
-    /// invalidates the set, even if a replacement has inherited its BSD name.
-    static func resolve(_ ids: Set<String>, in drives: [AttachedDrive]) -> [(AttachedDrive, DriveSlice)]? {
-        guard !ids.isEmpty else { return nil }
-        let choices = drives.flatMap { drive in
-            ([drive.disk] + drive.partitions).filter { ids.contains($0.id) }.map { (drive, $0) }
-        }
-        return choices.count == ids.count ? choices : nil
-    }
+    var slices: [DriveSlice] { [disk] + partitions }
+    var hasZFSPartition: Bool { slices.contains { $0.kind == .zfs } }
 
     /// External and attached-image disks from DiskArbitration, including disks
     /// whose partitions macOS cannot mount and Finder therefore never shows.
@@ -136,5 +129,30 @@ struct AttachedDrive: Identifiable {
                 return drive
             }
             .sorted { $0.disk.bsdName.localizedStandardCompare($1.disk.bsdName) == .orderedAscending }
+    }
+}
+
+
+/// Keep the chosen slice on its particular attachment, including while it is
+/// missing. Refreshing the picker must never open a smaller or substituted set.
+struct DriveSelection {
+    var targets: [String: DriveSlice] = [:]
+
+    func available(in drives: [AttachedDrive]) -> [(AttachedDrive, DriveSlice)] {
+        drives.compactMap { drive in
+            guard let id = targets[drive.id]?.id,
+                  let slice = drive.slices.first(where: { $0.id == id }) else { return nil }
+            return (drive, slice)
+        }
+    }
+
+    func unavailable(in drives: [AttachedDrive]) -> [DriveSlice] {
+        let availableIDs = Set(available(in: drives).map { $0.0.id })
+        return targets.filter { !availableIDs.contains($0.key) }.map(\.value)
+            .sorted { $0.bsdName.localizedStandardCompare($1.bsdName) == .orderedAscending }
+    }
+
+    mutating func removeUnavailable(in drives: [AttachedDrive]) {
+        targets = Dictionary(uniqueKeysWithValues: available(in: drives).map { ($0.0.id, $0.1) })
     }
 }
