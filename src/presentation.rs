@@ -220,7 +220,12 @@ pub struct FriendlyError {
 /// Turn an engine error into a headline, a next step, and retained details.
 pub fn friendly_error(raw: &str) -> FriendlyError {
     let lower = raw.to_ascii_lowercase();
-    let (title, message) = if lower.contains("missing stripe members") {
+    let (title, message) = if lower.contains("reopen the backup before restoring") {
+        (
+            "A backup member moved or changed",
+            "Open the backup again with its current member files, then choose the restore destination.",
+        )
+    } else if lower.contains("missing stripe members") {
         ("Open all members of this pool together", raw)
     } else if lower.starts_with("could not assemble the selected pool members") {
         ("Check the selected pool members", raw)
@@ -409,6 +414,13 @@ mod tests {
         assert_eq!(
             friendly_error("A file or folder already exists there.").title,
             "Something with that name is already there"
+        );
+        assert_eq!(
+            friendly_error(
+                "Source disk-b.img moved or changed. Reopen the backup before restoring."
+            )
+            .title,
+            "A backup member moved or changed"
         );
         assert_eq!(friendly_error("unexpected").title, "That didn't work");
     }
