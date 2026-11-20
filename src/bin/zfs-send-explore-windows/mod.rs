@@ -4435,6 +4435,9 @@ unsafe fn file_dialog(
         .take_while(|part| !part.is_empty())
         .map(|part| PathBuf::from(OsString::from_wide(part)));
     let first = parts.next()?;
+    if !multiple {
+        return Some(vec![first]);
+    }
     let mut paths: Vec<_> = parts.map(|name| first.join(name)).collect();
     if paths.is_empty() {
         paths.push(first);
