@@ -33,12 +33,11 @@ dialogs, Windows open/save dialogs, Segoe UI sized for each monitor's DPI, and
 Explorer-style file icons. Long scans and restores run on background workers so
 the window keeps responding.
 
-When nothing is open, the window shows three large choices and a summary of the
-steps:
+The welcome page offers three ways to open a backup.
 
+- **Browse connected drives** (Ctrl+D) — check the attached drive holding the backup, or all member drives from one pool.
 - **Open a backup file** (Ctrl+O) — a ZFS send file, a Slide or ZFS pool image,
   or a RAW, QCOW2 or VMDK disk image. The format is detected automatically.
-- **Browse connected drives** (Ctrl+D) — check the attached drive holding the backup, or all member drives from one pool.
 - **Open from a path** — type or paste a location, including `\\.\PhysicalDriveN`.
 
 Once a backup is open:
