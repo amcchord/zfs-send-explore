@@ -40,8 +40,6 @@ a fixture using only the copied app's bundled worker. Run this check locally:
 python3 scripts/verify-macos-package.py 'target/macos-package/ZFS Explore.app'
 ```
 
-![ZFS Explore on macOS](screenshots/macos-welcome.png)
-
 ## Recover a file
 
 The window guides you through four steps, shown in the step bar at the top:
@@ -97,7 +95,8 @@ drives Finder cannot show. Use the model, capacity and disk identifier (such as
 ZFS partition type. The picker keeps internal storage and mounted Apple disk
 images out of this list.
 
-Check the drive you want. For a striped pool, check each member and choose
+Check the drive you want. After a single drive opens, its title keeps the disk or
+partition identifier so you can distinguish identical devices. For a striped pool, check each member and choose
 **Open 2 Drives** (the number reflects your selection). Nothing is checked when
 the picker opens. To inspect partitions or override the suggested source, use the
 arrow at the right of a drive. Choose **Read from** for a single partition.

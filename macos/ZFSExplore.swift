@@ -302,7 +302,7 @@ final class Engine: @unchecked Sendable {
         let selected = driveSelection.available(in: drives)
         guard !selected.isEmpty, selected.count == driveSelection.count else { return }
         let (drive, slice) = selected[0]
-        let title = slice.whole ? drive.name : "\(drive.name) · \(slice.typeLabel)"
+        let title = slice.whole ? "\(drive.name) · \(slice.bsdName)" : "\(drive.name) · \(slice.typeLabel) · \(slice.bsdName)"
         showDrives = false
         open(selected.map { URL(fileURLWithPath: $0.1.path) },
              drive: selected.count == 1 ? (slice.path, title) : nil)
