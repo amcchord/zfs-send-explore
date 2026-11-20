@@ -57,8 +57,8 @@ pub(crate) fn validate_component(name: &str) -> Result<()> {
 /// Extract a source directory into a staged sibling and publish it only after
 /// every regular file succeeds. A forced replacement keeps the previous tree
 /// in the staging directory until the new tree has been renamed into place.
-pub(crate) fn extract_directory_tree<List, Extract>(
-    backup_file: Option<&Path>,
+pub(crate) fn extract_directory_tree_from_sources<List, Extract>(
+    backup_files: &[impl AsRef<Path>],
     source: &str,
     source_root: &str,
     destination: &Path,
@@ -70,8 +70,12 @@ where
     List: FnMut(&str) -> Result<Vec<DirectoryEntry>>,
     Extract: FnMut(&str, &Path) -> Result<u64>,
 {
-    let publication =
-        crate::destination::RestoreDestination::prepare(backup_file, destination, force, false)?;
+    let publication = crate::destination::RestoreDestination::prepare_sources(
+        backup_files,
+        destination,
+        force,
+        false,
+    )?;
     let parent = destination
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -152,7 +156,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::extract_directory_tree;
+    use super::extract_directory_tree_from_sources;
     use crate::filesystem::DirectoryEntry;
     use std::fs;
 
@@ -160,8 +164,8 @@ mod tests {
     fn recursive_extraction_stages_and_replaces_a_complete_tree() {
         let temporary = tempfile::tempdir().unwrap();
         let destination = temporary.path().join("recovered");
-        let result = extract_directory_tree(
-            None,
+        let result = extract_directory_tree_from_sources(
+            &[] as &[&std::path::Path],
             "test snapshot",
             "/Users",
             &destination,
@@ -197,8 +201,8 @@ mod tests {
         );
 
         fs::write(destination.join("old.txt"), b"old").unwrap();
-        extract_directory_tree(
-            None,
+        extract_directory_tree_from_sources(
+            &[] as &[&std::path::Path],
             "test snapshot",
             "/empty",
             &destination,
@@ -217,8 +221,8 @@ mod tests {
         fs::create_dir(&destination).unwrap();
         fs::write(destination.join("old.txt"), b"old").unwrap();
 
-        let result = extract_directory_tree(
-            None,
+        let result = extract_directory_tree_from_sources(
+            &[] as &[&std::path::Path],
             "test snapshot",
             "/",
             &destination,
@@ -252,8 +256,8 @@ mod report_tests {
             dirent_type: kind,
             logical_size: None,
         };
-        let result = extract_directory_tree(
-            None,
+        let result = extract_directory_tree_from_sources(
+            &[] as &[&std::path::Path],
             "tank/host@day1",
             "/docs",
             &dest,

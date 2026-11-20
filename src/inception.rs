@@ -12,7 +12,7 @@ use crate::ntfs_compression::CompressedStream;
 use crate::pool::PoolMember;
 use crate::sparse;
 use crate::stream::{DMU_SUBSTREAM, FEATURE_RAW, RECORD_SIZE, RecordKind, StreamReader};
-use crate::tree::{RecursiveExtraction, extract_directory_tree};
+use crate::tree::{RecursiveExtraction, extract_directory_tree_from_sources};
 use anyhow::{Context, Result, anyhow, bail};
 use ext4_view::{Ext4, Ext4Read};
 use fat::{FatFs, FatVariant, FileId};
@@ -133,7 +133,7 @@ pub struct NestedExtraction {
 
 /// An inspected inner disk image. All source access remains read-only.
 pub struct InceptionSession {
-    source_path: Option<PathBuf>,
+    source_paths: Vec<PathBuf>,
     snapshot: Option<String>,
     source: Arc<dyn ImageRead>,
     image_path: String,
@@ -156,7 +156,7 @@ impl InceptionSession {
             image_offset,
             image_length,
         )?;
-        session.source_path = Some(path.to_owned());
+        session.source_paths.push(path.to_owned());
         Ok(session)
     }
 
@@ -188,7 +188,7 @@ impl InceptionSession {
             as Arc<dyn ImageRead>;
         let mut session =
             Self::inspect_source_at(source, normalized_path, image_offset, image_length)?;
-        session.source_path = Some(stream.to_owned());
+        session.source_paths.push(stream.to_owned());
         session.snapshot = Some(format!(
             "{} ({:#018x})",
             plan.target.dataset_name, plan.target.to_guid
@@ -284,7 +284,7 @@ impl InceptionSession {
             }
             None
         };
-        let source_path = pool.source_path.clone();
+        let source_paths = pool.source_paths.clone();
         let source = pool.into_image_file_with_key(dataset, image_path, key_material)?;
         let mut source = Arc::new(source) as Arc<dyn ImageRead>;
         if let Some(key) = datto_key {
@@ -292,7 +292,7 @@ impl InceptionSession {
         }
         let mut session =
             Self::inspect_source_at(source, image_path.to_owned(), image_offset, image_length)?;
-        session.source_path = Some(source_path);
+        session.source_paths = source_paths;
         session.snapshot = Some(dataset.to_owned());
         Ok(session)
     }
@@ -357,7 +357,7 @@ impl InceptionSession {
             .map(|layout| probe_volume(&source, layout))
             .collect::<Vec<_>>();
         Ok(Self {
-            source_path: None,
+            source_paths: Vec::new(),
             snapshot: None,
             source,
             image_path,
@@ -435,8 +435,8 @@ impl InceptionSession {
         output: &Path,
         force: bool,
     ) -> Result<NestedExtraction> {
-        let publication = crate::destination::RestoreDestination::prepare(
-            self.source_path.as_deref(),
+        let publication = crate::destination::RestoreDestination::prepare_sources(
+            &self.source_paths,
             output,
             force,
             true,
@@ -496,8 +496,8 @@ impl InceptionSession {
             self.image_path,
             selected.selector
         );
-        extract_directory_tree(
-            self.source_path.as_deref(),
+        extract_directory_tree_from_sources(
+            &self.source_paths,
             &origin,
             path,
             output,
@@ -548,7 +548,7 @@ impl InceptionSession {
             image_offset,
             image_length,
         )?;
-        session.source_path = self.source_path.clone();
+        session.source_paths.clone_from(&self.source_paths);
         session.snapshot = self.snapshot.clone();
         Ok(session)
     }

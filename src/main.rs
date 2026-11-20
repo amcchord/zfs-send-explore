@@ -119,37 +119,31 @@ enum PoolCommand {
     },
     /// Validate a member and summarize its active pool state.
     Inspect {
-        /// ZFS vdev partition, file vdev, or supported GPT/MBR whole disk/image (read-only).
-        member: PathBuf,
+        #[command(flatten)]
+        source: PoolInput,
         /// Print machine-readable JSON.
         #[arg(long)]
         json: bool,
-        #[command(flatten)]
-        container: ContainerKeyInput,
     },
     /// List filesystem datasets reachable from the member.
     Datasets {
-        /// ZFS vdev partition, file vdev, or supported GPT/MBR whole disk/image.
-        member: PathBuf,
         #[command(flatten)]
-        container: ContainerKeyInput,
+        source: PoolInput,
     },
     /// List named snapshots stored in the pool.
     Snapshots {
-        /// ZFS vdev partition, file vdev, or supported GPT/MBR whole disk/image.
-        member: PathBuf,
+        #[command(flatten)]
+        source: PoolInput,
         /// Restrict output to one full dataset name.
         dataset: Option<String>,
         /// Print original timestamps and snapshot metadata as JSON.
         #[arg(long)]
         json: bool,
-        #[command(flatten)]
-        container: ContainerKeyInput,
     },
     /// List one directory from a current dataset or named snapshot.
     List {
-        /// ZFS vdev partition, file vdev, or supported GPT/MBR whole disk/image.
-        member: PathBuf,
+        #[command(flatten)]
+        source: PoolInput,
         /// Full dataset name, optionally followed by @snapshot.
         dataset: String,
         /// Absolute path inside the dataset or snapshot.
@@ -158,13 +152,11 @@ enum PoolCommand {
         /// File containing the ZFS passphrase, hex key, or 32-byte raw key.
         #[arg(long, value_name = "FILE")]
         key_file: Option<PathBuf>,
-        #[command(flatten)]
-        container: ContainerKeyInput,
     },
     /// Extract one regular file directly from a dataset or snapshot.
     Extract {
-        /// ZFS vdev partition, file vdev, or supported GPT/MBR whole disk/image.
-        member: PathBuf,
+        #[command(flatten)]
+        source: PoolInput,
         /// Full dataset name, optionally followed by @snapshot.
         dataset: String,
         /// Absolute path inside the dataset or snapshot.
@@ -178,12 +170,11 @@ enum PoolCommand {
         /// File containing the ZFS passphrase, hex key, or 32-byte raw key.
         #[arg(long, value_name = "FILE")]
         key_file: Option<PathBuf>,
-        #[command(flatten)]
-        container: ContainerKeyInput,
     },
     /// Recursively extract one ZFS directory into a new destination tree.
     ExtractTree {
-        member: PathBuf,
+        #[command(flatten)]
+        source: PoolInput,
         dataset: String,
         path: String,
         #[arg(short, long)]
@@ -192,14 +183,36 @@ enum PoolCommand {
         force: bool,
         #[arg(long, value_name = "FILE")]
         key_file: Option<PathBuf>,
-        #[command(flatten)]
-        container: ContainerKeyInput,
     },
     /// Explore a disk image stored as a regular file in a dataset or snapshot.
     Inception {
         #[command(subcommand)]
         command: PoolInceptionCommand,
     },
+}
+
+#[derive(Debug, Args)]
+struct PoolInput {
+    /// First ZFS member image, partition, or supported whole disk.
+    member: PathBuf,
+    /// Another disk or file member of the same stripe. Repeat for each additional member.
+    #[arg(long = "member", value_name = "PATH")]
+    additional_members: Vec<PathBuf>,
+    #[command(flatten)]
+    container: ContainerKeyInput,
+}
+
+impl PoolInput {
+    fn open(self) -> Result<PoolMember> {
+        let key = load_optional_secret_file(
+            self.container.container_key_file.as_ref(),
+            "LUKS container passphrase",
+            4096,
+        )?;
+        let mut members = self.additional_members;
+        members.insert(0, self.member);
+        PoolMember::open_members(&members, key.as_deref().map(Vec::as_slice))
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -310,7 +323,8 @@ enum InceptionCommand {
 enum PoolInceptionCommand {
     /// Detect the disk container, partition table, and inner filesystems.
     Inspect {
-        member: PathBuf,
+        #[command(flatten)]
+        source: PoolInput,
         dataset: String,
         image: String,
         #[arg(long, value_name = "FILE")]
@@ -320,13 +334,12 @@ enum PoolInceptionCommand {
         #[arg(long)]
         json: bool,
         #[command(flatten)]
-        container: ContainerKeyInput,
-        #[command(flatten)]
         datto: DattoImageInput,
     },
     /// List a directory in a filesystem inside the selected disk image.
     List {
-        member: PathBuf,
+        #[command(flatten)]
+        source: PoolInput,
         dataset: String,
         image: String,
         #[arg(default_value = "/")]
@@ -338,13 +351,12 @@ enum PoolInceptionCommand {
         #[command(flatten)]
         window: ImageWindow,
         #[command(flatten)]
-        container: ContainerKeyInput,
-        #[command(flatten)]
         datto: DattoImageInput,
     },
     /// Extract one file from a filesystem inside the selected disk image.
     Extract {
-        member: PathBuf,
+        #[command(flatten)]
+        source: PoolInput,
         dataset: String,
         image: String,
         path: String,
@@ -358,14 +370,13 @@ enum PoolInceptionCommand {
         volume: Option<String>,
         #[command(flatten)]
         window: ImageWindow,
-        #[command(flatten)]
-        container: ContainerKeyInput,
         #[command(flatten)]
         datto: DattoImageInput,
     },
     /// Recursively extract a directory from the subordinate filesystem.
     ExtractTree {
-        member: PathBuf,
+        #[command(flatten)]
+        source: PoolInput,
         dataset: String,
         image: String,
         path: String,
@@ -379,8 +390,6 @@ enum PoolInceptionCommand {
         volume: Option<String>,
         #[command(flatten)]
         window: ImageWindow,
-        #[command(flatten)]
-        container: ContainerKeyInput,
         #[command(flatten)]
         datto: DattoImageInput,
     },
@@ -562,12 +571,8 @@ fn run_pool(command: PoolCommand, time_zone: SnapshotTimeZone) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&layouts)?);
             }
         }
-        PoolCommand::Inspect {
-            member,
-            json,
-            container,
-        } => {
-            let pool = open_pool_member(&member, &container)?;
+        PoolCommand::Inspect { source, json } => {
+            let pool = source.open()?;
             let inspection = pool.inspect()?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&inspection)?);
@@ -578,19 +583,31 @@ fn run_pool(command: PoolCommand, time_zone: SnapshotTimeZone) -> Result<()> {
                     println!("container: {encryption}");
                 }
                 println!("pool guid: {}", inspection.pool_guid);
-                println!(
-                    "vdev: {} ({}, {} top-level)",
-                    inspection.vdev_guid, inspection.vdev_type, inspection.top_level_vdevs
-                );
-                println!("member bytes: {}", inspection.source_bytes);
+                if inspection.member_guids.len() > 1 {
+                    println!(
+                        "layout: {} ({} members)",
+                        inspection.vdev_type,
+                        inspection.member_guids.len()
+                    );
+                    for (group, guid) in inspection.member_guids.iter().enumerate() {
+                        println!("group {group}: {guid}");
+                    }
+                    println!("combined member bytes: {}", inspection.source_bytes);
+                } else {
+                    println!(
+                        "vdev: {} ({}, {} top-level)",
+                        inspection.vdev_guid, inspection.vdev_type, inspection.top_level_vdevs
+                    );
+                    println!("member bytes: {}", inspection.source_bytes);
+                }
                 println!("active txg: {}", inspection.txg);
                 println!("byte order: {}", inspection.endian);
                 println!("datasets: {}", inspection.datasets);
                 println!("snapshots: {}", inspection.snapshots);
             }
         }
-        PoolCommand::Datasets { member, container } => {
-            let pool = open_pool_member(&member, &container)?;
+        PoolCommand::Datasets { source } => {
+            let pool = source.open()?;
             for dataset in pool.datasets()? {
                 println!(
                     "{}\t{}\t{}",
@@ -599,12 +616,11 @@ fn run_pool(command: PoolCommand, time_zone: SnapshotTimeZone) -> Result<()> {
             }
         }
         PoolCommand::Snapshots {
-            member,
+            source,
             dataset,
             json,
-            container,
         } => {
-            let pool = open_pool_member(&member, &container)?;
+            let pool = source.open()?;
             let snapshots = pool.snapshots(dataset.as_deref())?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&snapshots)?);
@@ -624,13 +640,12 @@ fn run_pool(command: PoolCommand, time_zone: SnapshotTimeZone) -> Result<()> {
             }
         }
         PoolCommand::List {
-            member,
+            source,
             dataset,
             path,
             key_file,
-            container,
         } => {
-            let pool = open_pool_member(&member, &container)?;
+            let pool = source.open()?;
             let key = load_pool_key_material(&pool, &dataset, key_file.as_ref())?;
             for entry in
                 pool.list_directory_with_key(&dataset, &path, key.as_deref().map(Vec::as_slice))?
@@ -648,15 +663,14 @@ fn run_pool(command: PoolCommand, time_zone: SnapshotTimeZone) -> Result<()> {
             }
         }
         PoolCommand::Extract {
-            member,
+            source,
             dataset,
             path,
             output,
             force,
             key_file,
-            container,
         } => {
-            let pool = open_pool_member(&member, &container)?;
+            let pool = source.open()?;
             let key = load_pool_key_material(&pool, &dataset, key_file.as_ref())?;
             let extraction = pool.extract_with_key(
                 &dataset,
@@ -679,15 +693,14 @@ fn run_pool(command: PoolCommand, time_zone: SnapshotTimeZone) -> Result<()> {
             }
         }
         PoolCommand::ExtractTree {
-            member,
+            source,
             dataset,
             path,
             output,
             force,
             key_file,
-            container,
         } => {
-            let pool = open_pool_member(&member, &container)?;
+            let pool = source.open()?;
             let key = load_pool_key_material(&pool, &dataset, key_file.as_ref())?;
             let extraction = pool.extract_tree_with_key(
                 &dataset,
@@ -804,16 +817,15 @@ fn run_inception(command: InceptionCommand) -> Result<()> {
 fn run_pool_inception(command: PoolInceptionCommand) -> Result<()> {
     match command {
         PoolInceptionCommand::Inspect {
-            member,
+            source,
             dataset,
             image,
             key_file,
             window,
             json,
-            container,
             datto,
         } => {
-            let pool = open_pool_member(&member, &container)?;
+            let pool = source.open()?;
             let key = load_pool_key_material(&pool, &dataset, key_file.as_ref())?;
             let agent_password = load_optional_secret_file(
                 datto.agent_password_file.as_ref(),
@@ -833,17 +845,16 @@ fn run_pool_inception(command: PoolInceptionCommand) -> Result<()> {
             print_inception_inspection(&session, json)?;
         }
         PoolInceptionCommand::List {
-            member,
+            source,
             dataset,
             image,
             path,
             key_file,
             volume,
             window,
-            container,
             datto,
         } => {
-            let pool = open_pool_member(&member, &container)?;
+            let pool = source.open()?;
             let key = load_pool_key_material(&pool, &dataset, key_file.as_ref())?;
             let agent_password = load_optional_secret_file(
                 datto.agent_password_file.as_ref(),
@@ -863,7 +874,7 @@ fn run_pool_inception(command: PoolInceptionCommand) -> Result<()> {
             print_directory(session.list_directory(volume.as_deref(), &path)?);
         }
         PoolInceptionCommand::Extract {
-            member,
+            source,
             dataset,
             image,
             path,
@@ -872,10 +883,9 @@ fn run_pool_inception(command: PoolInceptionCommand) -> Result<()> {
             key_file,
             volume,
             window,
-            container,
             datto,
         } => {
-            let pool = open_pool_member(&member, &container)?;
+            let pool = source.open()?;
             let key = load_pool_key_material(&pool, &dataset, key_file.as_ref())?;
             let agent_password = load_optional_secret_file(
                 datto.agent_password_file.as_ref(),
@@ -903,7 +913,7 @@ fn run_pool_inception(command: PoolInceptionCommand) -> Result<()> {
             );
         }
         PoolInceptionCommand::ExtractTree {
-            member,
+            source,
             dataset,
             image,
             path,
@@ -912,10 +922,9 @@ fn run_pool_inception(command: PoolInceptionCommand) -> Result<()> {
             key_file,
             volume,
             window,
-            container,
             datto,
         } => {
-            let pool = open_pool_member(&member, &container)?;
+            let pool = source.open()?;
             let key = load_pool_key_material(&pool, &dataset, key_file.as_ref())?;
             let agent_password = load_optional_secret_file(
                 datto.agent_password_file.as_ref(),
@@ -1067,15 +1076,6 @@ fn load_pool_key_material(
 ) -> Result<Option<Zeroizing<Vec<u8>>>> {
     let requirement = pool.encryption_requirement(dataset)?;
     load_key_for_requirement(requirement, key_file)
-}
-
-fn open_pool_member(member: &std::path::Path, input: &ContainerKeyInput) -> Result<PoolMember> {
-    let key = load_optional_secret_file(
-        input.container_key_file.as_ref(),
-        "LUKS container passphrase",
-        4096,
-    )?;
-    PoolMember::open_with_container_key(member, key.as_deref().map(Vec::as_slice))
 }
 
 fn load_optional_secret_file(
@@ -1266,6 +1266,10 @@ mod tests {
             "pool.key",
             "--container-key-file",
             "datto-pool.pass",
+            "--member",
+            "second.img",
+            "--member",
+            "third.img",
             "--agent-password-file",
             "agent.pass",
             "--key-stash",
@@ -1285,7 +1289,7 @@ mod tests {
                             volume,
                             key_file,
                             window,
-                            container,
+                            source,
                             datto,
                             force,
                             ..
@@ -1295,12 +1299,20 @@ mod tests {
         else {
             panic!("wrong pool inception extract command")
         };
+        assert_eq!(source.member, std::path::Path::new("member.img"));
+        assert_eq!(
+            source.additional_members,
+            [
+                std::path::Path::new("second.img"),
+                std::path::Path::new("third.img")
+            ]
+        );
         assert_eq!(dataset, "tank/vms@nightly");
         assert_eq!(path, "/Users/example/Documents");
         assert_eq!(volume.as_deref(), Some("mbr1"));
         assert_eq!(key_file.as_deref(), Some(std::path::Path::new("pool.key")));
         assert_eq!(
-            container.container_key_file.as_deref(),
+            source.container.container_key_file.as_deref(),
             Some(std::path::Path::new("datto-pool.pass"))
         );
         assert_eq!(

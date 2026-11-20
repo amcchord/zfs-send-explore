@@ -79,7 +79,7 @@ fn existing(path: &Path) -> Result<Option<Identity>> {
 
 /// Compare canonical ancestors as well as filesystem IDs (hard links and
 /// case-insensitive aliases). Physical devices themselves cannot be a target.
-fn protect_source(source: Option<&Path>, path: &Path) -> Result<()> {
+fn protect_sources(sources: &[impl AsRef<Path>], path: &Path) -> Result<()> {
     let Some(id) = existing(path)? else {
         return Ok(());
     };
@@ -89,14 +89,15 @@ fn protect_source(source: Option<&Path>, path: &Path) -> Result<()> {
         "destination {} is a link or special file",
         path.display()
     );
-    if let Some(source) = source {
+    for source in sources {
+        let source = source.as_ref();
         #[cfg(windows)]
         if source
             .to_string_lossy()
             .to_ascii_lowercase()
             .starts_with(r"\\.\physicaldrive")
         {
-            return Ok(()); // Device targets were excluded above.
+            continue; // Device targets were excluded above.
         }
         let resolved = fs::canonicalize(source)
             .with_context(|| format!("checking source identity for {}", source.display()))?;
@@ -421,13 +422,13 @@ impl RestoreDestination {
         }
     }
 
-    pub(crate) fn prepare(
-        source: Option<&Path>,
+    pub(crate) fn prepare_sources(
+        sources: &[impl AsRef<Path>],
         path: &Path,
         force: bool,
         companion: bool,
     ) -> Result<Self> {
-        Self::recover(source, path)?;
+        Self::recover(sources, path)?;
         let data = existing(path)?;
         ensure!(
             force || data.is_none(),
@@ -436,7 +437,7 @@ impl RestoreDestination {
         );
         let metadata = if companion {
             let side = sidecar_path(path);
-            protect_source(source, &side)?;
+            protect_sources(sources, &side)?;
             let existing = existing(&side)?;
             ensure!(
                 existing.is_none() || (force && data.is_some()),
@@ -468,14 +469,14 @@ impl RestoreDestination {
         })
     }
 
-    pub(crate) fn recover(source: Option<&Path>, target: &Path) -> Result<bool> {
-        protect_source(source, target)?;
+    fn recover(sources: &[impl AsRef<Path>], target: &Path) -> Result<bool> {
+        protect_sources(sources, target)?;
         let journal = journal_name(target)?;
         let Some(id) = existing(&journal)? else {
             return Ok(false);
         };
-        protect_source(source, &journal)?;
-        protect_source(source, &sidecar_path(target))?;
+        protect_sources(sources, &journal)?;
+        protect_sources(sources, &sidecar_path(target))?;
         ensure!(
             fs::symlink_metadata(&journal)?.file_type().is_file(),
             "invalid pending restore at {}",
@@ -491,7 +492,7 @@ impl RestoreDestination {
             .with_context(|| {
                 format!("unrecognized pending restore record {}", journal.display())
             })?;
-        protect_source(source, &intent.staged(target)?)?;
+        protect_sources(sources, &intent.staged(target)?)?;
         intent.commit(target, &journal, file)?;
         Ok(true)
     }
@@ -633,8 +634,13 @@ mod tests {
                         let gate = barrier.clone();
                         let output = &output;
                         scope.spawn(move || {
-                            let ready =
-                                RestoreDestination::prepare(None, output, false, false).unwrap();
+                            let ready = RestoreDestination::prepare_sources(
+                                &[] as &[&Path],
+                                output,
+                                false,
+                                false,
+                            )
+                            .unwrap();
                             let parent = output.parent().unwrap();
                             if directory {
                                 let stage = tempfile::tempdir_in(parent).unwrap();
@@ -663,6 +669,27 @@ mod tests {
             };
             assert_eq!(fs::read(payload).unwrap(), winner);
         }
+    }
+
+    #[test]
+    fn every_selected_member_is_protected_including_aliases_and_sidecars() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("other-disk");
+        fs::create_dir(&directory).unwrap();
+        let first = temp.path().join("first.img");
+        let second = directory.join("second.img");
+        fs::write(&first, b"first member").unwrap();
+        fs::write(&second, b"second member").unwrap();
+        let members = [first, second.clone()];
+        let alias = temp.path().join("alias");
+        fs::hard_link(&second, &alias).unwrap();
+        for forbidden in [&second, &directory, &alias] {
+            assert!(RestoreDestination::prepare_sources(&members, forbidden, true, true).is_err());
+        }
+        let output = temp.path().join("restored");
+        fs::hard_link(&second, sidecar_path(&output)).unwrap();
+        assert!(RestoreDestination::prepare_sources(&members, &output, true, true).is_err());
+        assert_eq!(fs::read(&second).unwrap(), b"second member");
     }
 
     #[test]
