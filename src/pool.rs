@@ -13,7 +13,7 @@ use crate::filesystem::DirectoryEntry;
 use crate::inception::ImageRead;
 use crate::operations::{EncryptionRequirement, SIDECAR_VERSION, Sidecar, guid_string};
 use crate::sparse;
-use crate::tree::{RecursiveExtraction, extract_directory_tree};
+use crate::tree::RecursiveExtraction;
 use anyhow::{Context, Result, anyhow, bail};
 use luks::{DecryptedPayload, LuksVolume};
 use serde::Serialize;
@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use zfs_core::{
     BLKPTR_SIZE, Blkptr, ChecksumType, DMU_OST_META, DMU_OST_ZFS, DNODE_SIZE, Dnode, Endian,
@@ -53,6 +53,8 @@ pub struct PoolInspection {
     pub pool_guid: String,
     pub vdev_guid: String,
     pub vdev_type: String,
+    /// Leaf GUIDs ordered by top-level vdev ID.
+    pub member_guids: Vec<String>,
     pub top_level_vdevs: u64,
     pub source_bytes: u64,
     pub txg: u64,
@@ -71,7 +73,10 @@ pub struct PoolLayout {
     pub group_id: u64,
     pub group_type: String,
     pub top_level_groups: u64,
+    /// Whether this member can be browsed alone.
     pub supported_layout: bool,
+    /// Whether this label describes an ordinary leaf in a multi-disk stripe.
+    pub stripe_candidate: bool,
     pub guidance: String,
 }
 
@@ -96,6 +101,163 @@ struct LabeledMember {
     active: VdevLabel,
     container_encryption: Option<String>,
     layout: PoolLayout,
+}
+
+fn has_unsupported_role(config: &zfs_core::NvList, group: &zfs_core::NvList) -> bool {
+    [config, group].into_iter().any(|nv| {
+        [
+            "is_log", "is_spare", "removing", "offline", "faulted", "removed",
+        ]
+        .iter()
+        .any(|key| nv.get_u64(key).is_some_and(|value| value != 0))
+            || [
+                "alloc_bias",
+                "com.delphix:indirect_object",
+                "com.delphix:indirect_births",
+                "com.delphix:prev_indirect_vdev",
+            ]
+            .iter()
+            .any(|key| nv.get(key).is_some())
+    })
+}
+
+/// OpenZFS multihost protection can refresh the heartbeat timestamp on a
+/// subset of members without advancing the txg or changing the root pointer.
+fn same_pool_root(mut observed: zfs_core::Uberblock, expected: zfs_core::Uberblock) -> bool {
+    observed.timestamp = expected.timestamp;
+    observed == expected
+}
+
+/// An interrupted label update may leave an older uberblock on a member. Only
+/// identical label identities and an unambiguous newest root are safe to use.
+fn validate_member_labels(active: &VdevLabel, others: &[(u64, VdevLabel)]) -> Result<()> {
+    for (_, other) in others {
+        for field in [
+            "pool_guid",
+            "top_guid",
+            "guid",
+            "vdev_children",
+            "name",
+            "vdev_tree",
+        ] {
+            if active.config.get(field) != other.config.get(field) {
+                bail!("conflicting {field} in stripe member labels");
+            }
+        }
+        if active.active_uberblock.txg == other.active_uberblock.txg
+            && (!same_pool_root(active.active_uberblock, other.active_uberblock)
+                || active.config.get("state") != other.config.get("state")
+                || active.config.get("txg") != other.config.get("txg"))
+        {
+            bail!("conflicting stripe roots or configurations for the same transaction group");
+        }
+    }
+    Ok(())
+}
+
+fn validate_stripe(members: &[LabeledMember]) -> Result<()> {
+    let first = &members[0];
+    let expected = first.layout.top_level_groups;
+    let pool_guid = first
+        .active
+        .config
+        .get_u64("pool_guid")
+        .context("missing pool GUID")?;
+    // The 24-bit DVA vdev field bounds the range of representable group IDs.
+    if expected == 0 || expected > (1 << 24) || pool_guid == 0 {
+        bail!("invalid stripe group count or pool GUID");
+    }
+    let mut groups = BTreeSet::new();
+    let mut guids = BTreeSet::new();
+    let mut guid_sum = pool_guid;
+    let uber = &first.active.active_uberblock;
+    for member in members {
+        let label = &member.layout;
+        let config = &member.active.config;
+        if label.pool_guid != first.layout.pool_guid || label.pool_name != first.layout.pool_name {
+            bail!(
+                "selected disks belong to different pools; select members with the same pool GUID"
+            );
+        }
+        if label.top_level_groups != expected
+            || config.get("version") != first.active.config.get("version")
+            || config.get("txg") != first.active.config.get("txg")
+        {
+            bail!("stripe members have inconsistent configuration generations or group counts");
+        }
+        if !label.stripe_candidate {
+            if label.supported_layout {
+                bail!("this single-group layout must be opened with one member");
+            }
+            return Err(label.clone().into());
+        }
+        // A powered-off or crash-consistent disk image can retain ACTIVE (0).
+        // EXPORTED (1) is also usable; destroyed and auxiliary states are not.
+        if !matches!(config.get_u64("state"), Some(0 | 1))
+            || config.get("state") != first.active.config.get("state")
+        {
+            bail!(
+                "stripe members must have a consistent active or exported pool state from the same offline capture"
+            );
+        }
+        if config
+            .get_u64("txg")
+            .is_none_or(|txg| txg == 0 || txg > uber.txg)
+            || !same_pool_root(member.active.active_uberblock, *uber)
+        {
+            bail!(
+                "stale or conflicting stripe member: the latest transaction group and root block must agree on every disk"
+            );
+        }
+        let guid = config
+            .get_u64("guid")
+            .context("missing stripe member GUID")?;
+        if guid == 0
+            || config.get_u64("top_guid") != Some(guid)
+            || config
+                .get_nvlist("vdev_tree")
+                .and_then(|group| group.get_u64("guid"))
+                != Some(guid)
+        {
+            bail!(
+                "stripe group {} has inconsistent member and group GUIDs",
+                label.group_id
+            );
+        }
+        if label.group_id >= expected {
+            bail!(
+                "stripe group {} is outside the declared group count {expected}",
+                label.group_id
+            );
+        }
+        if !guids.insert(guid) || !groups.insert(label.group_id) {
+            bail!(
+                "duplicate stripe member or group ID {}; select each disk once",
+                label.group_id
+            );
+        }
+        guid_sum = guid_sum.wrapping_add(guid);
+    }
+    if groups.len() as u64 != expected {
+        let missing = (0..expected)
+            .filter(|id| !groups.contains(id))
+            .take(12)
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let total_missing = expected - groups.len() as u64;
+        let mut layout = first.layout.clone();
+        let more = if total_missing > 12 { ", …" } else { "" };
+        layout.guidance = format!(
+            "Missing stripe members. Supplied {} of {expected} groups. Add the disks for group IDs {missing}{more} from the same offline capture, or open a full ZFS send.",
+            groups.len()
+        );
+        return Err(layout.into());
+    }
+    if guid_sum != uber.guid_sum {
+        bail!("stripe member GUIDs do not match the complete topology recorded by the uberblock");
+    }
+    Ok(())
 }
 
 /// One filesystem dataset reachable through the pool's DSL directory tree.
@@ -619,9 +781,12 @@ impl std::ops::Deref for PoolObjset {
 
 /// An opened offline vdev member. All methods are read-only with respect to the
 /// source; extraction writes only to the explicitly selected destination.
+#[derive(Clone)]
 pub struct PoolMember {
-    pub(crate) source_path: PathBuf,
-    source: PoolSource,
+    pub(crate) source_paths: Vec<PathBuf>,
+    sources: Arc<[PoolSource]>,
+    member_guids: Vec<String>,
+    source_bytes: u64,
     backup_format: String,
     container_encryption: Option<String>,
     pool_name: String,
@@ -653,31 +818,72 @@ impl PoolMember {
     /// Open a pool whose vdev may be inside a LUKS1/LUKS2 partition. The
     /// passphrase is used only when a LUKS signature is actually present.
     pub fn open_with_container_key(path: &Path, container_key: Option<&[u8]>) -> Result<Self> {
-        let LabeledMember {
-            source,
-            active,
-            container_encryption,
-            layout,
-        } = Self::labels(path, container_key)?;
-        if !layout.supported_layout {
-            return Err(layout.into());
+        Self::open_members(&[path.to_owned()], container_key)
+    }
+
+    /// Open a complete offline stripe without importing the pool. The label's
+    /// top-level ID, never the order of the paths, selects the source for a DVA.
+    pub fn open_members(paths: &[PathBuf], container_key: Option<&[u8]>) -> Result<Self> {
+        if paths.is_empty() {
+            bail!("select at least one ZFS pool member");
         }
-        let pool_name = layout.pool_name;
-        let config = &active.config;
-        let pool_guid = config.get_u64("pool_guid").context("missing pool GUID")?;
-        let vdev_guid = config
-            .get_nvlist("vdev_tree")
-            .and_then(|v| v.get_u64("guid"))
+        let mut members = Vec::with_capacity(paths.len());
+        for path in paths {
+            crate::progress::checkpoint()?;
+            members.push(Self::labels(path, container_key)?);
+        }
+        members.sort_by_key(|member| member.layout.group_id);
+        let first = &members[0];
+        let striped = first.layout.top_level_groups > 1;
+        if striped || members.len() > 1 {
+            validate_stripe(&members)?;
+        } else if !first.layout.supported_layout {
+            return Err(first.layout.clone().into());
+        }
+
+        let pool_name = first.layout.pool_name.clone();
+        let pool_guid = first
+            .active
+            .config
+            .get_u64("pool_guid")
+            .context("missing pool GUID")?;
+        let vdev_guid = first
+            .active
+            .config
+            .get_u64("top_guid")
+            .or_else(|| first.active.config.get_nvlist("vdev_tree")?.get_u64("guid"))
             .context("missing vdev GUID")?;
-        let vdev_type = layout.group_type;
-        let top_level_vdevs = layout.top_level_groups;
-        let uberblock = &active.active_uberblock;
-        let rootbp = uberblock.rootbp_full();
-        let mos_block = read_block_from(&source, 0, &rootbp).with_context(|| {
+        let vdev_type = if striped {
+            "stripe".to_owned()
+        } else {
+            first.layout.group_type.clone()
+        };
+        let top_level_vdevs = first.layout.top_level_groups;
+        let uberblock = first.active.active_uberblock;
+        let container_encryption = members
+            .iter()
+            .filter_map(|member| member.container_encryption.clone())
+            .collect::<BTreeSet<_>>();
+        let container_encryption = (!container_encryption.is_empty()).then(|| {
+            container_encryption
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", ")
+        });
+        let member_guids = members
+            .iter()
+            .map(|member| member.layout.member_guid.clone())
+            .collect();
+        let source_bytes = members.iter().try_fold(0_u64, |total, member| {
+            total
+                .checked_add(member.source.len())
+                .context("combined pool size exceeds u64")
+        })?;
+        let sources: Arc<[PoolSource]> = members.into_iter().map(|member| member.source).collect();
+        let mos_block = read_block_from(&sources, &uberblock.rootbp_full()).with_context(|| {
             format!(
-                "reading MOS from active uberblock txg {} on {}",
-                uberblock.txg,
-                path.display()
+                "reading MOS from active uberblock txg {} in pool {pool_name}",
+                uberblock.txg
             )
         })?;
         let mos =
@@ -700,9 +906,11 @@ impl PoolMember {
         }
         .to_owned();
 
-        Ok(Self {
-            source,
-            source_path: path.to_owned(),
+        let pool = Self {
+            sources,
+            source_paths: paths.to_vec(),
+            member_guids,
+            source_bytes,
             backup_format,
             container_encryption,
             pool_name,
@@ -713,7 +921,39 @@ impl PoolMember {
             txg: uberblock.txg,
             endian: uberblock.endian,
             mos,
-        })
+        };
+        if striped && uberblock.version >= 5000 {
+            pool.check_stripe_features()?;
+        }
+        Ok(pool)
+    }
+
+    /// Allocation class properties may live in per-vdev ZAPs and be absent
+    /// from individual labels. Their active pool feature is recorded in the MOS.
+    fn check_stripe_features(&self) -> Result<()> {
+        let directory = self
+            .mos_dnode(&self.mos, 1)?
+            .context("missing MOS object directory")?;
+        let directory = self.read_zap_object(&directory)?;
+        for table in ["features_for_read", "features_for_write"] {
+            let object =
+                zap_lookup(&directory, table).with_context(|| format!("missing MOS {table}"))?;
+            let dnode = self
+                .mos_dnode(&self.mos, object)?
+                .with_context(|| format!("missing MOS feature object {object}"))?;
+            let features = self.read_zap_object(&dnode)?;
+            for feature in [
+                "org.zfsonlinux:allocation_classes",
+                "com.delphix:device_removal",
+            ] {
+                if zap_lookup(&features, feature).unwrap_or(0) > 0 {
+                    bail!(
+                        "unsupported stripe layout: active {feature} requires allocation classes or indirect vdev mapping"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Read the labels only. This also works for individual members of striped and RAIDZ pools.
@@ -876,10 +1116,21 @@ impl PoolMember {
             }
         }
 
-        let supported_layout = top_level_vdevs == 1
+        let ordinary_group = !has_unsupported_role(config, vdev);
+        let supported_layout = ordinary_group
+            && top_level_vdevs == 1
             && vdev_id == 0
             && matches!(vdev_type.as_str(), "disk" | "file" | "mirror");
-        let guidance = if supported_layout {
+        let stripe_candidate =
+            ordinary_group && top_level_vdevs > 1 && matches!(vdev_type.as_str(), "disk" | "file");
+        if stripe_candidate {
+            validate_member_labels(&active, &parsed)?;
+        }
+        let guidance = if stripe_candidate {
+            format!(
+                "This label identifies group {vdev_id} of {top_level_vdevs}. Select all {top_level_vdevs} members from the same offline stripe capture to browse it. If another group uses a different layout, open an existing full ZFS send instead."
+            )
+        } else if supported_layout {
             if vdev_type == "mirror" {
                 "One healthy member of this mirror can be browsed directly."
             } else {
@@ -908,6 +1159,7 @@ impl PoolMember {
             group_type: vdev_type,
             top_level_groups: top_level_vdevs,
             supported_layout,
+            stripe_candidate,
             guidance,
         };
         Ok(LabeledMember {
@@ -932,7 +1184,8 @@ impl PoolMember {
             vdev_guid: guid_string(self.vdev_guid),
             vdev_type: self.vdev_type.clone(),
             top_level_vdevs: self.top_level_vdevs,
-            source_bytes: self.source.len(),
+            member_guids: self.member_guids.clone(),
+            source_bytes: self.source_bytes,
             txg: self.txg,
             endian: match self.endian {
                 Endian::Little => "little".to_owned(),
@@ -1149,7 +1402,7 @@ impl PoolMember {
             bail!("{} is not a regular file", resolved.normalized_path);
         }
         let publication =
-            RestoreDestination::prepare(Some(&self.source_path), output, force, true)?;
+            RestoreDestination::prepare_sources(&self.source_paths, output, force, true)?;
         let mut temporary = temporary_for(output)?;
         sparse::prepare(temporary.as_file())?;
         let mut digest = Sha256::new();
@@ -1209,8 +1462,8 @@ impl PoolMember {
         force: bool,
         key_material: Option<&[u8]>,
     ) -> Result<RecursiveExtraction> {
-        extract_directory_tree(
-            Some(&self.source_path),
+        crate::tree::extract_directory_tree_from_sources(
+            &self.source_paths,
             selector,
             path,
             output,
@@ -1439,7 +1692,7 @@ impl PoolMember {
             None
         };
         let dataset_pointer = PoolBlockPointer::parse(dataset_pointer_raw, dataset_dnode.endian)?;
-        let objset_block = read_pool_block_from(&self.source, 0, &dataset_pointer, key.as_ref())
+        let objset_block = read_pool_block_from(&self.sources, &dataset_pointer, key.as_ref())
             .with_context(|| format!("reading objset for {selector}"))?;
         if let Some(key) = key.as_ref() {
             verify_objset_mac(&objset_block, dataset_dnode.endian, key)
@@ -1675,7 +1928,7 @@ impl PoolMember {
             if pointer.is_hole() {
                 return Ok(vec![0; dnode.data_block_size()]);
             }
-            let block = read_pool_block_from(&self.source, 0, &pointer, key)?;
+            let block = read_pool_block_from(&self.sources, &pointer, key)?;
             level -= 1;
             let index_shift = u32::from(level) * shift;
             let child_index =
@@ -1690,7 +1943,7 @@ impl PoolMember {
         if pointer.is_hole() {
             return Ok(vec![0; dnode.data_block_size()]);
         }
-        read_pool_block_from(&self.source, 0, &pointer, key)
+        read_pool_block_from(&self.sources, &pointer, key)
     }
 }
 
@@ -1818,7 +2071,31 @@ struct ResolvedPoolPath {
     dnode: PoolDnode,
 }
 
-fn read_block_from(source: &dyn ReadAt, expected_vdev: u32, pointer: &Blkptr) -> Result<Vec<u8>> {
+fn read_dva(sources: &[PoolSource], dva: &zfs_core::Dva, size: usize) -> Result<Vec<u8>> {
+    let source = sources
+        .get(dva.vdev as usize)
+        .context("top-level vdev is unavailable")?;
+    if dva.gang {
+        bail!("gang block is unsupported");
+    }
+    let offset = dva
+        .offset_sectors
+        .checked_mul(512)
+        .and_then(|bytes| bytes.checked_add(zfs_core::BOOT_SKEW))
+        .context("DVA offset overflow")?;
+    if size as u64 > u64::from(dva.asize_sectors) * 512
+        || offset
+            .checked_add(size as u64)
+            .is_none_or(|end| end > source.len().saturating_sub(2 * LABEL_SIZE as u64))
+    {
+        bail!("DVA at {offset} exceeds its allocation or member bounds");
+    }
+    let mut raw = vec![0; size];
+    source.read_exact_at(offset, &mut raw)?;
+    Ok(raw)
+}
+
+fn read_block_from(sources: &[PoolSource], pointer: &Blkptr) -> Result<Vec<u8>> {
     let logical_size = pointer.lsize_bytes();
     if logical_size == 0 || logical_size > MAX_BLOCK_SIZE {
         bail!(
@@ -1858,48 +2135,38 @@ fn read_block_from(source: &dyn ReadAt, expected_vdev: u32, pointer: &Blkptr) ->
         if dva.is_empty() {
             continue;
         }
-        if dva.vdev != expected_vdev {
-            errors.push(format!(
-                "DVA[{copy}] addresses unavailable top-level vdev {}",
-                dva.vdev
-            ));
-            continue;
-        }
-        if dva.gang {
-            errors.push(format!(
-                "DVA[{copy}] is a gang block, which is not supported yet"
-            ));
-            continue;
-        }
-        let offset = dva.physical_byte_offset();
-        let mut raw = vec![0u8; physical_size];
-        if let Err(error) = source.read_exact_at(offset, &mut raw) {
-            errors.push(format!("DVA[{copy}] at {offset}: {error}"));
-            continue;
-        }
+        let raw = match read_dva(sources, dva, physical_size) {
+            Ok(raw) => raw,
+            Err(error) => {
+                errors.push(format!("DVA[{copy}] on group {}: {error}", dva.vdev));
+                continue;
+            }
+        };
         if matches!(
             zfs_core::checksum::verify(checksum, pointer.byteorder, &raw, pointer.checksum_words),
             Some(false)
         ) {
-            errors.push(format!("DVA[{copy}] at {offset}: checksum mismatch"));
+            errors.push(format!(
+                "DVA[{copy}] on group {}: checksum mismatch",
+                dva.vdev
+            ));
             continue;
         }
         match decompress_block(pointer.compression, &raw, logical_size as u64) {
             Ok(data) => return Ok(data),
-            Err(error) => errors.push(format!("DVA[{copy}] at {offset}: {error}")),
+            Err(error) => errors.push(format!("DVA[{copy}] on group {}: {error}", dva.vdev)),
         }
     }
     bail!("no readable copy of block pointer: {}", errors.join("; "))
 }
 
 fn read_pool_block_from(
-    source: &dyn ReadAt,
-    expected_vdev: u32,
+    sources: &[PoolSource],
     pointer: &PoolBlockPointer,
     key: Option<&DatasetKey>,
 ) -> Result<Vec<u8>> {
     if !pointer.uses_crypt() {
-        return read_block_from(source, expected_vdev, &pointer.pointer);
+        return read_block_from(sources, &pointer.pointer);
     }
     let key = key.ok_or_else(|| anyhow!("native-encrypted ZFS block requires a dataset key"))?;
     let logical_size = pointer.lsize_bytes();
@@ -1935,23 +2202,13 @@ fn read_pool_block_from(
         if dva.is_empty() {
             continue;
         }
-        if dva.vdev != expected_vdev {
-            errors.push(format!(
-                "DVA[{copy}] addresses unavailable top-level vdev {}",
-                dva.vdev
-            ));
-            continue;
-        }
-        if dva.gang {
-            errors.push(format!("DVA[{copy}] is an unsupported gang block"));
-            continue;
-        }
-        let offset = dva.physical_byte_offset();
-        let mut raw = vec![0_u8; physical_size];
-        if let Err(error) = source.read_exact_at(offset, &mut raw) {
-            errors.push(format!("DVA[{copy}] at {offset}: {error}"));
-            continue;
-        }
+        let raw = match read_dva(sources, dva, physical_size) {
+            Ok(raw) => raw,
+            Err(error) => {
+                errors.push(format!("DVA[{copy}] on group {}: {error}", dva.vdev));
+                continue;
+            }
+        };
         let mut physical_checksum = match checksum {
             ChecksumType::Off => None,
             ChecksumType::Fletcher2 => Some(zfs_core::checksum::fletcher2(&raw, pointer.byteorder)),
@@ -1976,7 +2233,10 @@ fn read_pool_block_from(
                 computed[..2] != pointer.checksum_words[..2]
             }
         }) {
-            errors.push(format!("DVA[{copy}] at {offset}: checksum mismatch"));
+            errors.push(format!(
+                "DVA[{copy}] on group {}: checksum mismatch",
+                dva.vdev
+            ));
             continue;
         }
 
@@ -1998,21 +2258,24 @@ fn read_pool_block_from(
         let protected = match protected {
             Ok(data) => data,
             Err(error) => {
-                errors.push(format!("DVA[{copy}] at {offset}: {error:#}"));
+                errors.push(format!("DVA[{copy}] on group {}: {error:#}", dva.vdev));
                 continue;
             }
         };
         let decoded = match decompress_block(pointer.compression, &protected, logical_size as u64) {
             Ok(data) => data,
             Err(error) => {
-                errors.push(format!("DVA[{copy}] at {offset}: {error}"));
+                errors.push(format!("DVA[{copy}] on group {}: {error}", dva.vdev));
                 continue;
             }
         };
         if pointer.level > 0 {
             let digest = indirect_mac(&decoded, key.crypto_version())?;
             if digest != raw_pointer[112..128] {
-                errors.push(format!("DVA[{copy}] at {offset}: indirect MAC mismatch"));
+                errors.push(format!(
+                    "DVA[{copy}] on group {}: indirect MAC mismatch",
+                    dva.vdev
+                ));
                 continue;
             }
         }
@@ -2138,6 +2401,7 @@ fn normalize_path(path: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::PoolSource;
     use super::{
         FileSource, PoolMember, ReadAt, blkptr_uses_crypt, gpt_partitions, mbr_partitions,
         normalize_path, parse_blkptr, read_block_from, write_file_record,
@@ -2260,19 +2524,19 @@ mod tests {
         let mut image = vec![0u8; physical + payload.len() + 4 * zfs_core::LABEL_SIZE];
         image[physical..physical + payload.len()].copy_from_slice(&payload);
         fs::write(&path, &image).unwrap();
-        let source = FileSource::open(&path).unwrap();
+        let sources = [PoolSource::Plain(FileSource::open(&path).unwrap())];
         let mut pointer = Blkptr::default();
         pointer.dvas[0].asize_sectors = 1;
         pointer.compression = CompressType::Off.raw();
         pointer.checksum = ChecksumType::Fletcher4.raw();
         pointer.byteorder = Endian::Little;
         pointer.checksum_words = zfs_core::checksum::fletcher4(&payload, Endian::Little);
-        assert_eq!(read_block_from(&source, 0, &pointer).unwrap(), payload);
+        assert_eq!(read_block_from(&sources, &pointer).unwrap(), payload);
 
         let mut sentinel = pointer;
         sentinel.checksum = ChecksumType::Inherit.raw();
         assert!(
-            read_block_from(&source, 0, &sentinel)
+            read_block_from(&sources, &sentinel)
                 .unwrap_err()
                 .to_string()
                 .contains("unsupported on-disk checksum")
@@ -2281,9 +2545,9 @@ mod tests {
         let mut corrupted = image;
         corrupted[physical] ^= 1;
         fs::write(&path, corrupted).unwrap();
-        let source = FileSource::open(&path).unwrap();
+        let sources = [PoolSource::Plain(FileSource::open(&path).unwrap())];
         assert!(
-            read_block_from(&source, 0, &pointer)
+            read_block_from(&sources, &pointer)
                 .unwrap_err()
                 .to_string()
                 .contains("checksum mismatch")
@@ -2330,3 +2594,6 @@ mod tests {
         assert!(!blkptr_uses_crypt(&raw, Endian::Little));
     }
 }
+
+#[cfg(test)]
+mod stripe_tests;
