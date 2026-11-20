@@ -51,7 +51,8 @@ The window guides you through four steps, shown in the step bar at the top:
    connected drive** (⇧⌘D; see below). You can also drag a backup file into the
    window, or use **Open from a path…** (⇧⌘O) for a pasted path such as
    `/Volumes/Backups/slide.img` or a device such as `/dev/disk4s2`.
-2. The newest restore point is selected for you. Pick another date in the
+2. If the backup contains several computers or datasets, choose the one you need.
+   The newest restore point in that dataset opens. Pick another date in the
    sidebar's **Restore points** list if you need an older copy. Live dataset
    states and parent datasets are under **Other places in this backup**.
 3. If the restore point is encrypted, paste its key and choose **Unlock**, or
@@ -67,6 +68,12 @@ The window guides you through four steps, shown in the step bar at the top:
    reveals it and **Details** shows the full path and SHA-256 of a single file.
    Folder restores report skipped links or special items and do not restore
    owners, permissions or timestamps.
+
+To compare one file across restore points, select it and choose **Other Versions…**.
+The list shows each snapshot name, date and file size in the same dataset.
+Choose a version to open its folder with the file selected, then choose **Restore…**.
+This also works inside disk images. Each entry follows the same file path, image
+and partition across snapshots. An unavailable entry includes its reason.
 
 Problems are explained in plain words with the engine's original message under
 **Show Details**. Restore point dates are shown in your Mac's time zone; use the

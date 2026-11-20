@@ -50,7 +50,7 @@ Once a backup is open:
 1. **Header** — the backup's name and what it is ("Slide backup · 12 restore
    points"), with **Close**, **Open drive…** and **Open backup…**.
 2. **Restore point** — the newest restore point that holds files is selected
-   automatically. Each entry shows its date, the backup it belongs to and how it
+   once a computer or dataset has been chosen. Each entry shows its date, the backup it belongs to and how it
    was captured ("full copy", "changes only", "live files, not a snapshot").
 3. **Part of the disk** — appears inside a disk image. The recommended part (the
    largest readable partition that isn't a helper partition) is chosen for you.
@@ -76,10 +76,17 @@ safe checkpoint. The read count includes each pass over the source.
 
 1. Choose **Open backup…** and select the file. The app recognizes send files,
    pool images and disk images automatically.
-2. The newest restore point is selected and its top folder is listed. Choose an
+2. If prompted, choose which computer or dataset to open. The newest restore
+   point for the selected dataset opens. Choose an
    earlier date in **Restore point** if you need an older copy.
 3. Double-click folders, use **Up** (Alt+Up or Backspace), or type a path and
    press **Enter**.
+
+Select any regular file and choose **Restore › Other versions of the selected
+file…** to compare that path across snapshots of its dataset. The list includes
+snapshot names, dates and sizes. Open a version to select its file in that
+restore point, then choose **Restore…**. Nested disk images reopen on the
+corresponding partition. Selecting an unavailable entry explains the issue.
 
 A send-file restore point is browseable only when the file also contains its
 complete history back to a full copy; a standalone incremental ("changes only")

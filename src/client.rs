@@ -158,6 +158,10 @@ pub struct ClientExtraction {
 pub struct InceptionCatalog {
     pub image_path: String,
     pub image_offset: u64,
+    /// Path inside the immediate parent, without the composed display breadcrumb.
+    pub path_in_parent: String,
+    /// Keep explicit image windows while allowing an unbounded image to grow across snapshots.
+    pub requested_length: Option<u64>,
     pub stored_size: u64,
     pub disk_size: u64,
     pub container: DiskContainerKind,
@@ -169,11 +173,11 @@ impl InceptionCatalog {
     /// Inspect a standalone raw, QCOW2, or VMDK image without attaching or
     /// mounting it in Windows.
     pub fn open_file(path: &Path, image_offset: u64, image_length: Option<u64>) -> Result<Self> {
-        Self::from_session(InceptionSession::from_file_at(
-            path,
-            image_offset,
+        Self::from_session(
+            InceptionSession::from_file_at(path, image_offset, image_length)?,
+            &path.to_string_lossy(),
             image_length,
-        )?)
+        )
     }
 
     /// Descend into another disk-image file in the active inner filesystem.
@@ -184,15 +188,19 @@ impl InceptionCatalog {
         image_offset: u64,
         image_length: Option<u64>,
     ) -> Result<Self> {
-        Self::from_session(self.session.inspect_child_image_at(
-            volume,
+        Self::from_session(
+            self.session
+                .inspect_child_image_at(volume, image_path, image_offset, image_length)?,
             image_path,
-            image_offset,
             image_length,
-        )?)
+        )
     }
 
-    fn from_session(session: InceptionSession) -> Result<Self> {
+    fn from_session(
+        session: InceptionSession,
+        path_in_parent: &str,
+        requested_length: Option<u64>,
+    ) -> Result<Self> {
         if !session
             .volumes()
             .iter()
@@ -208,6 +216,8 @@ impl InceptionCatalog {
         }
         let session = Arc::new(session);
         Ok(Self {
+            path_in_parent: path_in_parent.to_owned(),
+            requested_length,
             image_path: session.image_path().to_owned(),
             image_offset: session.image_offset(),
             stored_size: session.stored_size(),
@@ -216,6 +226,10 @@ impl InceptionCatalog {
             volumes: session.volumes().to_vec(),
             session,
         })
+    }
+
+    pub fn file_length(&self, selector: &str, path: &str) -> Result<u64> {
+        self.session.file_length(selector, path)
     }
 
     /// List a directory through the already-inspected virtual disk. Retaining
@@ -268,7 +282,10 @@ impl SourceCatalog {
         } else {
             BTreeMap::new()
         };
-        let views = inspection
+        // The stream's replay order puts each available base before its incremental.
+        // The depth breaks ties when several points share the one-second ZFS timestamp.
+        let mut depths = BTreeMap::new();
+        let mut ranked = inspection
             .snapshots
             .iter()
             .map(|snapshot| {
@@ -283,26 +300,33 @@ impl SourceCatalog {
                 } else {
                     "incremental"
                 };
-                SourceView {
-                    label: format!("{}  —  {relation}, {mode}", snapshot.dataset_name),
-                    created_at: (snapshot.creation_time > 0).then_some(snapshot.creation_time),
-                    selector: format!("0x{:016x}", snapshot.to_guid),
-                    update_eligible: true,
-                    encrypted: snapshot.features & FEATURE_RAW != 0,
-                    key_format: requirements
-                        .get(&snapshot.to_guid)
-                        .map(|requirement| requirement.key_format.clone()),
-                    kind: if snapshot.from_guid == 0 {
-                        ViewKind::FullSend
-                    } else {
-                        ViewKind::IncrementalSend
+                let depth = depths.get(&snapshot.from_guid).map_or(0usize, |n| n + 1);
+                depths.insert(snapshot.to_guid, depth);
+                (
+                    depth,
+                    SourceView {
+                        label: format!("{}  —  {relation}, {mode}", snapshot.dataset_name),
+                        created_at: (snapshot.creation_time > 0).then_some(snapshot.creation_time),
+                        selector: format!("0x{:016x}", snapshot.to_guid),
+                        update_eligible: true,
+                        encrypted: snapshot.features & FEATURE_RAW != 0,
+                        key_format: requirements
+                            .get(&snapshot.to_guid)
+                            .map(|requirement| requirement.key_format.clone()),
+                        kind: if snapshot.from_guid == 0 {
+                            ViewKind::FullSend
+                        } else {
+                            ViewKind::IncrementalSend
+                        },
+                        dataset,
+                        snapshot: name,
+                        parent: false,
                     },
-                    dataset,
-                    snapshot: name,
-                    parent: false,
-                }
+                )
             })
             .collect::<Vec<_>>();
+        ranked.sort_by_key(|(depth, view)| std::cmp::Reverse((view.created_at, *depth)));
+        let views: Vec<_> = ranked.into_iter().map(|(_, view)| view).collect();
         let title = path.file_name().map_or_else(
             || path.display().to_string(),
             |name| name.to_string_lossy().into(),
@@ -366,6 +390,7 @@ impl SourceCatalog {
         snapshots.sort_by(|a, b| {
             b.creation_time
                 .cmp(&a.creation_time)
+                .then_with(|| b.creation_txg.cmp(&a.creation_txg))
                 .then_with(|| a.full_name.cmp(&b.full_name))
         });
         let mut encrypted_datasets = BTreeMap::new();
@@ -744,23 +769,15 @@ impl SourceCatalog {
         image_offset: u64,
         image_length: Option<u64>,
     ) -> Result<InceptionCatalog> {
-        let session = Arc::new(self.open_inception(
+        let session = self.open_inception(
             view_index,
             image_path,
             key_file,
             agent_password_file,
             key_stash_path,
             (image_offset, image_length),
-        )?);
-        Ok(InceptionCatalog {
-            image_path: session.image_path().to_owned(),
-            image_offset: session.image_offset(),
-            stored_size: session.stored_size(),
-            disk_size: session.image_size(),
-            container: session.container(),
-            volumes: session.volumes().to_vec(),
-            session,
-        })
+        )?;
+        InceptionCatalog::from_session(session, image_path, image_length)
     }
 
     /// Inspect a nested image with credentials entered directly by the UI.
@@ -809,7 +826,7 @@ impl SourceCatalog {
                 )?
             }
         };
-        InceptionCatalog::from_session(session)
+        InceptionCatalog::from_session(session, image_path, image_length)
     }
 
     fn open_inception(
@@ -1118,6 +1135,8 @@ mod tests {
             .unwrap(),
         );
         let catalog = InceptionCatalog {
+            path_in_parent: session.image_path().to_owned(),
+            requested_length: None,
             image_path: session.image_path().to_owned(),
             image_offset: session.image_offset(),
             stored_size: session.stored_size(),
@@ -1158,6 +1177,8 @@ mod tests {
                 .unwrap(),
         );
         let catalog = InceptionCatalog {
+            path_in_parent: session.image_path().to_owned(),
+            requested_length: None,
             image_path: session.image_path().to_owned(),
             image_offset: session.image_offset(),
             stored_size: session.stored_size(),

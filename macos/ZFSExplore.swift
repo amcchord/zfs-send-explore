@@ -31,11 +31,24 @@ struct Volume: Decodable, Identifiable {
         return [place, filesystem ?? "unreadable format", Sizes.label(bytes)].joined(separator: " · ")
     }
 }
+struct DatasetChoice: Decodable, Identifiable {
+    let name: String; let index: Int
+    var id: String { name }
+}
+struct FileVersion: Decodable, Identifiable {
+    let index: Int; let snapshot: String; let created_at: UInt64?; let size: UInt64?; let issue: String?
+    var id: Int { index }
+}
+struct FileHistory: Decodable, Identifiable {
+    let name: String; let versions: [FileVersion]
+    var id: String { name }
+}
 struct BrowserState: Decodable {
     let title: String; let summary: String?; let description: String?; let views: [BackupView]; let view: Int
     let locked: Bool; let path: String; let entries: [Entry]; let volumes: [Volume]
     let volume: String?; let layers: [String]; let can_back: Bool
-    var selectedView: BackupView? { views.indices.contains(view) ? views[view] : nil }
+    let choose_dataset: Bool?; let dataset_choices: [DatasetChoice]?; let recommended_view: Int?
+    var selectedView: BackupView? { choose_dataset != true && views.indices.contains(view) ? views[view] : nil }
     var needsVolume: Bool { !layers.isEmpty && volume == nil && !volumes.isEmpty }
 }
 struct RestoreResult: Decodable { let restored: String; let bytes: UInt64; let files: UInt64; let skipped: UInt64; let sha256: String?; let source: String?; let source_path: String?; let report: String? }
@@ -170,6 +183,7 @@ final class Engine: @unchecked Sendable {
         engine.cancel(job)
     }
     @Published var error: ServiceError?
+    @Published var history: FileHistory?
     @Published var restored: RestoreResult?
     @Published var search = ""
     @Published var secret = ""
@@ -276,10 +290,31 @@ final class Engine: @unchecked Sendable {
         open(URL(fileURLWithPath: (sourcePath.trimmingCharacters(in: .whitespacesAndNewlines) as NSString).expandingTildeInPath))
     }
     func select(_ index: Int) {
-        guard index != state?.view else { return }
+        guard state?.choose_dataset == true || index != state?.view else { return }
         secret = ""
         perform(["method": "select", "index": index], activity: "Opening restore point…")
     }
+    func findVersions(_ name: String) {
+        guard !busy else { return }
+        busy = true; activity = "Checking restore points…"; error = nil; restored = nil
+        Task {
+            defer { busy = false }
+            do {
+                let response = try await performRequest(["method": "versions", "name": name])
+                history = try JSONDecoder().decode(FileHistory.self, from: response)
+            } catch let failure as ServiceError { error = failure }
+            catch { self.error = ServiceError(message: error.localizedDescription) }
+        }
+    }
+    func openVersion(_ point: FileVersion, name: String) {
+        history = nil
+        Task {
+            if await run(["method": "open_version", "index": point.index, "name": name], activity: "Opening file version…") {
+                selection = name
+            }
+        }
+    }
+
     func unlockFile() {
         let panel = NSOpenPanel(); panel.title = "Choose the Key File"; panel.prompt = "Unlock"
         panel.message = "Choose the encryption key file for this backup. Slide key files are 32 bytes or 64 characters long."
@@ -373,6 +408,27 @@ struct ContentView: View {
         .onChange(of: model.isOpen) { _, open in withAnimation { columns = open ? .all : .detailOnly } }
         .sheet(isPresented: $model.showPath) { OpenPathSheet(model: model).tint(.teal) }
         .sheet(isPresented: $model.showDrives) { DrivePicker(model: model).tint(.teal) }
+        .sheet(item: $model.history) { history in
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Versions of “\(history.name)”").font(.title2.bold())
+                Text("Select a restore point to open this file.").foregroundStyle(.secondary)
+                List(history.versions) { point in
+                    Button { model.openVersion(point, name: history.name) } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(SnapshotTime.short(point.created_at, zone: timeZone) ?? "Date unavailable").bold()
+                                Text(point.snapshot).font(.caption)
+                                if let issue = point.issue { Text(issue).font(.caption).foregroundStyle(.secondary) }
+                            }
+                            Spacer()
+                            if let size = point.size { Text(Sizes.label(size)).monospacedDigit() }
+                            if point.issue == nil { Image(systemName: "chevron.right") }
+                        }.contentShape(Rectangle())
+                    }.buttonStyle(.plain).disabled(point.issue != nil)
+                }
+                HStack { Spacer(); Button("Close") { model.history = nil }.keyboardShortcut(.cancelAction) }
+            }.padding(20).frame(minWidth: 500, minHeight: 360)
+        }
         .sheet(isPresented: $model.showPreferences) { TimeZonePreferences(selection: $timeZone).tint(.teal) }
         .onOpenURL { model.open($0) }
         .onDrop(of: [.fileURL], isTargeted: $dropTargeted) { providers in
@@ -405,15 +461,15 @@ struct Sidebar: View {
     var body: some View {
         Group {
             if let state = model.state, model.isOpen {
-                List(selection: Binding(get: { state.view }, set: { if let index = $0 { model.select(index) } })) {
+                List(selection: Binding(get: { state.choose_dataset == true ? nil : state.view }, set: { if let index = $0 { model.select(index) } })) {
                     Section {
                         BackupSummary(state: state, title: model.title)
                     }
                     let points = state.views.indices.filter { state.views[$0].isRestorePoint }
                     if !points.isEmpty {
                         Section("Restore points") {
-                            ForEach(Array(points.enumerated()), id: \.element) { order, index in
-                                RestorePointRow(view: state.views[index], timeZone: timeZone, newest: order == 0 && points.count > 1 && state.views[index].created_at != nil)
+                            ForEach(points, id: \.self) { index in
+                                RestorePointRow(view: state.views[index], timeZone: timeZone, newest: state.recommended_view == index && points.count > 1 && state.views[index].created_at != nil)
                                     .tag(index)
                             }
                         }
@@ -526,7 +582,15 @@ struct Detail: View {
             if let state = model.state, model.isOpen {
                 StepBar(model: model, state: state, timeZone: timeZone)
                 Divider()
-                if state.locked { UnlockView(model: model, view: state.selectedView) }
+                if state.choose_dataset == true {
+                    VStack(alignment: .leading, spacing: 14) {
+                        Text("Choose a computer or dataset").font(.title2.bold())
+                        Text("This backup contains several sets of files. Choose one to see its latest restore point.")
+                        List(state.dataset_choices ?? []) { choice in
+                            Button(choice.name) { model.select(choice.index) }
+                        }
+                    }.padding(24)
+                } else if state.locked { UnlockView(model: model, view: state.selectedView) }
                 else if state.needsVolume { VolumeChooser(model: model, state: state) }
                 else { BrowserView(model: model, state: state) }
             } else {
@@ -865,6 +929,7 @@ struct BrowserView: View {
             .contextMenu(forSelectionType: String.self) { ids in
                 if let name = ids.first, let entry = state.entries.first(where: { $0.name == name }) {
                     if entry.directory { Button("Open Folder") { model.open(entry) } }
+                    if entry.regular && !state.views.isEmpty { Button("Other Versions…") { model.findVersions(entry.name) } }
                     if entry.regular { Button("Look Inside as a Disk Image") { model.enter(entry) } }
                     Button("Restore…") { model.selection = entry.name; model.restore() }.disabled(!entry.restorable)
                 }
@@ -925,6 +990,9 @@ struct ActionBar: View {
             }
             Spacer()
             Text("\(model.entries.count) \(model.entries.count == 1 ? "item" : "items")").font(.caption).foregroundStyle(.tertiary)
+            if let entry = model.selected, entry.regular && !state.views.isEmpty {
+                Button("Other Versions…") { model.findVersions(entry.name) }
+            }
             if let entry = model.selected, entry.directory || entry.image {
                 Button(entry.directory ? "Open Folder" : "Open Disk Image") { model.open(entry) }.controlSize(.large)
             }

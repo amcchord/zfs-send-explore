@@ -26,7 +26,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tempfile::NamedTempFile;
 use vmdk::VmdkReader;
@@ -97,6 +97,8 @@ pub struct VolumeInfo {
     pub offset: u64,
     pub length: u64,
     pub partition_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partition_guid: Option<String>,
     pub name: String,
     pub filesystem: Option<FilesystemKind>,
     /// A concise parser diagnostic for an unsupported or damaged volume.
@@ -343,6 +345,7 @@ impl InceptionSession {
                 offset: 0,
                 length: disk_size,
                 partition_type: "unpartitioned".to_owned(),
+                partition_guid: None,
                 name: String::new(),
             }]
         } else {
@@ -388,6 +391,18 @@ impl InceptionSession {
 
     pub fn volumes(&self) -> &[VolumeInfo] {
         &self.volumes
+    }
+
+    /// Read the file's logical length from its own metadata. NTFS directory
+    /// index entries can retain an earlier size than the unnamed data stream.
+    pub fn file_length(&self, selector: &str, path: &str) -> Result<u64> {
+        let volume = self.select_volume(Some(selector))?;
+        let fs = volume.filesystem.context("Unsupported filesystem")?;
+        inner_file_length(
+            self.volume_source(volume)?,
+            fs,
+            &normalized_inner_path(path)?,
+        )
     }
 
     pub fn list_directory(&self, volume: Option<&str>, path: &str) -> Result<Vec<DirectoryEntry>> {
@@ -1377,6 +1392,7 @@ struct PartitionLayout {
     offset: u64,
     length: u64,
     partition_type: String,
+    partition_guid: Option<String>,
     name: String,
 }
 
@@ -1397,6 +1413,7 @@ fn discover_partitions(source: &Arc<dyn ImageRead>) -> Result<Vec<PartitionLayou
         offset: 0,
         length: source.len(),
         partition_type: "unpartitioned".to_owned(),
+        partition_guid: None,
         name: String::new(),
     };
     if probe_volume(source, raw).filesystem.is_some() {
@@ -1540,6 +1557,10 @@ fn parse_gpt(
             offset,
             length,
             partition_type: format_gpt_guid(&entry[..16]),
+            partition_guid: entry[16..32]
+                .iter()
+                .any(|&b| b != 0)
+                .then(|| format_gpt_guid(&entry[16..32])),
             name: String::from_utf16_lossy(&name_units),
         });
     }
@@ -1687,6 +1708,7 @@ fn mbr_layout(
         offset,
         length,
         partition_type: format!("0x{kind:02x}"),
+        partition_guid: None,
         name: String::new(),
     })
 }
@@ -1758,6 +1780,7 @@ fn volume_info(
         offset: layout.offset,
         length: layout.length,
         partition_type: layout.partition_type,
+        partition_guid: layout.partition_guid,
         name: layout.name,
         filesystem,
         diagnostic,

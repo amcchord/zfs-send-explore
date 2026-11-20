@@ -177,3 +177,76 @@ fn unreadable_documents_and_compressed_downloads_preserve_the_open_source() {
         assert_eq!(state["result"]["title"], "tiny-full.zfs");
     }
 }
+
+#[test]
+fn tied_snapshots_open_the_chain_tip_and_can_restore_a_specific_version() {
+    let mut desktop = Desktop::start();
+    let opened = desktop.request(json!({"method":"open", "path":fixture("multi-snapshot.zfs")}));
+    let state = &opened["result"];
+    let selected = state["view"].as_u64().unwrap() as usize;
+    assert_eq!(state["views"][selected]["snapshot"], "s3");
+    assert_eq!(state["recommended_view"], selected);
+    assert_eq!(state["choose_dataset"], false);
+    let history = desktop.request(json!({"method":"versions", "name":"version.txt"}));
+    let rows = history["result"]["versions"].as_array().unwrap();
+    let versions: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            (
+                row["snapshot"].as_str().unwrap(),
+                row["size"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(versions, [("s3", 6), ("s2", 32), ("s1", 13)]);
+    for row in rows {
+        let selected = desktop
+            .request(json!({"method":"open_version", "name":"version.txt", "index":row["index"]}));
+        assert_eq!(selected["ok"], true);
+        let temporary = tempfile::tempdir().unwrap();
+        let target = temporary.path().join("restored");
+        assert_eq!(
+            desktop
+                .request(json!({"method":"extract", "name":"version.txt", "destination":target}))["ok"],
+            true
+        );
+        let expected = match row["snapshot"].as_str().unwrap() {
+            "s3" => "three\n",
+            "s2" => "snapshot two has a longer value\n",
+            _ => "snapshot one\n",
+        };
+        assert_eq!(std::fs::read_to_string(target).unwrap(), expected);
+    }
+    let missing = desktop.request(json!({"method":"versions","name":"only-s2.txt"}));
+    let rows = missing["result"]["versions"].as_array().unwrap();
+    assert_eq!(rows.iter().filter(|r| r["issue"].is_null()).count(), 1);
+}
+
+#[test]
+fn a_multi_dataset_backup_requires_a_choice_and_keeps_history_in_its_dataset() {
+    let directory = tempfile::tempdir().unwrap();
+    let archive = directory.path().join("two.zfs");
+    let mut bytes = std::fs::read(fixture("tiny-full.zfs")).unwrap();
+    bytes.extend(std::fs::read(fixture("multi-snapshot.zfs")).unwrap());
+    std::fs::write(&archive, bytes).unwrap();
+    let mut desktop = Desktop::start();
+    let open = desktop.request(json!({"method":"open","path":archive}));
+    let state = &open["result"];
+    assert_eq!(state["choose_dataset"], true);
+    assert!(state["entries"].as_array().unwrap().is_empty());
+    assert!(state["recommended_view"].is_null());
+    assert_eq!(
+        desktop.request(json!({"method":"list","path":"/"}))["ok"],
+        false
+    );
+    let index = state["views"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|v| v["snapshot"] == "s3")
+        .unwrap();
+    let state = desktop.request(json!({"method":"select","index":index}));
+    assert_eq!(state["result"]["choose_dataset"], false);
+    let history = desktop.request(json!({"method":"versions","name":"version.txt"}));
+    assert_eq!(history["result"]["versions"].as_array().unwrap().len(), 3);
+}

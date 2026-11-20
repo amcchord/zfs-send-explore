@@ -8,12 +8,14 @@ use serde_json::{Value, json};
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
+use zfs_send_extract::client::parent_path;
 use zfs_send_extract::client::{InceptionCatalog, SourceCatalog, child_path};
 use zfs_send_extract::filesystem::DirectoryEntry;
 use zfs_send_extract::presentation;
 #[cfg(target_os = "macos")]
 use zfs_send_extract::source::register_authorized_source;
 use zfs_send_extract::source::release_authorized_sources;
+use zfs_send_extract::versions::{ImageLocation, VersionPath};
 
 #[derive(Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
@@ -38,6 +40,13 @@ enum Request {
         name: String,
     },
     Back,
+    Versions {
+        name: String,
+    },
+    OpenVersion {
+        index: usize,
+        name: String,
+    },
     Volume {
         selector: String,
     },
@@ -59,6 +68,7 @@ struct Session {
     source: Option<SourceCatalog>,
     title: String,
     view: usize,
+    choose_dataset: bool,
     path: String,
     key: Option<Zeroizing<Vec<u8>>>,
     layers: Vec<Layer>,
@@ -101,8 +111,29 @@ impl Session {
         self.layers.last().map_or(&self.path, |layer| &layer.path)
     }
 
+    fn version_path(&self, name: &str) -> Result<VersionPath> {
+        let path = child_path(self.current_path(), name)?;
+        let images = self
+            .layers
+            .iter()
+            .map(|layer| {
+                ImageLocation::selected(
+                    &layer.catalog,
+                    layer
+                        .volume
+                        .as_deref()
+                        .context("Choose a partition first")?,
+                )
+            })
+            .collect::<Result<_>>()?;
+        Ok(VersionPath { images, path })
+    }
+
     fn state(&self) -> Result<Value> {
-        let entries = if self.locked() || (self.source.is_none() && self.layers.is_empty()) {
+        let entries = if self.choose_dataset
+            || self.locked()
+            || (self.source.is_none() && self.layers.is_empty())
+        {
             vec![]
         } else {
             self.list(self.current_path())?
@@ -159,7 +190,9 @@ impl Session {
         Ok(json!({
             "title": self.title, "summary": self.source.as_ref().map(|s| &s.summary),
             "description": self.source.as_ref().map(presentation::source_description),
-            "recommended_view": self.source.as_ref().and_then(|s| presentation::recommended_view(&s.views)),
+            "recommended_view": self.source.as_ref().and_then(|s| s.views.get(self.view).and_then(|v| presentation::dataset_choices(&s.views).get(v.dataset.as_str()).copied())).filter(|_| !self.choose_dataset),
+            "choose_dataset": self.choose_dataset,
+            "dataset_choices": self.source.as_ref().map(|s| presentation::dataset_choices(&s.views).into_iter().map(|(name,index)| json!({"name":name,"index":index})).collect::<Vec<_>>()),
             "views": views, "view": self.view, "locked": self.locked(),
             "path": self.current_path(), "entries": entries, "volumes": volumes,
             "volume": layer.and_then(|l| l.volume.as_ref()),
@@ -222,12 +255,22 @@ impl Session {
             .and_then(|s| presentation::recommended_view(&s.views))
         {
             candidate.view = index;
+        } else {
+            candidate.choose_dataset = candidate.source.is_some();
         }
         let state = candidate.state()?;
         Ok((candidate, state))
     }
 
     fn handle(&mut self, request: Request) -> Result<Value> {
+        if self.choose_dataset
+            && !matches!(
+                &request,
+                Request::Open { .. } | Request::Select { .. } | Request::Close
+            )
+        {
+            bail!("Choose a computer or dataset first");
+        }
         match request {
             Request::Open { path, authorize } => {
                 let source_path = Path::new(&path);
@@ -253,6 +296,7 @@ impl Session {
                 self.source()?.clear_browse_cache();
                 // Switching views always forgets the previous dataset's key and nested readers.
                 let old_view = self.view;
+                let old_choice = std::mem::replace(&mut self.choose_dataset, false);
                 let old_path = std::mem::replace(&mut self.path, "/".into());
                 let old_key = self.key.take();
                 let old_layers = std::mem::take(&mut self.layers);
@@ -261,6 +305,7 @@ impl Session {
                     Ok(state) => Ok(state),
                     Err(e) => {
                         self.view = old_view;
+                        self.choose_dataset = old_choice;
                         self.path = old_path;
                         self.key = old_key;
                         self.layers = old_layers;
@@ -335,6 +380,49 @@ impl Session {
                         Err(e)
                     }
                 }
+            }
+            Request::Versions { name } => {
+                let location = self.version_path(&name)?;
+                let versions =
+                    self.source()?
+                        .file_versions(self.view, &location, self.key(), None)?;
+                Ok(json!({"name": name, "versions": versions}))
+            }
+            Request::OpenVersion { index, name } => {
+                let location = self.version_path(&name)?;
+                let opened = self.source()?.open_file_version(
+                    self.view,
+                    index,
+                    &location,
+                    self.key(),
+                    None,
+                )?;
+                let mut path = parent_path(&location.path);
+                let mut layers = Vec::new();
+                for (catalog, selected) in opened.images.into_iter().rev() {
+                    let parent = parent_path(&catalog.path_in_parent);
+                    layers.push(Layer {
+                        volume: Some(catalog.volumes[selected].selector.clone()),
+                        catalog,
+                        path,
+                    });
+                    path = parent;
+                }
+                layers.reverse();
+                // Build and validate the complete replacement before changing navigation.
+                let candidate = Self {
+                    source: self.source.clone(),
+                    title: self.title.clone(),
+                    view: index,
+                    choose_dataset: false,
+                    path,
+                    key: self.key.clone(),
+                    layers,
+                    authorized: self.authorized.clone(),
+                };
+                let state = candidate.state_with_entries(opened.entries)?;
+                *self = candidate;
+                Ok(state)
             }
             Request::Back => {
                 if self.layers.len() <= usize::from(self.source.is_none()) {

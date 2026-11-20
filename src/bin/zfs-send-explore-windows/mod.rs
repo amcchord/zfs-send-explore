@@ -1,6 +1,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 mod dialogs;
+mod history;
 
 use anyhow::{Context, Result, bail};
 use dialogs::{
@@ -136,6 +137,7 @@ const ID_HOW_TO: u16 = 138;
 const ID_WELCOME_FILE: u16 = 140;
 const ID_WELCOME_DRIVE: u16 = 141;
 const ID_WELCOME_PATH: u16 = 142;
+const ID_VERSIONS: u16 = 145;
 const ID_TIME_ZONE_BASE: u16 = 10_000;
 
 const WM_JOB_COMPLETE: u32 = WM_APP + 1;
@@ -418,6 +420,15 @@ enum PendingJob {
 }
 
 enum JobResult {
+    FileVersions(
+        zfs_send_extract::versions::VersionPath,
+        Vec<zfs_send_extract::versions::FileVersion>,
+    ),
+    VersionOpened {
+        index: usize,
+        location: zfs_send_extract::versions::VersionPath,
+        opened: zfs_send_extract::versions::OpenedVersion,
+    },
     Catalog(SourceCatalog),
     Directory {
         path: String,
@@ -1093,6 +1104,12 @@ unsafe fn create_menus(state: &AppState) {
     append_menu(
         restore_menu,
         MF_STRING,
+        ID_VERSIONS as usize,
+        "Other versions of the selected file…",
+    );
+    append_menu(
+        restore_menu,
+        MF_STRING,
         ID_INCEPTION as usize,
         "Open selected file as a disk image\tCtrl+I",
     );
@@ -1278,6 +1295,11 @@ unsafe fn handle_command(state: &mut AppState, wparam: WPARAM, _lparam: LPARAM) 
         }
         ID_CLEAR_CREDENTIALS => clear_credentials(state),
         ID_RESTORE => extract_selected(state),
+        ID_VERSIONS => {
+            if let Err(error) = history::find_versions(state) {
+                show_problem(state.hwnd, &format!("{error:#}"));
+            }
+        }
         ID_INCEPTION => explore_selected_image(state),
         ID_OPEN_SELECTED => open_selected(state),
         ID_LEAVE_IMAGE => leave_inception(state, true),
@@ -1947,8 +1969,11 @@ unsafe fn finish_job(state: &mut AppState, result: JobMessage) {
                 );
             }
             // Start on the newest restore point that holds files.
-            let start = presentation::recommended_view(&catalog.views).unwrap_or(0);
-            SendMessageW(state.controls.view, CB_SETCURSEL, start, 0);
+            let start = presentation::recommended_view(&catalog.views)
+                .or_else(|| history::choose_dataset(state.hwnd, &catalog));
+            if let Some(index) = start {
+                SendMessageW(state.controls.view, CB_SETCURSEL, index, 0);
+            }
             let title = format!("{} — {}", source_title(state, &catalog.path), APP_TITLE);
             set_text(state.hwnd, &title);
             set_status(state, &presentation::source_description(&catalog));
@@ -1956,42 +1981,28 @@ unsafe fn finish_job(state: &mut AppState, result: JobMessage) {
             set_source_enabled(state, true);
             update_mode(state);
             update_breadcrumb(state);
-            if ensure_selected_view_key(state) {
+            if start.is_some() && ensure_selected_view_key(state) {
                 browse(state, "/".to_owned());
             } else {
                 clear_directory_ui(state);
+                if start.is_none() {
+                    set_status(
+                        state,
+                        "Choose a computer or dataset from the Restore point list.",
+                    );
+                }
             }
             update_guidance(state);
         }
-        Ok(JobResult::Directory { path, mut entries }) => {
-            entries.sort_by(|a, b| {
-                (b.dirent_type == 4)
-                    .cmp(&(a.dirent_type == 4))
-                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-            });
-            state.current_path = path;
-            set_text(state.controls.path, &state.current_path);
-            state.entries = entries;
-            populate_list(state);
-            set_status(
-                state,
-                &format!(
-                    "{} item{} in {}{}",
-                    state.entries.len(),
-                    if state.entries.len() == 1 { "" } else { "s" },
-                    state.current_path,
-                    state
-                        .inception
-                        .last()
-                        .map_or_else(String::new, |frame| format!(
-                            " inside {}",
-                            file_label(Path::new(&frame.catalog.image_path))
-                        ))
-                ),
-            );
-            update_breadcrumb(state);
-            update_guidance(state);
+        Ok(JobResult::FileVersions(location, versions)) => {
+            history::choose_version(state, location, &versions)
         }
+        Ok(JobResult::VersionOpened {
+            index,
+            location,
+            opened,
+        }) => history::activate_version(state, index, location, opened),
+        Ok(JobResult::Directory { path, entries }) => show_directory(state, path, entries),
         Ok(JobResult::InceptionOpened {
             catalog,
             parent_path,
@@ -2154,6 +2165,36 @@ unsafe fn finish_job(state: &mut AppState, result: JobMessage) {
             set_status(state, &format!("Updated {}", target.display()));
         }
     }
+}
+
+unsafe fn show_directory(state: &mut AppState, path: String, mut entries: Vec<DirectoryEntry>) {
+    entries.sort_by(|a, b| {
+        (b.dirent_type == 4)
+            .cmp(&(a.dirent_type == 4))
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    state.current_path = path;
+    set_text(state.controls.path, &state.current_path);
+    state.entries = entries;
+    populate_list(state);
+    set_status(
+        state,
+        &format!(
+            "{} item{} in {}{}",
+            state.entries.len(),
+            if state.entries.len() == 1 { "" } else { "s" },
+            state.current_path,
+            state
+                .inception
+                .last()
+                .map_or_else(String::new, |frame| format!(
+                    " inside {}",
+                    file_label(Path::new(&frame.catalog.image_path))
+                ))
+        ),
+    );
+    update_breadcrumb(state);
+    update_guidance(state);
 }
 
 unsafe fn show_restored(state: &AppState, destination: &Path, summary: &str, details: &str) {
