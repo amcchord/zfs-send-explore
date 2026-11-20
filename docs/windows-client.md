@@ -36,8 +36,6 @@ the window keeps responding.
 When nothing is open, the window shows three large choices and a summary of the
 steps:
 
-![The ZFS Explore welcome page on Windows](screenshots/windows/welcome.png)
-
 - **Open a backup file** (Ctrl+O) — a ZFS send file, a Slide or ZFS pool image,
   or a RAW, QCOW2 or VMDK disk image. The format is detected automatically.
 - **Browse connected drives** (Ctrl+D) — check the attached drive holding the backup, or all member drives from one pool.
@@ -213,8 +211,6 @@ For a physical drive:
    disk with unknown system status requires confirmation.
 4. If Windows reports that access was denied, close ZFS Explore, right-click it,
    choose **Run as administrator**, and open the drive again.
-
-![The connected-drive chooser](screenshots/windows/drive-picker.png)
 
 For an independent cross-check, PowerShell reports the same disk numbers:
 

@@ -2849,13 +2849,13 @@ unsafe fn open_physical_drive(state: &mut AppState) {
     open_selected_sources(state, OpenMode::Auto);
 }
 
-fn enumerate_physical_drives() -> Vec<PhysicalDrive> {
+fn enumerate_physical_drives() -> std::io::Result<Vec<PhysicalDrive>> {
+    let numbers = drive_inventory::physical_disk_numbers()?;
     let system = drive_inventory::windows_volume_disks().ok();
-    drive_inventory::physical_disk_numbers()
-        .unwrap_or_default()
+    Ok(numbers
         .into_iter()
         .filter_map(|number| inspect_physical_drive(number, system.as_deref()))
-        .collect()
+        .collect())
 }
 
 fn inspect_physical_drive(number: u32, system: Option<&[u32]>) -> Option<PhysicalDrive> {

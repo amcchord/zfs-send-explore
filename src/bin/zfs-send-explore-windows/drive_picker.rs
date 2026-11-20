@@ -176,7 +176,9 @@ unsafe fn update_status(dialog: HWND, state: &Picker) {
     set_text(GetDlgItem(dialog, STATUS), &status);
 }
 
-unsafe fn refresh(dialog: HWND, state: &Picker, inventory: Vec<PhysicalDrive>) {
+unsafe fn refresh(dialog: HWND, state: &Picker, result: std::io::Result<Vec<PhysicalDrive>>) {
+    let failed = result.is_err();
+    let inventory = result.unwrap_or_default();
     state.pending_change.set(false);
     KillTimer(dialog, REFRESH_TIMER);
     let list = GetDlgItem(dialog, LIST);
@@ -251,10 +253,12 @@ unsafe fn refresh(dialog: HWND, state: &Picker, inventory: Vec<PhysicalDrive>) {
         if empty { SW_SHOW } else { SW_HIDE },
     );
     if empty {
-        let text = if any_system && !show_system {
-            "No backup drives found. Connect a drive and choose Refresh. The Windows system disk is hidden."
+        let text = if failed {
+            "Windows couldn’t list connected drives. Choose Refresh to try again."
+        } else if any_system && !show_system {
+            "Connect a backup drive. It will appear here. The Windows system disk is hidden."
         } else {
-            "No drives found. Connect a backup drive and choose Refresh."
+            "Connect a backup drive. It will appear here."
         };
         set_text(GetDlgItem(dialog, EMPTY), text);
     }
@@ -304,12 +308,18 @@ unsafe fn open(dialog: HWND, state: &Picker) {
     }
     // Query again after any confirmation. Never substitute a drive or proceed
     // with a subset if something changed while the dialog was open.
-    let current = enumerate_physical_drives();
+    let current = match enumerate_physical_drives() {
+        Ok(current) => current,
+        Err(error) => {
+            refresh(dialog, state, Err(error));
+            return;
+        }
+    };
     if state.pending_change.get()
         || checked(dialog, state) != selected
         || !can_open(&selected, &current)
     {
-        refresh(dialog, state, current);
+        refresh(dialog, state, Ok(current));
         return;
     }
     *state.result.borrow_mut() = Some(selected);
