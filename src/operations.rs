@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -186,7 +186,7 @@ fn extract_resolved_snapshot(
         size_bonus_offset: resolved.size_bonus_offset,
         size_spill_offset: resolved.size_spill_offset,
         snapshot_guid: guid_string(index.begin.to_guid),
-        sha256: sha256_file(temporary.path())?,
+        sha256: file_digest(temporary.path())?.1,
         raw_state: if write_sidecar {
             index.raw_sidecar_state(resolved.object_id)?
         } else {
@@ -372,14 +372,13 @@ pub fn apply_incremental_with_key(
             sidecar.format_version
         );
     }
-    let current_hash = sha256_file(target)?;
+    let (current_size, current_hash) = file_digest(target)?;
     if current_hash != sidecar.sha256 {
         bail!(
             "target {} does not match the extracted base file (SHA-256 differs)",
             target.display()
         );
     }
-    let current_size = fs::metadata(target)?.len();
     if current_size != sidecar.logical_size {
         bail!(
             "target size is {current_size}, but extraction metadata expects {}",
@@ -529,7 +528,7 @@ pub fn apply_incremental_with_key(
 
     sidecar.logical_size = new_size;
     sidecar.snapshot_guid = guid_string(begin.to_guid);
-    sidecar.sha256 = sha256_file(temporary.path())?;
+    sidecar.sha256 = file_digest(temporary.path())?.1;
     sidecar.raw_state = None;
     publication.file(temporary, Some(&sidecar))?;
     Ok(sidecar)
@@ -807,7 +806,7 @@ fn apply_raw_incremental(
     raw_state.target_spill = target_spill;
     sidecar.logical_size = new_size;
     sidecar.snapshot_guid = guid_string(begin.to_guid);
-    sidecar.sha256 = sha256_file(temporary.path())?;
+    sidecar.sha256 = file_digest(temporary.path())?.1;
     sidecar.raw_state = Some(raw_state);
     publication.file(temporary, Some(&sidecar))?;
     Ok(sidecar)
@@ -1081,18 +1080,21 @@ pub(crate) fn sidecar_path(target: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
+pub(crate) fn file_digest(path: &Path) -> Result<(u64, String)> {
     let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 128 * 1024];
+    let mut length = 0;
     loop {
+        crate::progress::checkpoint()?;
         let count = file.read(&mut buffer)?;
         if count == 0 {
             break;
         }
         digest.update(&buffer[..count]);
+        length += count as u64;
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok((length, format!("{:x}", digest.finalize())))
 }
 
 pub(crate) fn guid_string(guid: u64) -> String {

@@ -1,10 +1,10 @@
 //! Streaming, portable receipt for a staged directory restore.
+use crate::operations::file_digest;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
@@ -41,23 +41,6 @@ pub(crate) struct ReportWriter {
     file: BufWriter<NamedTempFile>,
     skipped_report_names: HashSet<String>,
     entries: u64,
-}
-
-fn file_digest(path: &Path) -> Result<(u64, String)> {
-    let mut file = File::open(path)?;
-    let mut hash = Sha256::new();
-    let mut bytes = 0;
-    let mut buffer = [0; 128 * 1024];
-    loop {
-        crate::progress::checkpoint()?;
-        let n = file.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        hash.update(&buffer[..n]);
-        bytes += n as u64;
-    }
-    Ok((bytes, format!("{:x}", hash.finalize())))
 }
 
 impl ReportWriter {
