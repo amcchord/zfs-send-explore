@@ -109,7 +109,7 @@ final class CaptureWindow: NSWindow {
                 print("Requested capture drive is unavailable:", path)
                 exit(1)
             }
-            model.driveSelection.targets[drive.id] = slice
+            model.driveSelection.targets[drive.id] = [slice]
             await pause(); snap("30-drive-picker")
             model.openDrive(); await settle(model); snap("31-drive-opened")
             await model.run(["method": "unlock", "key_file": key], activity: "Unlocking…"); await pause(); snap("32-drive-unlocked")

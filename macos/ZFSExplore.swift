@@ -300,7 +300,7 @@ final class Engine: @unchecked Sendable {
     func openDrive() {
         refreshDrives()
         let selected = driveSelection.available(in: drives)
-        guard !selected.isEmpty, selected.count == driveSelection.targets.count else { return }
+        guard !selected.isEmpty, selected.count == driveSelection.count else { return }
         let (drive, slice) = selected[0]
         let title = slice.whole ? drive.name : "\(drive.name) · \(slice.typeLabel)"
         showDrives = false
@@ -1108,7 +1108,8 @@ struct DrivePicker: View {
     private let refresh = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
     var body: some View {
-        let count = model.driveSelection.targets.count
+        let count = model.driveSelection.count
+        let unit = model.driveSelection.targets.count == count ? "Drives" : "Members"
         let unavailable = model.driveSelection.unavailable(in: model.drives)
         VStack(alignment: .leading, spacing: 16) {
             Text("Connected drives").font(.title2.bold())
@@ -1149,7 +1150,7 @@ struct DrivePicker: View {
                 Button("Refresh") { model.refreshDrives() }
                 Spacer()
                 Button("Cancel") { model.showDrives = false }.keyboardShortcut(.cancelAction)
-                Button(count > 1 ? "Open \(count) Drives" : "Open Drive") { model.openDrive() }
+                Button(count > 1 ? "Open \(count) \(unit)" : "Open Drive") { model.openDrive() }
                     .keyboardShortcut(.defaultAction).disabled(count == 0 || !unavailable.isEmpty)
             }
         }
@@ -1162,17 +1163,30 @@ private struct DriveRow: View {
     let drive: AttachedDrive
     @Binding var selection: DriveSelection
     @State private var expanded = false
-    @State private var preferredSliceID: String?
+    @State private var preferred: [DriveSlice]?
 
-    private var target: DriveSlice {
-        drive.slices.first { $0.id == preferredSliceID } ?? drive.suggested
+    private var sources: [DriveSlice] {
+        if let chosen = selection.targets[drive.id] { return chosen }
+        if let preferred {
+            let ids = Set(preferred.map(\.id))
+            return drive.slices.filter { ids.contains($0.id) }
+        }
+        return [drive.suggested]
     }
+
+    private func updateSources(_ slices: [DriveSlice]) {
+        preferred = slices
+        if selection.targets[drive.id] != nil {
+            selection.targets[drive.id] = slices.isEmpty ? nil : slices
+        }
+    }
+
     var body: some View {
         let chosen = selection.targets[drive.id]
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
                 Toggle(isOn: Binding(get: { chosen != nil }, set: { checked in
-                    selection.targets[drive.id] = checked ? target : nil
+                    selection.targets[drive.id] = checked ? (sources.isEmpty ? [drive.suggested] : sources) : nil
                 })) {
                     HStack(spacing: 11) {
                         Image(systemName: "externaldrive").font(.title2).foregroundStyle(.teal)
@@ -1201,20 +1215,33 @@ private struct DriveRow: View {
                 }
             }
             if expanded, !drive.partitions.isEmpty {
-                Picker("Read from", selection: Binding(get: { chosen?.id ?? target.id }, set: { id in
-                    guard let slice = drive.slices.first(where: { $0.id == id }) else { return }
-                    preferredSliceID = id
-                    if chosen != nil { selection.targets[drive.id] = slice }
-                })) {
-                    ForEach(drive.slices) { slice in
-                        let label = slice.whole ? "Whole disk" : "\(slice.typeLabel) · \(slice.sizeLabel)"
-                        Text("\(label) · \(slice.bsdName)\(slice.id == drive.suggested.id ? " (suggested)" : "")").tag(slice.id)
+                VStack(alignment: .leading, spacing: 7) {
+                    if drive.partitions.count == 1 {
+                        Picker("Read from", selection: Binding(get: { sources.first?.id ?? drive.suggested.id }, set: { id in
+                            if let slice = drive.slices.first(where: { $0.id == id }) { updateSources([slice]) }
+                        })) {
+                            ForEach(drive.slices) { slice in Text(sourceLabel(slice)).tag(slice.id) }
+                        }.accessibilityLabel("Read from \(drive.disk.bsdName)")
+                    } else {
+                        Text("Read the whole disk or choose member partitions.").font(.caption).foregroundStyle(.secondary)
+                        ForEach(drive.slices) { slice in
+                            Toggle(sourceLabel(slice), isOn: Binding(get: { sources.contains(where: { $0.id == slice.id }) }, set: { value in
+                                updateSources(DriveSelection.changing(sources, slice: slice, checked: value))
+                            })).toggleStyle(.checkbox)
+                        }
                     }
                 }.padding(.leading, 27)
-                .accessibilityLabel("Read from \(drive.disk.bsdName)")
             }
         }.padding(.horizontal, 14).padding(.vertical, 12)
     }
+
+    private func sourceLabel(_ slice: DriveSlice) -> String {
+        let label = slice.whole ? "Whole disk" : "\(slice.typeLabel) · \(slice.sizeLabel)"
+        let location = slice.mountPath.map { " · mounted at \($0)" } ?? ""
+        let hint = slice.id == drive.suggested.id ? " (suggested)" : ""
+        return "\(label) · \(slice.bsdName)\(location)\(hint)"
+    }
+
 }
 
 struct TimeZonePreferences: View {

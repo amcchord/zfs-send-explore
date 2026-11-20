@@ -15,11 +15,13 @@ struct DriveSlice: Identifiable, Hashable {
     var sizeLabel: String { ByteCountFormatter.string(fromByteCount: size, countStyle: .file) }
 
     enum Kind { case zfs, linux, other, system, mounted }
+    var hasZFSType: Bool {
+        ["6A898CC3-1DD2-11B2-99A6-080020736631", "516E7CBA-6ECF-11D6-8FF8-00022D09712B"].contains(content.uppercased())
+    }
     var kind: Kind {
         if mountPath != nil { return .mounted }
+        if hasZFSType { return .zfs }
         switch content.uppercased() {
-        // OpenZFS (Linux, illumos, macOS) and FreeBSD ZFS partition types.
-        case "6A898CC3-1DD2-11B2-99A6-080020736631", "516E7CBA-6ECF-11D6-8FF8-00022D09712B": return .zfs
         // Datto and many Linux-hosted pools use the generic Linux data type.
         case "LINUX", "0FC63DAF-8483-4772-8E79-3D69D8477DE4", "SOLARIS": return .linux
         case "LINUX_SWAP", "0657FD6D-A4AB-43C4-84E5-0933C84B4F4F", "EFI",
@@ -29,8 +31,8 @@ struct DriveSlice: Identifiable, Hashable {
         }
     }
     var typeLabel: String {
+        if hasZFSType { return "ZFS" }
         switch content.uppercased() {
-        case "6A898CC3-1DD2-11B2-99A6-080020736631", "516E7CBA-6ECF-11D6-8FF8-00022D09712B": return "ZFS"
         case "LINUX", "0FC63DAF-8483-4772-8E79-3D69D8477DE4": return "Linux"
         case "LINUX_SWAP", "0657FD6D-A4AB-43C4-84E5-0933C84B4F4F": return "Linux swap"
         case "EFI", "C12A7328-F81F-11D2-BA4B-00A0C93EC93B": return "EFI system"
@@ -70,7 +72,7 @@ struct AttachedDrive: Identifiable, Equatable {
     }
 
     var slices: [DriveSlice] { [disk] + partitions }
-    var hasZFSPartition: Bool { slices.contains { $0.kind == .zfs } }
+    var hasZFSPartition: Bool { slices.contains(where: \.hasZFSType) }
 
     /// External and attached-image disks from DiskArbitration, including disks
     /// whose partitions macOS cannot mount and Finder therefore never shows.
@@ -136,23 +138,36 @@ struct AttachedDrive: Identifiable, Equatable {
 /// Keep the chosen slice on its particular attachment, including while it is
 /// missing. Refreshing the picker must never open a smaller or substituted set.
 struct DriveSelection {
-    var targets: [String: DriveSlice] = [:]
+    var targets: [String: [DriveSlice]] = [:]
+    var count: Int { targets.values.reduce(0) { $0 + $1.count } }
+
+    /// A whole-disk read overlaps every partition. Separate partitions can be
+    /// distinct top-level members and remain selectable together.
+    static func changing(_ previous: [DriveSlice], slice: DriveSlice, checked: Bool) -> [DriveSlice] {
+        var next = previous.filter { $0.id != slice.id }
+        guard checked else { return next }
+        if slice.whole { return [slice] }
+        next.removeAll(where: \.whole)
+        next.append(slice)
+        return next
+    }
 
     func available(in drives: [AttachedDrive]) -> [(AttachedDrive, DriveSlice)] {
-        drives.compactMap { drive in
-            guard let id = targets[drive.id]?.id,
-                  let slice = drive.slices.first(where: { $0.id == id }) else { return nil }
-            return (drive, slice)
+        drives.flatMap { drive in
+            let ids = Set((targets[drive.id] ?? []).map(\.id))
+            return drive.slices.filter { ids.contains($0.id) }.map { (drive, $0) }
         }
     }
 
     func unavailable(in drives: [AttachedDrive]) -> [DriveSlice] {
-        let availableIDs = Set(available(in: drives).map { $0.0.id })
-        return targets.filter { !availableIDs.contains($0.key) }.map(\.value)
+        let ids = Set(available(in: drives).map { $0.1.id })
+        return targets.values.flatMap { $0 }.filter { !ids.contains($0.id) }
             .sorted { $0.bsdName.localizedStandardCompare($1.bsdName) == .orderedAscending }
     }
 
     mutating func removeUnavailable(in drives: [AttachedDrive]) {
-        targets = Dictionary(uniqueKeysWithValues: available(in: drives).map { ($0.0.id, $0.1) })
+        let retained = available(in: drives)
+        targets.removeAll()
+        for (drive, slice) in retained { targets[drive.id, default: []].append(slice) }
     }
 }

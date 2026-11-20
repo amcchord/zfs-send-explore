@@ -100,7 +100,9 @@ images out of this list.
 Check the drive you want. For a striped pool, check each member and choose
 **Open 2 Drives** (the number reflects your selection). Nothing is checked when
 the picker opens. To inspect partitions or override the suggested source, use the
-arrow at the right of a drive and choose **Read from**. The suggestion prefers
+arrow at the right of a drive. Choose **Read from** for a single partition.
+When multiple partitions on one disk are separate pool members, check those
+partitions together. Choosing the whole disk replaces its partition choices. The suggestion prefers
 a ZFS partition, then the largest eligible unmounted data partition, then the
 whole disk. Picking a partition on an unchecked drive leaves it unchecked.
 
