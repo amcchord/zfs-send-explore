@@ -51,7 +51,8 @@ The window guides you through four steps, shown in the step bar at the top:
    connected drive** (⇧⌘D; see below). You can also drag a backup file into the
    window, or use **Open from a path…** (⇧⌘O) for a pasted path such as
    `/Volumes/Backups/slide.img` or a device such as `/dev/disk4s2`.
-2. The newest restore point is selected for you. Pick another date in the
+2. If the backup contains several computers or datasets, choose the one you need.
+   The newest restore point in that dataset opens. Pick another date in the
    sidebar's **Restore points** list if you need an older copy. Live dataset
    states and parent datasets are under **Other places in this backup**.
 3. If the restore point is encrypted, paste its key and choose **Unlock**, or
@@ -67,6 +68,12 @@ The window guides you through four steps, shown in the step bar at the top:
    reveals it and **Details** shows the full path and SHA-256 of a single file.
    Folder restores report skipped links or special items and do not restore
    owners, permissions or timestamps.
+
+To compare one file across restore points, select it and choose **Other Versions…**.
+The list shows each snapshot name, date and file size in the same dataset.
+Choose a version to open its folder with the file selected, then choose **Restore…**.
+This also works inside disk images. Each entry follows the same file path, image
+and partition across snapshots. An unavailable entry includes its reason.
 
 Problems are explained in plain words with the engine's original message under
 **Show Details**. Restore point dates are shown in your Mac's time zone; use the
@@ -112,8 +119,11 @@ incremental application remain CLI/Windows features. Single disk or single
 top-level mirror pool layouts are supported; RAIDZ and striped/multiple-vdev
 pools are not.
 
-Long operations show an indeterminate activity indicator and run off the main
-thread. Byte-level progress and cancel/resume are not yet provided.
+Long operations run in a background worker. The progress panel shows bytes
+read, bytes written, and completed files. **Cancel** stops at the next safe
+checkpoint. A cancelled restore can be retried in the same session. The app
+retains the active send snapshot’s directory index to speed up browsing.
+The read count includes each pass over the source.
 
 ## Snapshot dates
 
@@ -134,3 +144,17 @@ fragmented attribute lists, partial final units and initialized-length zero fill
 Disk images stored as compressed NTFS files can also be browsed directly. Standard
 16-cluster units with 512–4096-byte clusters are supported. EFS-encrypted streams
 remain unsupported; this feature does not add WOF/CompactOS decompression.
+
+## Checking a recovered folder
+
+The restore receipt gives the destination and report path. Open the JSON Lines report to see the selected source, file sizes and hashes, empty directories, and skipped entries. To recheck the copy later, pass the report path to `zfs-send-extract verify`. Keep it inside the restored folder so its relative paths continue to resolve.
+
+### Qualify a packaged Mac download
+
+On a Mac with Xcode, an active desktop session, and permission for Xcode UI testing, run the following command with the downloaded ZIP and a new directory for evidence. Close any running copy of ZFS Explore first.
+
+```sh
+./scripts/test-macos-gui.sh /path/to/zfs-send-explore-macos-arm64.zip /path/to/new-evidence
+```
+
+The external UI test opens the archived app, chooses public fixtures through its file dialog, retries a wrong passphrase, saves a file, attempts a same-name restore over a distinctive test file, and recovers the middle of three snapshots. It compares the output bytes to independently recorded SHA-256 values. The evidence directory contains the archive and executable hashes, screenshots, restored files, per-file comparisons and the Xcode test result. This check uses ordinary files and requires no administrator prompt.

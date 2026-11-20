@@ -5,14 +5,13 @@
 //! a multi-terabyte member is never buffered in full.
 
 use crate::compression::decompress_block;
+use crate::destination::{RestoreDestination, temporary_for};
 use crate::encrypted::{
     DatasetKey, EncryptionParams, is_encrypted_object_type, pool_block_pointer_auth,
 };
 use crate::filesystem::DirectoryEntry;
 use crate::inception::ImageRead;
-use crate::operations::{
-    EncryptionRequirement, SIDECAR_VERSION, Sidecar, guid_string, save_sidecar, sidecar_path,
-};
+use crate::operations::{EncryptionRequirement, SIDECAR_VERSION, Sidecar, guid_string};
 use crate::sparse;
 use crate::tree::{RecursiveExtraction, extract_directory_tree};
 use anyhow::{Context, Result, anyhow, bail};
@@ -20,11 +19,11 @@ use luks::{DecryptedPayload, LuksVolume};
 use serde::Serialize;
 use sha2::{Digest, Sha256, Sha512};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use tempfile::NamedTempFile;
+
 use zfs_core::{
     BLKPTR_SIZE, Blkptr, ChecksumType, DMU_OST_META, DMU_OST_ZFS, DNODE_SIZE, Dnode, Endian,
     LABEL_SIZE, MAX_BLOCK_SIZE, MAX_INDIRECT_LEVELS, ObjsetPhys, Reader, SaLayouts, SaRegistry,
@@ -60,6 +59,43 @@ pub struct PoolInspection {
     pub endian: String,
     pub datasets: usize,
     pub snapshots: usize,
+}
+
+/// Information available directly from a member label, even if the pool cannot be browsed.
+#[derive(Debug, Clone, Serialize)]
+pub struct PoolLayout {
+    pub pool_name: String,
+    pub pool_guid: String,
+    pub member_guid: String,
+    pub group_guid: String,
+    pub group_id: u64,
+    pub group_type: String,
+    pub top_level_groups: u64,
+    pub supported_layout: bool,
+    pub guidance: String,
+}
+
+impl std::fmt::Display for PoolLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Pool layout for {} ({}): disk group {} ({}), {} top-level group(s). {}",
+            self.pool_name,
+            self.pool_guid,
+            self.group_id,
+            self.group_type,
+            self.top_level_groups,
+            self.guidance
+        )
+    }
+}
+impl std::error::Error for PoolLayout {}
+
+struct LabeledMember {
+    source: PoolSource,
+    active: VdevLabel,
+    container_encryption: Option<String>,
+    layout: PoolLayout,
 }
 
 /// One filesystem dataset reachable through the pool's DSL directory tree.
@@ -584,6 +620,7 @@ impl std::ops::Deref for PoolObjset {
 /// An opened offline vdev member. All methods are read-only with respect to the
 /// source; extraction writes only to the explicitly selected destination.
 pub struct PoolMember {
+    pub(crate) source_path: PathBuf,
     source: PoolSource,
     backup_format: String,
     container_encryption: Option<String>,
@@ -616,6 +653,75 @@ impl PoolMember {
     /// Open a pool whose vdev may be inside a LUKS1/LUKS2 partition. The
     /// passphrase is used only when a LUKS signature is actually present.
     pub fn open_with_container_key(path: &Path, container_key: Option<&[u8]>) -> Result<Self> {
+        let LabeledMember {
+            source,
+            active,
+            container_encryption,
+            layout,
+        } = Self::labels(path, container_key)?;
+        if !layout.supported_layout {
+            return Err(layout.into());
+        }
+        let pool_name = layout.pool_name;
+        let config = &active.config;
+        let pool_guid = config.get_u64("pool_guid").context("missing pool GUID")?;
+        let vdev_guid = config
+            .get_nvlist("vdev_tree")
+            .and_then(|v| v.get_u64("guid"))
+            .context("missing vdev GUID")?;
+        let vdev_type = layout.group_type;
+        let top_level_vdevs = layout.top_level_groups;
+        let uberblock = &active.active_uberblock;
+        let rootbp = uberblock.rootbp_full();
+        let mos_block = read_block_from(&source, 0, &rootbp).with_context(|| {
+            format!(
+                "reading MOS from active uberblock txg {} on {}",
+                uberblock.txg,
+                path.display()
+            )
+        })?;
+        let mos =
+            PoolObjset::parse(&mos_block, uberblock.endian).context("decoding the MOS objset")?;
+        if mos.os_type != DMU_OST_META {
+            bail!(
+                "active uberblock resolved objset type {}, not the MOS type {DMU_OST_META}",
+                mos.os_type
+            );
+        }
+
+        let backup_format = if pool_name.eq_ignore_ascii_case("slide") {
+            "slide_box"
+        } else if container_encryption.is_some()
+            && pool_name.to_ascii_lowercase().starts_with("revrt-")
+        {
+            "datto_reverse_roundtrip"
+        } else {
+            "generic_zfs"
+        }
+        .to_owned();
+
+        Ok(Self {
+            source,
+            source_path: path.to_owned(),
+            backup_format,
+            container_encryption,
+            pool_name,
+            pool_guid,
+            vdev_guid,
+            vdev_type,
+            top_level_vdevs,
+            txg: uberblock.txg,
+            endian: uberblock.endian,
+            mos,
+        })
+    }
+
+    /// Read the labels only. This also works for individual members of striped and RAIDZ pools.
+    pub fn layout(path: &Path, container_key: Option<&[u8]>) -> Result<PoolLayout> {
+        Ok(Self::labels(path, container_key)?.layout)
+    }
+
+    fn labels(path: &Path, container_key: Option<&[u8]>) -> Result<LabeledMember> {
         let file_source = FileSource::open(path)?;
         let (mut parsed, mut failures) = read_labels(&file_source);
         let mut container_encryption = None;
@@ -734,7 +840,7 @@ impl PoolMember {
         }
 
         parsed.sort_by_key(|(_, label)| label.active_uberblock.txg);
-        let (_, active) = parsed.last().expect("non-empty labels");
+        let (_, active) = parsed.pop().expect("non-empty labels");
         let config = &active.config;
         let pool_name = config
             .get_str("name")
@@ -747,11 +853,6 @@ impl PoolMember {
         let top_level_vdevs = config
             .get_u64("vdev_children")
             .ok_or_else(|| anyhow!("active vdev label has no vdev_children count"))?;
-        if top_level_vdevs != 1 {
-            bail!(
-                "pool {pool_name} has {top_level_vdevs} top-level vdevs; this command needs one member from every top-level vdev and currently accepts only a one-vdev pool"
-            );
-        }
         let vdev = config
             .get_nvlist("vdev_tree")
             .ok_or_else(|| anyhow!("active vdev label has no vdev_tree"))?;
@@ -760,16 +861,10 @@ impl PoolMember {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow!("active vdev label has no vdev type"))?
             .to_owned();
-        if !matches!(vdev_type.as_str(), "disk" | "file" | "mirror") {
-            bail!(
-                "top-level vdev type {vdev_type:?} is unsupported; the first pool-member profile accepts a single disk/file vdev or one member of one mirror"
-            );
-        }
-        let vdev_id = vdev.get_u64("id").unwrap_or(0);
-        if vdev_id != 0 {
-            bail!("the only top-level vdev has id {vdev_id}, not the supported id 0");
-        }
-        let vdev_guid = vdev.get_u64("guid").unwrap_or(0);
+        let vdev_id = vdev
+            .get_u64("id")
+            .context("active vdev label has no group ID")?;
+        let vdev_guid = vdev.get_u64("guid").context("missing group GUID")?;
 
         for (_, label) in &parsed {
             if let Some(other) = label.config.get_u64("pool_guid")
@@ -781,47 +876,45 @@ impl PoolMember {
             }
         }
 
-        let uberblock = &active.active_uberblock;
-        let rootbp = uberblock.rootbp_full();
-        let mos_block = read_block_from(&source, 0, &rootbp).with_context(|| {
-            format!(
-                "reading MOS from active uberblock txg {} on {}",
-                uberblock.txg,
-                path.display()
-            )
-        })?;
-        let mos =
-            PoolObjset::parse(&mos_block, uberblock.endian).context("decoding the MOS objset")?;
-        if mos.os_type != DMU_OST_META {
-            bail!(
-                "active uberblock resolved objset type {}, not the MOS type {DMU_OST_META}",
-                mos.os_type
-            );
-        }
-
-        let backup_format = if pool_name.eq_ignore_ascii_case("slide") {
-            "slide_box"
-        } else if container_encryption.is_some()
-            && pool_name.to_ascii_lowercase().starts_with("revrt-")
-        {
-            "datto_reverse_roundtrip"
+        let supported_layout = top_level_vdevs == 1
+            && vdev_id == 0
+            && matches!(vdev_type.as_str(), "disk" | "file" | "mirror");
+        let guidance = if supported_layout {
+            if vdev_type == "mirror" {
+                "One healthy member of this mirror can be browsed directly."
+            } else {
+                "This single-disk layout can be browsed directly."
+            }
+            .to_owned()
         } else {
-            "generic_zfs"
-        }
-        .to_owned();
-
-        Ok(Self {
-            source,
-            backup_format,
-            container_encryption,
+            let member_requirement = match vdev_type.as_str() {
+                "disk" | "file" => "Keep this member. This group has no redundant copy.",
+                "mirror" => "Keep a healthy member of this mirror group.",
+                "raidz" => {
+                    "Retain all available RAIDZ members. Recovery depends on the parity level and the number of healthy members."
+                }
+                _ => "Retain all available members of this group.",
+            };
+            format!(
+                "This label identifies group {vdev_id} of {top_level_vdevs} top-level groups. {member_requirement} Recovery requires every data-bearing group. ZFS Explore cannot assemble this layout. Open an existing full ZFS send or self-contained send history instead."
+            )
+        };
+        let layout = PoolLayout {
             pool_name,
-            pool_guid,
-            vdev_guid,
-            vdev_type,
-            top_level_vdevs,
-            txg: uberblock.txg,
-            endian: uberblock.endian,
-            mos,
+            pool_guid: guid_string(pool_guid),
+            member_guid: guid_string(config.get_u64("guid").context("missing member GUID")?),
+            group_guid: guid_string(vdev_guid),
+            group_id: vdev_id,
+            group_type: vdev_type,
+            top_level_groups: top_level_vdevs,
+            supported_layout,
+            guidance,
+        };
+        Ok(LabeledMember {
+            source,
+            active,
+            container_encryption,
+            layout,
         })
     }
 
@@ -1055,13 +1148,8 @@ impl PoolMember {
         if resolved.dirent_type != 8 {
             bail!("{} is not a regular file", resolved.normalized_path);
         }
-        if output.exists() && !force {
-            bail!(
-                "output {} already exists (pass --force to replace it)",
-                output.display()
-            );
-        }
-
+        let publication =
+            RestoreDestination::prepare(Some(&self.source_path), output, force, true)?;
         let mut temporary = temporary_for(output)?;
         sparse::prepare(temporary.as_file())?;
         let mut digest = Sha256::new();
@@ -1073,7 +1161,7 @@ impl PoolMember {
         )?;
         temporary.as_file_mut().set_len(resolved.logical_size)?;
         temporary.as_file_mut().sync_all()?;
-        persist_replace(temporary, output, force)?;
+
         let sha256 = format!("{:x}", digest.finalize());
 
         let sidecar_written = if let Some(snapshot_guid) = view.snapshot_guid {
@@ -1094,18 +1182,10 @@ impl PoolMember {
                 sha256: sha256.clone(),
                 raw_state: None,
             };
-            save_sidecar(output, &sidecar)?;
+            publication.file(temporary, Some(&sidecar))?;
             true
         } else {
-            let stale = sidecar_path(output);
-            if stale.exists() {
-                fs::remove_file(&stale).with_context(|| {
-                    format!(
-                        "removing stale incremental-send sidecar {} after current-head extraction",
-                        stale.display()
-                    )
-                })?;
-            }
+            publication.file(temporary, None)?;
             false
         };
 
@@ -1130,6 +1210,8 @@ impl PoolMember {
         key_material: Option<&[u8]>,
     ) -> Result<RecursiveExtraction> {
         extract_directory_tree(
+            Some(&self.source_path),
+            selector,
             path,
             output,
             force,
@@ -1163,7 +1245,7 @@ impl PoolMember {
         )?;
         temporary.as_file_mut().set_len(resolved.logical_size)?;
         temporary.as_file_mut().sync_all()?;
-        persist_replace(temporary, output, false)?;
+        temporary.persist_noclobber(output)?;
         Ok(resolved.logical_size)
     }
 
@@ -2052,26 +2134,6 @@ fn normalize_path(path: &str) -> Result<String> {
     } else {
         Ok(format!("/{}", components.join("/")))
     }
-}
-
-fn temporary_for(path: &Path) -> Result<NamedTempFile> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    fs::create_dir_all(parent)?;
-    NamedTempFile::new_in(parent)
-        .with_context(|| format!("creating temporary file in {}", parent.display()))
-}
-
-fn persist_replace(temporary: NamedTempFile, path: &Path, force: bool) -> Result<()> {
-    if path.exists() && !force {
-        bail!("{} already exists", path.display());
-    }
-    temporary
-        .persist(path)
-        .map_err(|error| anyhow!("persisting {}: {}", path.display(), error.error))?;
-    Ok(())
 }
 
 #[cfg(test)]

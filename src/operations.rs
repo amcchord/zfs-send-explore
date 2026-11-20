@@ -1,4 +1,5 @@
 use crate::compression::{decode_embedded_write, decode_replay_write};
+use crate::destination::{RestoreDestination, temporary_for};
 use crate::encrypted::{
     DatasetKey, EncryptionParams, RawBlockPointer, RawDnode, RawDnodeRange, RawSidecarState,
     decompress_block, is_encrypted_object_type,
@@ -16,10 +17,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
-use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use tempfile::NamedTempFile;
 
 pub(crate) const SIDECAR_VERSION: u32 = 1;
 const MAX_REPLAY_BLOCK_SIZE: u64 = 16 * 1024 * 1024;
@@ -158,12 +158,11 @@ fn extract_resolved_snapshot(
     if resolved.dirent_type != 8 {
         bail!("{} is not a regular file", resolved.normalized_path);
     }
-    if output.exists() && !force {
-        bail!(
-            "output {} already exists (pass --force to replace it)",
-            output.display()
-        );
-    }
+    let publication = if write_sidecar {
+        RestoreDestination::prepare(Some(stream), output, force, true)?
+    } else {
+        RestoreDestination::staged_member(output)
+    };
 
     let mut temporary = temporary_for(output)?;
     sparse::prepare(temporary.as_file())?;
@@ -176,7 +175,6 @@ fn extract_resolved_snapshot(
     )?;
     temporary.as_file_mut().set_len(resolved.logical_size)?;
     temporary.as_file_mut().sync_all()?;
-    persist_replace(temporary, output, force)?;
 
     let sidecar = Sidecar {
         format_version: SIDECAR_VERSION,
@@ -188,16 +186,14 @@ fn extract_resolved_snapshot(
         size_bonus_offset: resolved.size_bonus_offset,
         size_spill_offset: resolved.size_spill_offset,
         snapshot_guid: guid_string(index.begin.to_guid),
-        sha256: sha256_file(output)?,
+        sha256: file_digest(temporary.path())?.1,
         raw_state: if write_sidecar {
             index.raw_sidecar_state(resolved.object_id)?
         } else {
             None
         },
     };
-    if write_sidecar {
-        save_sidecar(output, &sidecar)?;
-    }
+    publication.file(temporary, write_sidecar.then_some(&sidecar))?;
     Ok(sidecar)
 }
 
@@ -213,24 +209,51 @@ pub fn extract_tree_snapshot_with_key(
 ) -> Result<RecursiveExtraction> {
     let plan = plan_snapshot(stream, snapshot)?;
     let index = ObjectIndex::build_plan_with_key(stream, &plan, key_material)?;
+    // Select only files under this root before building a single extent index.
+    // Paths and traversal limits match the staged directory publisher.
+    let mut sizes = BTreeMap::new();
+    let mut directories = vec![(path.to_owned(), 0usize)];
+    let mut entries = 1u64;
+    while let Some((folder, depth)) = directories.pop() {
+        if depth > crate::tree::MAX_TREE_DEPTH {
+            bail!("Backup directory tree is too deep");
+        }
+        for entry in index.list_directory(&folder)? {
+            crate::progress::checkpoint()?;
+            entries += 1;
+            if entries > crate::tree::MAX_TREE_ENTRIES {
+                bail!("Backup directory tree has too many entries");
+            }
+            crate::tree::validate_component(&entry.name)?;
+            let child = crate::tree::source_child(&folder, &entry.name);
+            match entry.dirent_type {
+                4 => directories.push((child, depth + 1)),
+                8 => {
+                    sizes.insert(entry.object_id, index.resolve_path(&child)?.logical_size);
+                }
+                _ => {}
+            }
+        }
+    }
+    let images = crate::inception::StreamImage::build_many(stream, &plan, &sizes, key_material)?;
     extract_directory_tree(
+        Some(stream),
+        &format!(
+            "{} · {} ({})",
+            stream.display(),
+            plan.target.dataset_name,
+            guid_string(plan.target.to_guid)
+        ),
         path,
         output,
         force,
         |directory| index.list_directory(directory),
         |source, destination| {
-            let resolved = index.resolve_path(source)?;
-            extract_resolved_snapshot(
-                stream,
-                &plan,
-                &index,
-                resolved,
-                destination,
-                false,
-                key_material,
-                false,
-            )
-            .map(|sidecar| sidecar.logical_size)
+            let id = index.resolve_path(source)?.object_id;
+            images
+                .get(&id)
+                .context("File missing from tree index")?
+                .restore_staged(destination)
         },
     )
 }
@@ -290,34 +313,38 @@ pub fn snapshots(stream: &Path) -> Result<Vec<BeginRecord>> {
 }
 
 pub fn apply_encryption_requirement(stream: &Path) -> Result<Option<EncryptionRequirement>> {
+    let (header, params) = incremental_header(stream)?;
+    params
+        .map(|params| {
+            Ok(EncryptionRequirement {
+                dataset_name: header.dataset_name,
+                key_format: params.key_format_name()?.to_owned(),
+            })
+        })
+        .transpose()
+}
+
+fn incremental_header(stream: &Path) -> Result<(BeginRecord, Option<EncryptionParams>)> {
     let file = File::open(stream).with_context(|| format!("opening {}", stream.display()))?;
     let mut reader = StreamReader::new(file);
-    let mut requirement = None;
-    let mut substreams = 0_u32;
+    let mut header = None;
     while let Some(record) = reader.next_record()? {
-        if let RecordKind::Begin(header) = record.kind
-            && header.header_type == DMU_SUBSTREAM
+        if let RecordKind::Begin(begin) = record.kind
+            && begin.header_type == DMU_SUBSTREAM
         {
-            substreams += 1;
-            if substreams > 1 {
+            if header.is_some() {
                 bail!("apply accepts exactly one incremental snapshot substream");
             }
-            if header.features & FEATURE_RAW != 0 {
-                let params = EncryptionParams::from_begin_payload(&record.payload)?;
-                requirement = Some(EncryptionRequirement {
-                    dataset_name: header.dataset_name,
-                    key_format: params.key_format_name()?.to_owned(),
-                });
-            }
+            let params = (begin.features & FEATURE_RAW != 0)
+                .then(|| EncryptionParams::from_begin_payload(&record.payload))
+                .transpose()?;
+            header = Some((begin, params));
         }
     }
     if !reader.saw_end() {
         bail!("incremental stream has no END record");
     }
-    if substreams == 0 {
-        bail!("incremental stream has no snapshot substream");
-    }
-    Ok(requirement)
+    header.context("incremental stream has no snapshot substream")
 }
 
 pub fn apply_incremental(stream: &Path, target: &Path) -> Result<Sidecar> {
@@ -329,6 +356,7 @@ pub fn apply_incremental_with_key(
     target: &Path,
     key_material: Option<&[u8]>,
 ) -> Result<Sidecar> {
+    let publication = RestoreDestination::prepare(Some(stream), target, true, true)?;
     let sidecar_path = sidecar_path(target);
     let sidecar_file = File::open(&sidecar_path).with_context(|| {
         format!(
@@ -344,14 +372,13 @@ pub fn apply_incremental_with_key(
             sidecar.format_version
         );
     }
-    let current_hash = sha256_file(target)?;
+    let (current_size, current_hash) = file_digest(target)?;
     if current_hash != sidecar.sha256 {
         bail!(
             "target {} does not match the extracted base file (SHA-256 differs)",
             target.display()
         );
     }
-    let current_size = fs::metadata(target)?.len();
     if current_size != sidecar.logical_size {
         bail!(
             "target size is {current_size}, but extraction metadata expects {}",
@@ -359,8 +386,24 @@ pub fn apply_incremental_with_key(
         );
     }
 
-    if apply_encryption_requirement(stream)?.is_some() {
-        return apply_raw_incremental(stream, target, sidecar, key_material);
+    let (incoming, params) = incremental_header(stream)?;
+    // The update may have committed just before the process or its progress
+    // channel stopped. The verified pair already represents this snapshot.
+    if incoming.from_guid != 0 && guid_string(incoming.to_guid) == sidecar.snapshot_guid {
+        if let Some(params) = params {
+            let raw = sidecar
+                .raw_state
+                .as_ref()
+                .context("missing raw authentication state")?;
+            if raw.crypto_guid != params.guid || raw.crypto_version != params.version {
+                bail!("raw incremental encryption identity does not match the extracted base");
+            }
+            params.unlock(key_material.context("raw incremental send requires a key")?)?;
+        }
+        return Ok(sidecar);
+    }
+    if params.is_some() {
+        return apply_raw_incremental(stream, target, sidecar, key_material, publication);
     }
 
     let mut source = File::open(target)?;
@@ -482,13 +525,12 @@ pub fn apply_incremental_with_key(
     // original file open without a compatible delete share. Release the base
     // handle before the atomic tempfile persist.
     drop(source);
-    persist_replace(temporary, target, true)?;
 
     sidecar.logical_size = new_size;
     sidecar.snapshot_guid = guid_string(begin.to_guid);
-    sidecar.sha256 = sha256_file(target)?;
+    sidecar.sha256 = file_digest(temporary.path())?.1;
     sidecar.raw_state = None;
-    save_sidecar(target, &sidecar)?;
+    publication.file(temporary, Some(&sidecar))?;
     Ok(sidecar)
 }
 
@@ -497,6 +539,7 @@ fn apply_raw_incremental(
     target: &Path,
     mut sidecar: Sidecar,
     key_material: Option<&[u8]>,
+    publication: RestoreDestination,
 ) -> Result<Sidecar> {
     let key_material =
         key_material.ok_or_else(|| anyhow!("raw incremental send requires a key"))?;
@@ -758,15 +801,14 @@ fn apply_raw_incremental(
     temporary.as_file_mut().set_len(new_size)?;
     temporary.as_file_mut().sync_all()?;
     drop(source);
-    persist_replace(temporary, target, true)?;
 
     raw_state.dnodes = raw_dnodes.into_values().collect();
     raw_state.target_spill = target_spill;
     sidecar.logical_size = new_size;
     sidecar.snapshot_guid = guid_string(begin.to_guid);
-    sidecar.sha256 = sha256_file(target)?;
+    sidecar.sha256 = file_digest(temporary.path())?.1;
     sidecar.raw_state = Some(raw_state);
-    save_sidecar(target, &sidecar)?;
+    publication.file(temporary, Some(&sidecar))?;
     Ok(sidecar)
 }
 
@@ -1032,53 +1074,27 @@ fn replace_file_extent(file: &mut File, offset: u64, length: u64, payload: &[u8]
     Ok(())
 }
 
-fn temporary_for(path: &Path) -> Result<NamedTempFile> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    fs::create_dir_all(parent)?;
-    NamedTempFile::new_in(parent)
-        .with_context(|| format!("creating temporary file in {}", parent.display()))
-}
-
-fn persist_replace(temporary: NamedTempFile, path: &Path, force: bool) -> Result<()> {
-    if path.exists() && !force {
-        bail!("{} already exists", path.display());
-    }
-    temporary
-        .persist(path)
-        .map_err(|error| anyhow!("persisting {}: {}", path.display(), error.error))?;
-    Ok(())
-}
-
-pub(crate) fn save_sidecar(target: &Path, sidecar: &Sidecar) -> Result<()> {
-    let path = sidecar_path(target);
-    let mut temporary = temporary_for(&path)?;
-    serde_json::to_writer_pretty(temporary.as_file_mut(), sidecar)?;
-    temporary.as_file_mut().write_all(b"\n")?;
-    temporary.as_file_mut().sync_all()?;
-    persist_replace(temporary, &path, true)
-}
-
 pub(crate) fn sidecar_path(target: &Path) -> PathBuf {
     let mut name: OsString = target.as_os_str().to_owned();
     name.push(".zfse.json");
     PathBuf::from(name)
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
+pub(crate) fn file_digest(path: &Path) -> Result<(u64, String)> {
     let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 128 * 1024];
+    let mut length = 0;
     loop {
+        crate::progress::checkpoint()?;
         let count = file.read(&mut buffer)?;
         if count == 0 {
             break;
         }
         digest.update(&buffer[..count]);
+        length += count as u64;
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok((length, format!("{:x}", digest.finalize())))
 }
 
 pub(crate) fn guid_string(guid: u64) -> String {

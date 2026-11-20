@@ -16,8 +16,8 @@ cp packaging/icons/ZFSExplore.icns "$APP/Contents/Resources/"
 cargo build --release --locked --target "$RUST_TARGET" --bin zfs-send-extract --bin zfs-explore-service
 swiftc -parse-as-library -O -target "$ARCH-apple-macosx14.0" \
   -o "$APP/Contents/MacOS/ZFSExplore" macos/ZFSExplore.swift macos/SnapshotTime.swift macos/AttachedDrives.swift
-cp "target/$RUST_TARGET/release/zfs-explore-service" "$APP/Contents/MacOS/"
-cp "target/$RUST_TARGET/release/zfs-send-extract" "$DEST/zfs-send-extract"
+cp "${CARGO_TARGET_DIR:-target}/$RUST_TARGET/release/zfs-explore-service" "$APP/Contents/MacOS/"
+cp "${CARGO_TARGET_DIR:-target}/$RUST_TARGET/release/zfs-send-extract" "$DEST/zfs-send-extract"
 "$DEST/zfs-send-extract" --version
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

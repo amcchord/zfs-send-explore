@@ -8,12 +8,14 @@ use serde_json::{Value, json};
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
+use zfs_send_extract::client::parent_path;
 use zfs_send_extract::client::{InceptionCatalog, SourceCatalog, child_path};
 use zfs_send_extract::filesystem::DirectoryEntry;
 use zfs_send_extract::presentation;
 #[cfg(target_os = "macos")]
 use zfs_send_extract::source::register_authorized_source;
 use zfs_send_extract::source::release_authorized_sources;
+use zfs_send_extract::versions::{ImageLocation, VersionPath};
 
 #[derive(Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
@@ -38,6 +40,13 @@ enum Request {
         name: String,
     },
     Back,
+    Versions {
+        name: String,
+    },
+    OpenVersion {
+        index: usize,
+        name: String,
+    },
     Volume {
         selector: String,
     },
@@ -59,6 +68,7 @@ struct Session {
     source: Option<SourceCatalog>,
     title: String,
     view: usize,
+    choose_dataset: bool,
     path: String,
     key: Option<Zeroizing<Vec<u8>>>,
     layers: Vec<Layer>,
@@ -101,12 +111,37 @@ impl Session {
         self.layers.last().map_or(&self.path, |layer| &layer.path)
     }
 
+    fn version_path(&self, name: &str) -> Result<VersionPath> {
+        let path = child_path(self.current_path(), name)?;
+        let images = self
+            .layers
+            .iter()
+            .map(|layer| {
+                ImageLocation::selected(
+                    &layer.catalog,
+                    layer
+                        .volume
+                        .as_deref()
+                        .context("Choose a partition first")?,
+                )
+            })
+            .collect::<Result<_>>()?;
+        Ok(VersionPath { images, path })
+    }
+
     fn state(&self) -> Result<Value> {
-        let entries = if self.locked() || (self.source.is_none() && self.layers.is_empty()) {
+        let entries = if self.choose_dataset
+            || self.locked()
+            || (self.source.is_none() && self.layers.is_empty())
+        {
             vec![]
         } else {
             self.list(self.current_path())?
         };
+        self.state_with_entries(entries)
+    }
+
+    fn state_with_entries(&self, entries: Vec<DirectoryEntry>) -> Result<Value> {
         let mut entries: Vec<Value> = entries
             .iter()
             .map(|entry| {
@@ -155,7 +190,9 @@ impl Session {
         Ok(json!({
             "title": self.title, "summary": self.source.as_ref().map(|s| &s.summary),
             "description": self.source.as_ref().map(presentation::source_description),
-            "recommended_view": self.source.as_ref().and_then(|s| presentation::recommended_view(&s.views)),
+            "recommended_view": self.source.as_ref().and_then(|s| s.views.get(self.view).and_then(|v| presentation::dataset_choices(&s.views).get(v.dataset.as_str()).copied())).filter(|_| !self.choose_dataset),
+            "choose_dataset": self.choose_dataset,
+            "dataset_choices": self.source.as_ref().map(|s| presentation::dataset_choices(&s.views).into_iter().map(|(name,index)| json!({"name":name,"index":index})).collect::<Vec<_>>()),
             "views": views, "view": self.view, "locked": self.locked(),
             "path": self.current_path(), "entries": entries, "volumes": volumes,
             "volume": layer.and_then(|l| l.volume.as_ref()),
@@ -193,6 +230,7 @@ impl Session {
             Ok(source) => candidate.source = Some(source),
             Err(send_error) => match SourceCatalog::open_pool(source_path) {
                 Ok(source) => candidate.source = Some(source),
+                Err(e) if e.is::<zfs_send_extract::pool::PoolLayout>() => return Err(e),
                 Err(pool_error) => match InceptionCatalog::open_file(source_path, 0, None) {
                     Ok(image) => candidate.layers.push(Self::new_layer(image)),
                     Err(image_error) => bail!(
@@ -217,12 +255,22 @@ impl Session {
             .and_then(|s| presentation::recommended_view(&s.views))
         {
             candidate.view = index;
+        } else {
+            candidate.choose_dataset = candidate.source.is_some();
         }
         let state = candidate.state()?;
         Ok((candidate, state))
     }
 
     fn handle(&mut self, request: Request) -> Result<Value> {
+        if self.choose_dataset
+            && !matches!(
+                &request,
+                Request::Open { .. } | Request::Select { .. } | Request::Close
+            )
+        {
+            bail!("Choose a computer or dataset first");
+        }
         match request {
             Request::Open { path, authorize } => {
                 let source_path = Path::new(&path);
@@ -245,8 +293,10 @@ impl Session {
             }
             Request::Select { index } => {
                 self.source()?.view(index)?;
+                self.source()?.clear_browse_cache();
                 // Switching views always forgets the previous dataset's key and nested readers.
                 let old_view = self.view;
+                let old_choice = std::mem::replace(&mut self.choose_dataset, false);
                 let old_path = std::mem::replace(&mut self.path, "/".into());
                 let old_key = self.key.take();
                 let old_layers = std::mem::take(&mut self.layers);
@@ -255,6 +305,7 @@ impl Session {
                     Ok(state) => Ok(state),
                     Err(e) => {
                         self.view = old_view;
+                        self.choose_dataset = old_choice;
                         self.path = old_path;
                         self.key = old_key;
                         self.layers = old_layers;
@@ -283,20 +334,23 @@ impl Session {
                     bail!("Enter a key or choose a key file");
                 };
                 // Authenticate before retaining the supplied key.
-                self.source()?
-                    .list_directory_with_key_material(self.view, "/", Some(&material))?;
+                let entries = self.source()?.list_directory_with_key_material(
+                    self.view,
+                    "/",
+                    Some(&material),
+                )?;
                 self.key = Some(material);
                 self.path = "/".into();
-                self.state()
+                self.state_with_entries(entries)
             }
             Request::List { path } => {
-                self.list(&path)?;
+                let entries = self.list(&path)?;
                 if let Some(layer) = self.layers.last_mut() {
                     layer.path = path;
                 } else {
                     self.path = path;
                 }
-                self.state()
+                self.state_with_entries(entries)
             }
             Request::Enter { name } => {
                 if self.layers.len() >= 8 {
@@ -327,6 +381,49 @@ impl Session {
                     }
                 }
             }
+            Request::Versions { name } => {
+                let location = self.version_path(&name)?;
+                let versions =
+                    self.source()?
+                        .file_versions(self.view, &location, self.key(), None)?;
+                Ok(json!({"name": name, "versions": versions}))
+            }
+            Request::OpenVersion { index, name } => {
+                let location = self.version_path(&name)?;
+                let opened = self.source()?.open_file_version(
+                    self.view,
+                    index,
+                    &location,
+                    self.key(),
+                    None,
+                )?;
+                let mut path = parent_path(&location.path);
+                let mut layers = Vec::new();
+                for (catalog, selected) in opened.images.into_iter().rev() {
+                    let parent = parent_path(&catalog.path_in_parent);
+                    layers.push(Layer {
+                        volume: Some(catalog.volumes[selected].selector.clone()),
+                        catalog,
+                        path,
+                    });
+                    path = parent;
+                }
+                layers.reverse();
+                // Build and validate the complete replacement before changing navigation.
+                let candidate = Self {
+                    source: self.source.clone(),
+                    title: self.title.clone(),
+                    view: index,
+                    choose_dataset: false,
+                    path,
+                    key: self.key.clone(),
+                    layers,
+                    authorized: self.authorized.clone(),
+                };
+                let state = candidate.state_with_entries(opened.entries)?;
+                *self = candidate;
+                Ok(state)
+            }
             Request::Back => {
                 if self.layers.len() <= usize::from(self.source.is_none()) {
                     bail!("Already at the source");
@@ -350,10 +447,10 @@ impl Session {
                 {
                     bail!("Choose a supported filesystem volume");
                 }
-                layer.catalog.list_directory(Some(&selector), "/")?;
+                let entries = layer.catalog.list_directory(Some(&selector), "/")?;
                 layer.volume = Some(selector);
                 layer.path = "/".into();
-                self.state()
+                self.state_with_entries(entries)
             }
             Request::Extract { name, destination } => {
                 let entry = self
@@ -362,6 +459,20 @@ impl Session {
                     .find(|e| e.name == name)
                     .context("Select an existing file or folder first")?;
                 let path = child_path(self.current_path(), &name)?;
+                let origin = self
+                    .source
+                    .as_ref()
+                    .and_then(|s| s.views.get(self.view))
+                    .map(|v| v.label.as_str())
+                    .unwrap_or(&self.title);
+                let source = match self.layers.last() {
+                    Some(layer) => format!(
+                        "{origin} · {} · {}",
+                        layer.catalog.image_path,
+                        layer.volume.as_deref().unwrap_or("")
+                    ),
+                    None => origin.to_owned(),
+                };
                 let destination = Path::new(&destination);
                 // Never overwrite from the desktop bridge, even after a Save dialog replacement prompt.
                 if std::fs::symlink_metadata(destination).is_ok() {
@@ -387,8 +498,8 @@ impl Session {
                         )?
                     };
                     Ok(
-                        json!({"restored": destination, "bytes": result.logical_bytes, "files": result.files,
-                        "skipped": result.skipped_entries}),
+                        json!({"restored": destination, "source": source, "source_path": path, "bytes": result.logical_bytes, "files": result.files,
+                        "report": destination.join(&result.report_name), "skipped": result.skipped_entries}),
                     )
                 } else if entry.dirent_type == 8 {
                     let result = if let Some(layer) = self.layers.last() {
@@ -405,7 +516,7 @@ impl Session {
                         )?
                     };
                     Ok(
-                        json!({"restored": destination, "bytes": result.logical_size, "sha256": result.sha256, "files": 1, "skipped": 0}),
+                        json!({"restored": destination, "source": source, "source_path": path, "bytes": result.logical_size, "sha256": result.sha256, "files": 1, "skipped": 0}),
                     )
                 } else {
                     bail!(
@@ -572,12 +683,71 @@ fn authorize_device(_path: &Path) -> Result<()> {
     bail!("Device authorization is only available on macOS")
 }
 
-fn main() -> Result<()> {
-    let mut session = Session::default();
-    let mut input = std::io::stdin().lock();
+/// Each complete JSON line is written under one lock, including progress events.
+fn emit(value: Value) -> Result<()> {
     let mut output = std::io::stdout().lock();
+    serde_json::to_writer(&mut output, &value)?;
+    output.write_all(b"\n")?;
+    output.flush()?;
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex, mpsc::sync_channel};
+    use zfs_send_extract::progress::JobControl;
+
+    // The input thread must keep reading cancellation while the session worker
+    // owns a blocking filesystem operation. Callers without job IDs retain the
+    // original one-request, one-response protocol.
+    #[derive(Deserialize)]
+    struct Header {
+        method: String,
+        job: Option<String>,
+    }
+    type Work = (Zeroizing<Vec<u8>>, Option<String>, JobControl);
+    let (send, receive) = sync_channel::<Work>(1);
+    let jobs = Arc::new(Mutex::new(BTreeMap::<String, JobControl>::new()));
+    let running = jobs.clone();
+    let worker = std::thread::spawn(move || -> Result<()> {
+        let mut session = Session::default();
+        for (line, job, control) in receive {
+            let operation = || {
+                serde_json::from_slice::<Request>(&line)
+                    .context("Invalid desktop request")
+                    .and_then(|request| session.handle(request))
+            };
+            let result = if let Some(id) = job.clone() {
+                control.run(
+                    move |progress| {
+                        let _ = emit(json!({"job":id, "progress":progress}));
+                    },
+                    operation,
+                )
+            } else {
+                let mut operation = operation;
+                operation()
+            };
+            if let Some(id) = job {
+                running.lock().unwrap().remove(&id);
+            }
+            let response = match result {
+                Ok(value) => json!({"ok": true, "result": value}),
+                Err(_) if control.is_cancelled() => {
+                    json!({"ok":false,"title":"Operation cancelled","message":"You can try again when you are ready.","error":"Operation cancelled"})
+                }
+                Err(error) => {
+                    let raw = format!("{error:#}");
+                    let friendly = presentation::friendly_error(&raw);
+                    json!({"ok": false, "error": raw, "title": friendly.title, "message": friendly.message})
+                }
+            };
+            emit(response)?;
+        }
+        Ok(())
+    });
+    let mut input = std::io::stdin().lock();
     loop {
-        // Bound a request, including an accidentally pasted oversized key.
         let mut line = Zeroizing::new(Vec::new());
         let length = (&mut input)
             .take(64 * 1024 + 1)
@@ -588,21 +758,31 @@ fn main() -> Result<()> {
         if length > 64 * 1024 {
             bail!("Desktop request exceeds 64 KiB");
         }
-        let result = serde_json::from_slice::<Request>(&line)
-            .context("Invalid desktop request")
-            .and_then(|request| session.handle(request));
-        let response = match result {
-            Ok(value) => json!({"ok": true, "result": value}),
-            // Do not echo the original JSON request (it may contain credentials).
-            Err(error) => {
-                let raw = format!("{error:#}");
-                let friendly = presentation::friendly_error(&raw);
-                json!({"ok": false, "error": raw, "title": friendly.title, "message": friendly.message})
+        let header = serde_json::from_slice::<Header>(&line).ok();
+        if let Some(Header {
+            ref method,
+            ref job,
+        }) = header
+            && method == "cancel"
+        {
+            if let Some(control) = job
+                .as_ref()
+                .and_then(|id| jobs.lock().unwrap().get(id).cloned())
+            {
+                control.cancel();
             }
-        };
-        serde_json::to_writer(&mut output, &response)?;
-        output.write_all(b"\n")?;
-        output.flush()?;
+            continue;
+        }
+        let job = header.and_then(|h| h.job);
+        let control = JobControl::default();
+        if let Some(id) = &job {
+            jobs.lock().unwrap().insert(id.clone(), control.clone());
+        }
+        send.send((line, job, control))
+            .map_err(|_| anyhow::anyhow!("Desktop worker stopped"))?;
     }
-    Ok(())
+    drop(send);
+    worker
+        .join()
+        .map_err(|_| anyhow::anyhow!("Desktop worker stopped"))?
 }

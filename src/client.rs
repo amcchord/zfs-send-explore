@@ -4,7 +4,7 @@
 //! every method on a worker thread, then send the small catalog or directory
 //! result back to its event loop.
 
-use crate::filesystem::DirectoryEntry;
+use crate::filesystem::{DirectoryEntry, ObjectIndex, plan_snapshot};
 use crate::inception::{DiskContainerKind, InceptionSession, VolumeInfo};
 use crate::operations::{self, EncryptionRequirement, Sidecar};
 use crate::pool::{PoolExtraction, PoolMember};
@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use zeroize::Zeroizing;
 
 /// The two read-only backup sources understood by the application.
@@ -76,9 +76,66 @@ impl SourceView {
     }
 }
 
+/// Identify the file incarnation as well as ordinary edits to its contents.
+#[derive(Debug, PartialEq, Eq)]
+struct SendStamp {
+    identity: (u64, u64),
+    length: u64,
+    modified: std::time::SystemTime,
+}
+
+impl SendStamp {
+    fn read(path: &Path) -> Result<Self> {
+        let file = File::open(path)?;
+        let meta = file.metadata()?;
+        #[cfg(unix)]
+        let identity = {
+            use std::os::unix::fs::MetadataExt;
+            (meta.dev(), meta.ino())
+        };
+        #[cfg(windows)]
+        let identity = {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::{
+                BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+            };
+            let mut info = BY_HANDLE_FILE_INFORMATION::default();
+            // SAFETY: file owns its handle throughout the call and info is a writable output.
+            if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            (
+                u64::from(info.dwVolumeSerialNumber),
+                (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+            )
+        };
+        Ok(Self {
+            identity,
+            length: meta.len(),
+            modified: meta.modified()?,
+        })
+    }
+}
+
+struct BrowseIndex {
+    stamp: SendStamp,
+    selector: String,
+    key: Option<Zeroizing<Vec<u8>>>,
+    index: ObjectIndex,
+}
+
+impl std::fmt::Debug for BrowseIndex {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fmt.debug_struct("BrowseIndex")
+            .field("selector", &self.selector)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Lightweight description retained by the UI after opening a source.
 #[derive(Debug, Clone)]
 pub struct SourceCatalog {
+    browse_index: Arc<Mutex<Option<BrowseIndex>>>,
     pub kind: SourceKind,
     pub path: PathBuf,
     pub title: String,
@@ -101,6 +158,10 @@ pub struct ClientExtraction {
 pub struct InceptionCatalog {
     pub image_path: String,
     pub image_offset: u64,
+    /// Path inside the immediate parent, without the composed display breadcrumb.
+    pub path_in_parent: String,
+    /// Keep explicit image windows while allowing an unbounded image to grow across snapshots.
+    pub requested_length: Option<u64>,
     pub stored_size: u64,
     pub disk_size: u64,
     pub container: DiskContainerKind,
@@ -112,11 +173,11 @@ impl InceptionCatalog {
     /// Inspect a standalone raw, QCOW2, or VMDK image without attaching or
     /// mounting it in Windows.
     pub fn open_file(path: &Path, image_offset: u64, image_length: Option<u64>) -> Result<Self> {
-        Self::from_session(InceptionSession::from_file_at(
-            path,
-            image_offset,
+        Self::from_session(
+            InceptionSession::from_file_at(path, image_offset, image_length)?,
+            &path.to_string_lossy(),
             image_length,
-        )?)
+        )
     }
 
     /// Descend into another disk-image file in the active inner filesystem.
@@ -127,17 +188,36 @@ impl InceptionCatalog {
         image_offset: u64,
         image_length: Option<u64>,
     ) -> Result<Self> {
-        Self::from_session(self.session.inspect_child_image_at(
-            volume,
+        Self::from_session(
+            self.session
+                .inspect_child_image_at(volume, image_path, image_offset, image_length)?,
             image_path,
-            image_offset,
             image_length,
-        )?)
+        )
     }
 
-    fn from_session(session: InceptionSession) -> Result<Self> {
+    fn from_session(
+        session: InceptionSession,
+        path_in_parent: &str,
+        requested_length: Option<u64>,
+    ) -> Result<Self> {
+        if !session
+            .volumes()
+            .iter()
+            .any(|volume| volume.filesystem.is_some())
+        {
+            let reasons = session
+                .volumes()
+                .iter()
+                .filter_map(|volume| volume.diagnostic.as_deref())
+                .collect::<Vec<_>>()
+                .join("; ");
+            bail!("No readable filesystem in this disk image. {reasons}");
+        }
         let session = Arc::new(session);
         Ok(Self {
+            path_in_parent: path_in_parent.to_owned(),
+            requested_length,
             image_path: session.image_path().to_owned(),
             image_offset: session.image_offset(),
             stored_size: session.stored_size(),
@@ -146,6 +226,10 @@ impl InceptionCatalog {
             volumes: session.volumes().to_vec(),
             session,
         })
+    }
+
+    pub fn file_length(&self, selector: &str, path: &str) -> Result<u64> {
+        self.session.file_length(selector, path)
     }
 
     /// List a directory through the already-inspected virtual disk. Retaining
@@ -164,6 +248,7 @@ impl InceptionCatalog {
         force: bool,
     ) -> Result<ClientExtraction> {
         let extraction = self.session.extract(volume, path, destination, force)?;
+        crate::progress::completed_file();
         Ok(ClientExtraction {
             logical_size: extraction.logical_size,
             sha256: extraction.sha256,
@@ -197,7 +282,10 @@ impl SourceCatalog {
         } else {
             BTreeMap::new()
         };
-        let views = inspection
+        // The stream's replay order puts each available base before its incremental.
+        // The depth breaks ties when several points share the one-second ZFS timestamp.
+        let mut depths = BTreeMap::new();
+        let mut ranked = inspection
             .snapshots
             .iter()
             .map(|snapshot| {
@@ -212,31 +300,39 @@ impl SourceCatalog {
                 } else {
                     "incremental"
                 };
-                SourceView {
-                    label: format!("{}  —  {relation}, {mode}", snapshot.dataset_name),
-                    created_at: (snapshot.creation_time > 0).then_some(snapshot.creation_time),
-                    selector: format!("0x{:016x}", snapshot.to_guid),
-                    update_eligible: true,
-                    encrypted: snapshot.features & FEATURE_RAW != 0,
-                    key_format: requirements
-                        .get(&snapshot.to_guid)
-                        .map(|requirement| requirement.key_format.clone()),
-                    kind: if snapshot.from_guid == 0 {
-                        ViewKind::FullSend
-                    } else {
-                        ViewKind::IncrementalSend
+                let depth = depths.get(&snapshot.from_guid).map_or(0usize, |n| n + 1);
+                depths.insert(snapshot.to_guid, depth);
+                (
+                    depth,
+                    SourceView {
+                        label: format!("{}  —  {relation}, {mode}", snapshot.dataset_name),
+                        created_at: (snapshot.creation_time > 0).then_some(snapshot.creation_time),
+                        selector: format!("0x{:016x}", snapshot.to_guid),
+                        update_eligible: true,
+                        encrypted: snapshot.features & FEATURE_RAW != 0,
+                        key_format: requirements
+                            .get(&snapshot.to_guid)
+                            .map(|requirement| requirement.key_format.clone()),
+                        kind: if snapshot.from_guid == 0 {
+                            ViewKind::FullSend
+                        } else {
+                            ViewKind::IncrementalSend
+                        },
+                        dataset,
+                        snapshot: name,
+                        parent: false,
                     },
-                    dataset,
-                    snapshot: name,
-                    parent: false,
-                }
+                )
             })
             .collect::<Vec<_>>();
+        ranked.sort_by_key(|(depth, view)| std::cmp::Reverse((view.created_at, *depth)));
+        let views: Vec<_> = ranked.into_iter().map(|(_, view)| view).collect();
         let title = path.file_name().map_or_else(
             || path.display().to_string(),
             |name| name.to_string_lossy().into(),
         );
         Ok(Self {
+            browse_index: Default::default(),
             kind: SourceKind::SendStream,
             path: path.to_owned(),
             title,
@@ -294,6 +390,7 @@ impl SourceCatalog {
         snapshots.sort_by(|a, b| {
             b.creation_time
                 .cmp(&a.creation_time)
+                .then_with(|| b.creation_txg.cmp(&a.creation_txg))
                 .then_with(|| a.full_name.cmp(&b.full_name))
         });
         let mut encrypted_datasets = BTreeMap::new();
@@ -357,6 +454,7 @@ impl SourceCatalog {
             _ => "ZFS pool",
         };
         Ok(Self {
+            browse_index: Default::default(),
             kind: SourceKind::PoolMember,
             path: path.to_owned(),
             title: format!("{vendor} — {}", inspection.pool_name),
@@ -386,6 +484,55 @@ impl SourceCatalog {
             .ok_or_else(|| anyhow!("selected source view {index} no longer exists"))
     }
 
+    /// Drop decrypted metadata when the user locks, switches or closes a view.
+    pub fn clear_browse_cache(&self) {
+        *self.browse_index.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    fn send_requirement(view: &SourceView) -> Option<EncryptionRequirement> {
+        view.key_format
+            .as_ref()
+            .map(|format| EncryptionRequirement {
+                dataset_name: view.dataset.clone(),
+                key_format: format.clone(),
+            })
+    }
+
+    fn list_send(
+        &self,
+        view: &SourceView,
+        path: &str,
+        key: Option<Zeroizing<Vec<u8>>>,
+    ) -> Result<Vec<DirectoryEntry>> {
+        let mut current = self
+            .browse_index
+            .lock()
+            .map_err(|_| anyhow!("Send directory index unavailable"))?;
+        let stamp = SendStamp::read(&self.path)?;
+        if let Some(cached) = current.as_ref()
+            && cached.selector == view.selector
+            && cached.stamp == stamp
+            && cached.key == key
+        {
+            return cached.index.list_directory(path);
+        }
+        *current = None;
+        let plan = plan_snapshot(&self.path, Some(&view.selector))?;
+        let index =
+            ObjectIndex::build_plan_with_key(&self.path, &plan, key.as_deref().map(Vec::as_slice))?;
+        if SendStamp::read(&self.path)? != stamp {
+            bail!("Backup changed while reading its index. Reopen the backup.");
+        }
+        let entries = index.list_directory(path)?;
+        *current = Some(BrowseIndex {
+            stamp,
+            selector: view.selector.clone(),
+            key,
+            index,
+        });
+        Ok(entries)
+    }
+
     /// List one directory. `key_file` is consulted only for an encrypted
     /// source and is never retained in the catalog.
     pub fn list_directory(
@@ -397,13 +544,8 @@ impl SourceCatalog {
         let view = self.view(view_index)?;
         match self.kind {
             SourceKind::SendStream => {
-                let key = key_for_snapshot(&self.path, &view.selector, key_file)?;
-                operations::list_directory_snapshot_with_key(
-                    &self.path,
-                    path,
-                    Some(&view.selector),
-                    key.as_deref().map(Vec::as_slice),
-                )
+                let key = read_key_for_requirement(Self::send_requirement(view), key_file)?;
+                self.list_send(view, path, key)
             }
             SourceKind::PoolMember => {
                 let pool = self.open_pool_member()?;
@@ -427,15 +569,8 @@ impl SourceCatalog {
         let view = self.view(view_index)?;
         match self.kind {
             SourceKind::SendStream => {
-                let requirement =
-                    operations::encryption_requirement(&self.path, Some(&view.selector))?;
-                let key = key_material_for_requirement(requirement, key_material)?;
-                operations::list_directory_snapshot_with_key(
-                    &self.path,
-                    path,
-                    Some(&view.selector),
-                    key.as_deref().map(Vec::as_slice),
-                )
+                let key = key_material_for_requirement(Self::send_requirement(view), key_material)?;
+                self.list_send(view, path, key)
             }
             SourceKind::PoolMember => {
                 let pool = self.open_pool_member()?;
@@ -634,23 +769,15 @@ impl SourceCatalog {
         image_offset: u64,
         image_length: Option<u64>,
     ) -> Result<InceptionCatalog> {
-        let session = Arc::new(self.open_inception(
+        let session = self.open_inception(
             view_index,
             image_path,
             key_file,
             agent_password_file,
             key_stash_path,
             (image_offset, image_length),
-        )?);
-        Ok(InceptionCatalog {
-            image_path: session.image_path().to_owned(),
-            image_offset: session.image_offset(),
-            stored_size: session.stored_size(),
-            disk_size: session.image_size(),
-            container: session.container(),
-            volumes: session.volumes().to_vec(),
-            session,
-        })
+        )?;
+        InceptionCatalog::from_session(session, image_path, image_length)
     }
 
     /// Inspect a nested image with credentials entered directly by the UI.
@@ -699,7 +826,7 @@ impl SourceCatalog {
                 )?
             }
         };
-        InceptionCatalog::from_session(session)
+        InceptionCatalog::from_session(session, image_path, image_length)
     }
 
     fn open_inception(
@@ -909,6 +1036,7 @@ fn read_secret_file(
 }
 
 fn extraction_from_sidecar(sidecar: Sidecar) -> ClientExtraction {
+    crate::progress::completed_file();
     ClientExtraction {
         logical_size: sidecar.logical_size,
         sha256: sidecar.sha256,
@@ -917,6 +1045,7 @@ fn extraction_from_sidecar(sidecar: Sidecar) -> ClientExtraction {
 }
 
 fn extraction_from_pool(extraction: PoolExtraction) -> ClientExtraction {
+    crate::progress::completed_file();
     ClientExtraction {
         logical_size: extraction.logical_size,
         sha256: extraction.sha256,
@@ -1006,6 +1135,8 @@ mod tests {
             .unwrap(),
         );
         let catalog = InceptionCatalog {
+            path_in_parent: session.image_path().to_owned(),
+            requested_length: None,
             image_path: session.image_path().to_owned(),
             image_offset: session.image_offset(),
             stored_size: session.stored_size(),
@@ -1046,6 +1177,8 @@ mod tests {
                 .unwrap(),
         );
         let catalog = InceptionCatalog {
+            path_in_parent: session.image_path().to_owned(),
+            requested_length: None,
             image_path: session.image_path().to_owned(),
             image_offset: session.image_offset(),
             stored_size: session.stored_size(),
@@ -1097,6 +1230,109 @@ mod tests {
             b"hello from the base snapshot\n"
         );
         assert!(!target.join("hello.txt.zfse.json").exists());
+    }
+
+    #[test]
+    fn send_browsing_reuses_only_the_current_authenticated_file_index() {
+        use crate::progress::{JobControl, Progress};
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let lab = tempfile::tempdir().unwrap();
+        let stream = lab.path().join("backup.zfs");
+        let fixture = Path::new("tests/fixtures/encrypted-raw-s1.zfs");
+        std::fs::copy(fixture, &stream).unwrap();
+        let catalog = SourceCatalog::open_send(&stream).unwrap();
+        let key = Some(b"zfs-send-fixture-passphrase".as_slice());
+        let list = |key, path| {
+            let count = Rc::new(Cell::new(0));
+            let observer = count.clone();
+            let result = JobControl::default().run(
+                move |p: Progress| observer.set(p.read_bytes),
+                || catalog.list_directory_with_key_material(0, path, key),
+            );
+            (result, count.get())
+        };
+        let (root, first_read) = list(key, "/");
+        assert!(root.is_ok() && first_read >= std::fs::metadata(&stream).unwrap().len());
+        let (other, read) = list(key, "/docs");
+        assert!(other.is_ok() && read == 0);
+        assert!(list(Some(b"wrong"), "/").0.is_err());
+        assert!(list(key, "/").1 > 0);
+        std::fs::rename(&stream, lab.path().join("previous")).unwrap();
+        std::fs::copy(fixture, &stream).unwrap();
+        assert!(list(key, "/docs").1 > 0);
+    }
+
+    #[test]
+    fn send_tree_uses_one_extent_scan_and_authenticates_encrypted_data() {
+        use crate::progress::JobControl;
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let lab = tempfile::tempdir().unwrap();
+        let stream = Path::new("tests/fixtures/tiny-full.zfs");
+        let work = Rc::new(Cell::new((0, 0)));
+        let stats = work.clone();
+        JobControl::default()
+            .run(
+                move |p| stats.set((p.read_bytes, p.files)),
+                || {
+                    crate::operations::extract_tree_snapshot_with_key(
+                        stream,
+                        "/",
+                        &lab.path().join("plain"),
+                        false,
+                        None,
+                        None,
+                    )
+                },
+            )
+            .unwrap();
+        let size = std::fs::metadata(stream).unwrap().len();
+        let (read, files) = work.get();
+        assert_eq!(files, 3);
+        // Catalog pass, metadata pass, and one extent scan plus selected payloads.
+        assert!(
+            (3 * size..4 * size).contains(&read),
+            "{read} bytes read for a {size}-byte send"
+        );
+        let output = lab.path().join("encrypted");
+        crate::operations::extract_tree_snapshot_with_key(
+            Path::new("tests/fixtures/encrypted-raw-s1.zfs"),
+            "/",
+            &output,
+            false,
+            None,
+            Some(b"zfs-send-fixture-passphrase"),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(output.join("docs/hello.txt")).unwrap(),
+            b"encrypted hello\n"
+        );
+    }
+
+    #[test]
+    fn cancelled_folder_restore_can_be_retried() {
+        use crate::progress::JobControl;
+        let stream = Path::new("tests/fixtures/tiny-full.zfs");
+        let catalog = SourceCatalog::open_send(stream).unwrap();
+        let lab = tempfile::tempdir().unwrap();
+        let destination = lab.path().join("restored");
+        let control = JobControl::default();
+        let cancel = control.clone();
+        let result = control.run(
+            move |_| cancel.cancel(),
+            || catalog.extract_tree(0, "/", &destination, false, None),
+        );
+        assert!(result.is_err());
+        assert!(!destination.exists());
+        assert_eq!(
+            catalog
+                .extract_tree(0, "/", &destination, false, None)
+                .unwrap()
+                .files,
+            3
+        );
     }
 
     fn small_fat12_image() -> Vec<u8> {

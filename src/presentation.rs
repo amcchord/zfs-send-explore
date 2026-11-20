@@ -33,8 +33,16 @@ pub fn view_detail(view: &SourceView) -> String {
             view.snapshot.as_deref().unwrap_or("snapshot")
         ),
         ViewKind::Current => format!("{name} · live files, not a snapshot"),
-        ViewKind::FullSend => format!("{name} · full copy"),
-        ViewKind::IncrementalSend => format!("{name} · changes only"),
+        ViewKind::FullSend if view.created_at.is_none() => format!("{name} · full copy"),
+        ViewKind::IncrementalSend if view.created_at.is_none() => format!("{name} · changes only"),
+        ViewKind::FullSend => format!(
+            "{name} · {} · full copy",
+            view.snapshot.as_deref().unwrap_or("snapshot")
+        ),
+        ViewKind::IncrementalSend => format!(
+            "{name} · {} · changes only",
+            view.snapshot.as_deref().unwrap_or("snapshot")
+        ),
     }
 }
 
@@ -74,16 +82,28 @@ pub fn short_name(dataset: &str) -> &str {
     dataset.rsplit('/').next().unwrap_or(dataset)
 }
 
-/// Index of the restore point a first-time user most likely wants: the newest
-/// dated snapshot of a dataset that holds files, else the first view.
+/// One initial choice per dataset, preferring its newest captured point over its head.
+pub fn dataset_choices(views: &[SourceView]) -> std::collections::BTreeMap<&str, usize> {
+    let mut choices = std::collections::BTreeMap::<&str, usize>::new();
+    for (index, view) in views.iter().enumerate().filter(|(_, view)| !view.parent) {
+        let priority = |v: &SourceView| (v.kind != ViewKind::Current, v.created_at);
+        let best = choices.entry(&view.dataset).or_insert(index);
+        // A tied view already appears in ancestry/transaction order.
+        if priority(view) > priority(&views[*best]) {
+            *best = index;
+        }
+    }
+    choices
+}
+
+/// An automatic selection is appropriate only when one dataset is plausible.
 pub fn recommended_view(views: &[SourceView]) -> Option<usize> {
-    views
-        .iter()
-        .enumerate()
-        .filter(|(_, view)| view.kind != ViewKind::Current && !view.parent)
-        .max_by_key(|(index, view)| (view.created_at.unwrap_or(0), std::cmp::Reverse(*index)))
-        .map(|(index, _)| index)
-        .or_else(|| (!views.is_empty()).then_some(0))
+    let choices = dataset_choices(views);
+    match choices.len() {
+        0 => (!views.is_empty()).then_some(0),
+        1 => choices.values().next().copied(),
+        _ => None,
+    }
 }
 
 const EFI_SYSTEM: &str = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b";
@@ -195,7 +215,14 @@ pub struct FriendlyError {
 /// Turn an engine error into a headline, a next step, and retained details.
 pub fn friendly_error(raw: &str) -> FriendlyError {
     let lower = raw.to_ascii_lowercase();
-    let (title, message) = if lower.contains("could not open this backup")
+    let (title, message) = if lower.starts_with("pool layout for ") {
+        ("This pool layout needs a different recovery source", raw)
+    } else if lower.contains("compressed backup download") {
+        (
+            "Expand this backup first",
+            "Decompress the download, then open the expanded image or send file. For a .zst file, use zstd -d or a Zstandard-compatible archive tool.",
+        )
+    } else if lower.contains("could not open this backup")
         || lower.contains("source was not recognized")
     {
         (
@@ -290,6 +317,7 @@ mod tests {
             offset: 0,
             length,
             partition_type: kind.to_owned(),
+            partition_guid: None,
             name: String::new(),
             filesystem,
             diagnostic: None,

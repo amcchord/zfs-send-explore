@@ -1,6 +1,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 mod dialogs;
+mod history;
 
 use anyhow::{Context, Result, bail};
 use dialogs::{
@@ -39,7 +40,7 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::WindowsProgramming::MulDiv;
 use windows_sys::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, GetSaveFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY,
-    OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 use windows_sys::Win32::UI::Controls::{
     BCM_SETNOTE, BS_COMMANDLINK, ICC_BAR_CLASSES, ICC_LISTVIEW_CLASSES, ICC_STANDARD_CLASSES,
@@ -136,9 +137,14 @@ const ID_HOW_TO: u16 = 138;
 const ID_WELCOME_FILE: u16 = 140;
 const ID_WELCOME_DRIVE: u16 = 141;
 const ID_WELCOME_PATH: u16 = 142;
+const ID_VERSIONS: u16 = 145;
 const ID_TIME_ZONE_BASE: u16 = 10_000;
 
 const WM_JOB_COMPLETE: u32 = WM_APP + 1;
+const WM_JOB_PROGRESS: u32 = WM_APP + 2;
+const ID_CANCEL_JOB: u16 = 188;
+
+use zfs_send_extract::progress::{JobControl, Progress};
 
 // Static control styles (System Services constants, defined here to avoid a feature).
 const SS_NOPREFIX: u32 = 0x0080;
@@ -213,6 +219,7 @@ struct Controls {
     header_title: HWND,
     header_detail: HWND,
     open_backup: HWND,
+    cancel_job: HWND,
     open_drive: HWND,
     close_source: HWND,
     welcome_heading: HWND,
@@ -274,6 +281,9 @@ struct AppState {
     inception: Vec<ImageFrame>,
     settings: UiSettings,
     busy: bool,
+    control: JobControl,
+    activity: String,
+    close_after_job: bool,
     pending_job: Option<PendingJob>,
     /// Friendly name of the physical drive chosen in the drive picker.
     drive_title: Option<(PathBuf, String)>,
@@ -391,6 +401,9 @@ impl Default for AppState {
             inception: Vec::new(),
             settings: load_settings(),
             busy: false,
+            control: JobControl::default(),
+            activity: String::new(),
+            close_after_job: false,
             pending_job: None,
             drive_title: None,
         }
@@ -407,17 +420,28 @@ enum PendingJob {
 }
 
 enum JobResult {
+    FileVersions(
+        zfs_send_extract::versions::VersionPath,
+        Vec<zfs_send_extract::versions::FileVersion>,
+    ),
+    VersionOpened {
+        index: usize,
+        location: zfs_send_extract::versions::VersionPath,
+        opened: zfs_send_extract::versions::OpenedVersion,
+    },
     Catalog(SourceCatalog),
     Directory {
         path: String,
         entries: Vec<DirectoryEntry>,
     },
     Extracted {
+        origin: String,
         destination: PathBuf,
         extraction: ClientExtraction,
         nested: bool,
     },
     TreeExtracted {
+        origin: String,
         destination: PathBuf,
         extraction: RecursiveExtraction,
     },
@@ -640,13 +664,39 @@ unsafe extern "system" fn window_proc(
             handle_notify(&mut *state, lparam);
             0
         }
+        WM_JOB_PROGRESS if !state.is_null() => {
+            let progress = Box::from_raw(lparam as *mut Progress);
+            let state = &*state;
+            if state.busy && !state.control.is_cancelled() {
+                set_status(
+                    state,
+                    &format!(
+                        "{}   {} read · {} written · {} files finished",
+                        state.activity,
+                        presentation::format_size(progress.read_bytes),
+                        presentation::format_size(progress.written_bytes),
+                        progress.files
+                    ),
+                );
+            }
+            0
+        }
         WM_JOB_COMPLETE if !state.is_null() => {
             let result = Box::from_raw(lparam as *mut JobMessage);
-            finish_job(&mut *state, *result);
+            if (*state).close_after_job {
+                DestroyWindow(hwnd);
+            } else {
+                finish_job(&mut *state, *result);
+            }
             0
         }
         WM_CLOSE => {
-            DestroyWindow(hwnd);
+            if !state.is_null() && (*state).busy {
+                (*state).close_after_job = true;
+                cancel_job(&*state);
+            } else {
+                DestroyWindow(hwnd);
+            }
             0
         }
         WM_DESTROY => {
@@ -781,6 +831,8 @@ unsafe fn initialize_window(state: &mut AppState) -> Result<()> {
         SS_ENDELLIPSIS,
     );
     controls.open_backup = button(hwnd, instance, "Open backup…", ID_OPEN_BACKUP, false);
+    controls.cancel_job = button(hwnd, instance, "Cancel", ID_CANCEL_JOB, false);
+    ShowWindow(controls.cancel_job, SW_HIDE);
     controls.open_drive = button(hwnd, instance, "Open drive…", ID_OPEN_DRIVE, false);
     controls.close_source = button(hwnd, instance, "Close", ID_CLOSE_SOURCE, false);
 
@@ -1052,6 +1104,12 @@ unsafe fn create_menus(state: &AppState) {
     append_menu(
         restore_menu,
         MF_STRING,
+        ID_VERSIONS as usize,
+        "Other versions of the selected file…",
+    );
+    append_menu(
+        restore_menu,
+        MF_STRING,
         ID_INCEPTION as usize,
         "Open selected file as a disk image\tCtrl+I",
     );
@@ -1171,6 +1229,9 @@ unsafe fn handle_command(state: &mut AppState, wparam: WPARAM, _lparam: LPARAM) 
     let id = (wparam & 0xffff) as u16;
     let notification = ((wparam >> 16) & 0xffff) as u16;
     if state.busy && !matches!(id, ID_EXIT | ID_ABOUT) {
+        if matches!(id, ID_CANCEL_JOB | ID_LEAVE_IMAGE) {
+            cancel_job(state);
+        }
         return;
     }
     match id {
@@ -1181,6 +1242,9 @@ unsafe fn handle_command(state: &mut AppState, wparam: WPARAM, _lparam: LPARAM) 
         ID_OPEN_IMAGE => choose_source(state, OpenMode::Image),
         ID_CLOSE_SOURCE => close_source(state),
         ID_VIEW if notification == CBN_SELCHANGE as u16 => {
+            if let Some(catalog) = &state.catalog {
+                catalog.clear_browse_cache();
+            }
             leave_all_images(state, false);
             clear_directory_ui(state);
             if ensure_selected_view_key(state) {
@@ -1231,6 +1295,11 @@ unsafe fn handle_command(state: &mut AppState, wparam: WPARAM, _lparam: LPARAM) 
         }
         ID_CLEAR_CREDENTIALS => clear_credentials(state),
         ID_RESTORE => extract_selected(state),
+        ID_VERSIONS => {
+            if let Err(error) = history::find_versions(state) {
+                show_problem(state.hwnd, &format!("{error:#}"));
+            }
+        }
         ID_INCEPTION => explore_selected_image(state),
         ID_OPEN_SELECTED => open_selected(state),
         ID_LEAVE_IMAGE => leave_inception(state, true),
@@ -1264,7 +1333,7 @@ unsafe fn handle_command(state: &mut AppState, wparam: WPARAM, _lparam: LPARAM) 
         ID_HOW_TO => show_how_to(state.hwnd),
         ID_SHORTCUTS => show_shortcuts(state.hwnd),
         ID_EXIT => {
-            DestroyWindow(state.hwnd);
+            SendMessageW(state.hwnd, WM_CLOSE, 0, 0);
         }
         ID_ABOUT => show_about(state.hwnd),
         _ => {}
@@ -1370,7 +1439,7 @@ unsafe fn open_source(state: &mut AppState, mode: OpenMode) {
         .clone()
         .filter(|value| secret_applies_to_source(value, &path));
     state.pending_job = Some(PendingJob::Open(mode));
-    spawn_job(state.hwnd, move || {
+    spawn_job(state, move || {
         let pool_key = container_key.as_ref().map(SecretValue::bytes);
         match mode {
             OpenMode::Image => InceptionCatalog::open_file(&path, 0, None).map(|catalog| {
@@ -1419,7 +1488,7 @@ unsafe fn browse(state: &mut AppState, path: String) {
     let key = active_zfs_key(state);
     set_busy(state, true, "Reading folder…");
     state.pending_job = Some(PendingJob::Browse);
-    spawn_job(state.hwnd, move || {
+    spawn_job(state, move || {
         let entries = if let Some(inception) = inception {
             let volume = inception
                 .volumes
@@ -1474,19 +1543,35 @@ unsafe fn extract_selected(state: &mut AppState) {
             return;
         }
     };
+    let mut origin = catalog
+        .as_ref()
+        .and_then(|c| view.and_then(|v| c.views.get(v)))
+        .map(|v| v.label.clone())
+        .unwrap_or_default();
+    if let Some(frame) = state.inception.last() {
+        origin.push_str(&format!(
+            " {} {}",
+            frame.catalog.image_path,
+            selected_volume_index(state)
+                .and_then(|i| frame.catalog.volumes.get(i))
+                .map(|v| v.selector.as_str())
+                .unwrap_or("")
+        ));
+    }
+    let origin = format!("{} · {}", origin.trim(), source_path);
     let key = active_zfs_key(state);
     let inception = state.inception.last().map(|frame| frame.catalog.clone());
     let volume_index = selected_volume_index(state);
     set_busy(state, true, &format!("Restoring {}…", entry.name));
     state.pending_job = Some(PendingJob::Extract);
-    spawn_job(state.hwnd, move || {
+    spawn_job(state, move || {
         if is_directory {
             let extraction = if let Some(inception) = inception {
                 let volume = inception
                     .volumes
                     .get(volume_index.ok_or_else(|| anyhow::anyhow!("no inner volume selected"))?)
                     .ok_or_else(|| anyhow::anyhow!("selected inner volume no longer exists"))?;
-                inception.extract_tree(Some(&volume.selector), &source_path, &destination, true)?
+                inception.extract_tree(Some(&volume.selector), &source_path, &destination, false)?
             } else {
                 catalog
                     .as_ref()
@@ -1495,11 +1580,12 @@ unsafe fn extract_selected(state: &mut AppState) {
                         view.ok_or_else(|| anyhow::anyhow!("no source view is selected"))?,
                         &source_path,
                         &destination,
-                        true,
+                        false,
                         key.as_ref().map(SecretValue::bytes),
                     )?
             };
             return Ok(JobResult::TreeExtracted {
+                origin,
                 destination,
                 extraction,
             });
@@ -1510,7 +1596,7 @@ unsafe fn extract_selected(state: &mut AppState) {
                 .get(volume_index.ok_or_else(|| anyhow::anyhow!("no inner volume selected"))?)
                 .ok_or_else(|| anyhow::anyhow!("selected inner volume no longer exists"))?;
             (
-                inception.extract(Some(&volume.selector), &source_path, &destination, true)?,
+                inception.extract(Some(&volume.selector), &source_path, &destination, false)?,
                 true,
             )
         } else {
@@ -1522,13 +1608,14 @@ unsafe fn extract_selected(state: &mut AppState) {
                         view.ok_or_else(|| anyhow::anyhow!("no source view is selected"))?,
                         &source_path,
                         &destination,
-                        true,
+                        false,
                         key.as_ref().map(SecretValue::bytes),
                     )?,
                 false,
             )
         };
         Ok(JobResult::Extracted {
+            origin,
             destination,
             extraction,
             nested,
@@ -1624,7 +1711,7 @@ unsafe fn explore_selected_image(state: &mut AppState) {
     let name = file_label(Path::new(&image_path));
     set_busy(state, true, &format!("Looking inside {name}…"));
     state.pending_job = Some(PendingJob::ExploreImage);
-    spawn_job(state.hwnd, move || {
+    spawn_job(state, move || {
         let child = if let Some(parent_image) = parent_image {
             let volume = parent_image
                 .volumes
@@ -1702,7 +1789,7 @@ unsafe fn update_extracted_file(state: &mut AppState) {
         "Checking the restored file and applying the incremental send…",
     );
     state.pending_job = Some(PendingJob::Update);
-    spawn_job(state.hwnd, move || {
+    spawn_job(state, move || {
         apply_incremental_with_key_material(&stream, &target, key.as_ref().map(SecretValue::bytes))
             .map(|sidecar| JobResult::Updated { target, sidecar })
     });
@@ -1854,7 +1941,13 @@ unsafe fn choose_agent_password_file(state: &mut AppState) -> bool {
 
 unsafe fn finish_job(state: &mut AppState, result: JobMessage) {
     let pending = state.pending_job.take();
+    let cancelled = state.control.is_cancelled() && result.is_err();
     set_busy(state, false, "Ready");
+    if cancelled {
+        restore_source_box_after_failed_open(state, pending);
+        set_status(state, "Operation cancelled");
+        return;
+    }
     match result {
         Err(error) => handle_job_error(state, &error, pending),
         Ok(JobResult::Catalog(catalog)) => {
@@ -1876,8 +1969,11 @@ unsafe fn finish_job(state: &mut AppState, result: JobMessage) {
                 );
             }
             // Start on the newest restore point that holds files.
-            let start = presentation::recommended_view(&catalog.views).unwrap_or(0);
-            SendMessageW(state.controls.view, CB_SETCURSEL, start, 0);
+            let start = presentation::recommended_view(&catalog.views)
+                .or_else(|| history::choose_dataset(state.hwnd, &catalog));
+            if let Some(index) = start {
+                SendMessageW(state.controls.view, CB_SETCURSEL, index, 0);
+            }
             let title = format!("{} — {}", source_title(state, &catalog.path), APP_TITLE);
             set_text(state.hwnd, &title);
             set_status(state, &presentation::source_description(&catalog));
@@ -1885,42 +1981,28 @@ unsafe fn finish_job(state: &mut AppState, result: JobMessage) {
             set_source_enabled(state, true);
             update_mode(state);
             update_breadcrumb(state);
-            if ensure_selected_view_key(state) {
+            if start.is_some() && ensure_selected_view_key(state) {
                 browse(state, "/".to_owned());
             } else {
                 clear_directory_ui(state);
+                if start.is_none() {
+                    set_status(
+                        state,
+                        "Choose a computer or dataset from the Restore point list.",
+                    );
+                }
             }
             update_guidance(state);
         }
-        Ok(JobResult::Directory { path, mut entries }) => {
-            entries.sort_by(|a, b| {
-                (b.dirent_type == 4)
-                    .cmp(&(a.dirent_type == 4))
-                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-            });
-            state.current_path = path;
-            set_text(state.controls.path, &state.current_path);
-            state.entries = entries;
-            populate_list(state);
-            set_status(
-                state,
-                &format!(
-                    "{} item{} in {}{}",
-                    state.entries.len(),
-                    if state.entries.len() == 1 { "" } else { "s" },
-                    state.current_path,
-                    state
-                        .inception
-                        .last()
-                        .map_or_else(String::new, |frame| format!(
-                            " inside {}",
-                            file_label(Path::new(&frame.catalog.image_path))
-                        ))
-                ),
-            );
-            update_breadcrumb(state);
-            update_guidance(state);
+        Ok(JobResult::FileVersions(location, versions)) => {
+            history::choose_version(state, location, &versions)
         }
+        Ok(JobResult::VersionOpened {
+            index,
+            location,
+            opened,
+        }) => history::activate_version(state, index, location, opened),
+        Ok(JobResult::Directory { path, entries }) => show_directory(state, path, entries),
         Ok(JobResult::InceptionOpened {
             catalog,
             parent_path,
@@ -1992,6 +2074,7 @@ unsafe fn finish_job(state: &mut AppState, result: JobMessage) {
             browse(state, "/".to_owned());
         }
         Ok(JobResult::Extracted {
+            origin,
             destination,
             extraction,
             nested,
@@ -2003,7 +2086,7 @@ unsafe fn finish_job(state: &mut AppState, result: JobMessage) {
             } else {
                 "\n\nThis copy came from current files, not a snapshot, so it can't be updated from an incremental send."
             };
-            let details = format!("SHA-256: {}{update}", extraction.sha256);
+            let details = format!("From {origin}\nSHA-256: {}{update}", extraction.sha256);
             show_restored(
                 state,
                 &destination,
@@ -2017,6 +2100,7 @@ unsafe fn finish_job(state: &mut AppState, result: JobMessage) {
             set_status(state, &format!("Restored {}", destination.display()));
         }
         Ok(JobResult::TreeExtracted {
+            origin,
             destination,
             extraction,
         }) => {
@@ -2055,7 +2139,10 @@ unsafe fn finish_job(state: &mut AppState, result: JobMessage) {
                     destination.display(),
                     presentation::format_size(extraction.logical_bytes),
                 ),
-                "Only file contents are restored; owners, permissions and timestamps are not. Links are never followed.",
+                &format!(
+                    "Report: {}\nFrom {origin}\nFile contents and directory names were restored. Ownership, permissions and timestamps are omitted.",
+                    destination.join(&extraction.report_name).display()
+                ),
             );
             set_status(
                 state,
@@ -2078,6 +2165,36 @@ unsafe fn finish_job(state: &mut AppState, result: JobMessage) {
             set_status(state, &format!("Updated {}", target.display()));
         }
     }
+}
+
+unsafe fn show_directory(state: &mut AppState, path: String, mut entries: Vec<DirectoryEntry>) {
+    entries.sort_by(|a, b| {
+        (b.dirent_type == 4)
+            .cmp(&(a.dirent_type == 4))
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    state.current_path = path;
+    set_text(state.controls.path, &state.current_path);
+    state.entries = entries;
+    populate_list(state);
+    set_status(
+        state,
+        &format!(
+            "{} item{} in {}{}",
+            state.entries.len(),
+            if state.entries.len() == 1 { "" } else { "s" },
+            state.current_path,
+            state
+                .inception
+                .last()
+                .map_or_else(String::new, |frame| format!(
+                    " inside {}",
+                    file_label(Path::new(&frame.catalog.image_path))
+                ))
+        ),
+    );
+    update_breadcrumb(state);
+    update_guidance(state);
 }
 
 unsafe fn show_restored(state: &AppState, destination: &Path, summary: &str, details: &str) {
@@ -2196,13 +2313,27 @@ fn entry_kind(entry: &DirectoryEntry) -> &'static str {
     }
 }
 
-fn spawn_job<F>(hwnd: HWND, operation: F)
+fn spawn_job<F>(state: &AppState, operation: F)
 where
     F: FnOnce() -> Result<JobResult> + Send + 'static,
 {
-    let window = hwnd as usize;
+    let window = state.hwnd as usize;
+    let control = state.control.clone();
     thread::spawn(move || {
-        let result = operation().map_err(|error| format!("{error:#}"));
+        let result = control
+            .run(
+                move |progress| {
+                    let pointer = Box::into_raw(Box::new(progress));
+                    // SAFETY: the UI consumes this progress snapshot or we reclaim it on posting failure.
+                    if unsafe { PostMessageW(window as HWND, WM_JOB_PROGRESS, 0, pointer as isize) }
+                        == 0
+                    {
+                        unsafe { drop(Box::from_raw(pointer)) };
+                    }
+                },
+                operation,
+            )
+            .map_err(|error| format!("{error:#}"));
         let pointer = Box::into_raw(Box::new(result));
         // SAFETY: `pointer` is consumed by WM_JOB_COMPLETE. If the window has
         // already closed, posting fails and this worker reclaims the box.
@@ -2214,7 +2345,26 @@ where
     });
 }
 
+unsafe fn cancel_job(state: &AppState) {
+    state.control.cancel();
+    EnableWindow(state.controls.cancel_job, 0);
+    set_status(state, "Cancelling…");
+}
+
 unsafe fn set_busy(state: &mut AppState, busy: bool, message: &str) {
+    if busy {
+        state.control = JobControl::default();
+    }
+    state.activity = message.to_owned();
+    ShowWindow(
+        state.controls.open_backup,
+        if busy { SW_HIDE } else { SW_SHOW },
+    );
+    ShowWindow(
+        state.controls.cancel_job,
+        if busy { SW_SHOW } else { SW_HIDE },
+    );
+    EnableWindow(state.controls.cancel_job, busy as i32);
     state.busy = busy;
     let enabled = (!busy) as i32;
     for control in [
@@ -2610,6 +2760,7 @@ fn open_automatically(path: PathBuf, container_key: Option<&[u8]>) -> Result<Job
     }
     match SourceCatalog::open_pool_with_container_key_material(&path, container_key) {
         Ok(catalog) => return Ok(JobResult::Catalog(catalog)),
+        Err(error) if error.is::<zfs_send_extract::pool::PoolLayout>() => return Err(error),
         Err(error) => errors.push(format!("pool member: {error:#}")),
     }
     if !send_first {
@@ -3243,6 +3394,9 @@ unsafe fn clear_credentials(state: &mut AppState) {
 }
 
 unsafe fn clear_credentials_silent(state: &mut AppState) {
+    if let Some(catalog) = &state.catalog {
+        catalog.clear_browse_cache();
+    }
     state.keys.clear();
     state.container_key = None;
     state.agent_password = None;
@@ -3307,6 +3461,9 @@ unsafe fn active_zfs_key(state: &AppState) -> Option<SecretValue> {
 }
 
 unsafe fn store_zfs_key(state: &mut AppState, secret: SecretValue) {
+    if let Some(catalog) = &state.catalog {
+        catalog.clear_browse_cache();
+    }
     state
         .keys
         .retain(|existing| existing.source != secret.source || existing.view != secret.view);
@@ -3314,6 +3471,9 @@ unsafe fn store_zfs_key(state: &mut AppState, secret: SecretValue) {
 }
 
 unsafe fn remove_active_zfs_key(state: &mut AppState) {
+    if let Some(catalog) = &state.catalog {
+        catalog.clear_browse_cache();
+    }
     let source = credential_scope(state);
     let view = credential_view(state);
     state.keys.retain(|key| {
@@ -3695,6 +3855,14 @@ unsafe fn layout(state: &AppState) {
     state.header_height.set(header);
     let mut right = width - pad;
     let button_y = (header - row) / 2;
+    MoveWindow(
+        controls.cancel_job,
+        right - scale(140),
+        button_y,
+        scale(140),
+        row,
+        1,
+    );
     for (control, button_width) in [
         (controls.open_backup, scale(140)),
         (controls.open_drive, scale(130)),
@@ -3987,12 +4155,13 @@ unsafe fn command_link(parent: HWND, instance: HINSTANCE, text: &str, note: &str
     link
 }
 
-fn all_controls(controls: &Controls) -> [HWND; 31] {
+fn all_controls(controls: &Controls) -> [HWND; 32] {
     [
         controls.source_path,
         controls.header_title,
         controls.header_detail,
         controls.open_backup,
+        controls.cancel_job,
         controls.open_drive,
         controls.close_source,
         controls.welcome_heading,
@@ -4177,11 +4346,7 @@ unsafe fn file_dialog(
             | OFN_HIDEREADONLY
             | OFN_NOCHANGEDIR
             | OFN_PATHMUSTEXIST
-            | if save {
-                OFN_OVERWRITEPROMPT
-            } else {
-                OFN_FILEMUSTEXIST
-            },
+            | if save { 0 } else { OFN_FILEMUSTEXIST },
         ..zeroed()
     };
     let accepted = if save {

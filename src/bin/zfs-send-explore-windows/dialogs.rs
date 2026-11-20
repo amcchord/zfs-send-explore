@@ -227,6 +227,8 @@ const IDCANCEL: u16 = 2;
 struct FormState {
     edit: HWND,
     ok: HWND,
+    selecting: bool,
+    choice: Option<usize>,
     result: Option<FormResult>,
     finished: bool,
 }
@@ -252,6 +254,13 @@ unsafe extern "system" fn form_proc(
                         (*state).ok,
                         (GetWindowTextLengthW((*state).edit) > 0) as i32,
                     );
+                }
+                IDOK if (*state).selecting => {
+                    let item = SendMessageW((*state).edit, super::CB_GETCURSEL, 0, 0);
+                    if item >= 0 {
+                        (*state).choice = Some(item as usize);
+                        DestroyWindow(hwnd);
+                    }
                 }
                 IDOK => {
                     let length = GetWindowTextLengthW((*state).edit);
@@ -304,6 +313,33 @@ unsafe extern "system" fn form_proc(
 /// A compact modal form with one text field. Password fields are masked and
 /// cleared before the dialog closes.
 pub(super) unsafe fn form_dialog(owner: HWND, form: &Form) -> FormResult {
+    run_form(owner, form, &[]).0
+}
+
+/// A keyboard-accessible selector using the same modal window as the credentials form.
+pub(super) unsafe fn choose_row(
+    owner: HWND,
+    heading: &str,
+    body: &str,
+    field: &str,
+    rows: &[String],
+) -> Option<usize> {
+    if rows.is_empty() {
+        return None;
+    }
+    let form = Form {
+        heading,
+        body,
+        field,
+        initial: "",
+        password: false,
+        primary: "Open",
+        secondary: None,
+    };
+    run_form(owner, &form, rows).1
+}
+
+unsafe fn run_form(owner: HWND, form: &Form, rows: &[String]) -> (FormResult, Option<usize>) {
     let instance = GetModuleHandleW(null());
     let class_name = wide("ZfsExploreFormDialog");
     let class = WNDCLASSW {
@@ -327,6 +363,8 @@ pub(super) unsafe fn form_dialog(owner: HWND, form: &Form) -> FormResult {
     let mut state = FormState {
         edit: null_mut(),
         ok: null_mut(),
+        selecting: !rows.is_empty(),
+        choice: None,
         result: None,
         finished: false,
     };
@@ -348,7 +386,7 @@ pub(super) unsafe fn form_dialog(owner: HWND, form: &Form) -> FormResult {
     if dialog.is_null() {
         let mut fonts = fonts;
         fonts.destroy();
-        return FormResult::Cancelled;
+        return (FormResult::Cancelled, None);
     }
     // Grow the window so the client area fits the content at this DPI.
     let mut client = RECT::default();
@@ -392,20 +430,42 @@ pub(super) unsafe fn form_dialog(owner: HWND, form: &Form) -> FormResult {
     );
     MoveWindow(label, pad, scale(124), inner, scale(20), 1);
     SendMessageW(label, WM_SETFONT, fonts.strong as usize, 1);
-    let mut style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL as u32;
-    if form.password {
-        style |= ES_PASSWORD as u32;
+    if rows.is_empty() {
+        let mut style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL as u32;
+        if form.password {
+            style |= ES_PASSWORD as u32;
+        }
+        state.edit = control(
+            dialog,
+            instance,
+            windows_sys::core::w!("EDIT"),
+            form.initial,
+            style,
+            0,
+            FORM_EDIT,
+        );
+        MoveWindow(state.edit, pad, scale(146), inner, scale(30), 1);
+    } else {
+        state.edit = control(
+            dialog,
+            instance,
+            windows_sys::core::w!("COMBOBOX"),
+            "",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | super::WS_VSCROLL | super::CBS_DROPDOWNLIST as u32,
+            0,
+            FORM_EDIT,
+        );
+        for row in rows {
+            SendMessageW(
+                state.edit,
+                super::CB_ADDSTRING,
+                0,
+                super::wide(row).as_ptr() as isize,
+            );
+        }
+        SendMessageW(state.edit, super::CB_SETCURSEL, 0, 0);
+        MoveWindow(state.edit, pad, scale(146), inner, scale(240), 1);
     }
-    state.edit = control(
-        dialog,
-        instance,
-        windows_sys::core::w!("EDIT"),
-        form.initial,
-        style,
-        0,
-        FORM_EDIT,
-    );
-    MoveWindow(state.edit, pad, scale(146), inner, scale(30), 1);
     SendMessageW(state.edit, WM_SETFONT, fonts.body as usize, 1);
     let buttons_y = scale(198);
     state.ok = button(dialog, instance, form.primary, IDOK, true);
@@ -434,7 +494,10 @@ pub(super) unsafe fn form_dialog(owner: HWND, form: &Form) -> FormResult {
         MoveWindow(other, pad, buttons_y, scale(170), scale(32), 1);
         SendMessageW(other, WM_SETFONT, fonts.body as usize, 1);
     }
-    EnableWindow(state.ok, (!form.initial.is_empty()) as i32);
+    EnableWindow(
+        state.ok,
+        (!rows.is_empty() || !form.initial.is_empty()) as i32,
+    );
     EnableWindow(owner, 0);
     ShowWindow(dialog, SW_SHOW);
     UpdateWindow(dialog);
@@ -461,5 +524,8 @@ pub(super) unsafe fn form_dialog(owner: HWND, form: &Form) -> FormResult {
     SetForegroundWindow(owner);
     let mut fonts = fonts;
     fonts.destroy();
-    state.result.take().unwrap_or(FormResult::Cancelled)
+    (
+        state.result.take().unwrap_or(FormResult::Cancelled),
+        state.choice,
+    )
 }

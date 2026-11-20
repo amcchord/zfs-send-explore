@@ -97,6 +97,8 @@ pub struct VolumeInfo {
     pub offset: u64,
     pub length: u64,
     pub partition_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partition_guid: Option<String>,
     pub name: String,
     pub filesystem: Option<FilesystemKind>,
     /// A concise parser diagnostic for an unsupported or damaged volume.
@@ -131,6 +133,8 @@ pub struct NestedExtraction {
 
 /// An inspected inner disk image. All source access remains read-only.
 pub struct InceptionSession {
+    source_path: Option<PathBuf>,
+    snapshot: Option<String>,
     source: Arc<dyn ImageRead>,
     image_path: String,
     stored_size: u64,
@@ -146,12 +150,14 @@ impl InceptionSession {
     /// inside ZFS; the file is never attached or mounted by the host.
     pub fn from_file_at(path: &Path, image_offset: u64, image_length: Option<u64>) -> Result<Self> {
         let source = Arc::new(FileImage::open(path)?) as Arc<dyn ImageRead>;
-        Self::inspect_source_at(
+        let mut session = Self::inspect_source_at(
             source,
             path.display().to_string(),
             image_offset,
             image_length,
-        )
+        )?;
+        session.source_path = Some(path.to_owned());
+        Ok(session)
     }
 
     pub fn from_send(
@@ -180,7 +186,14 @@ impl InceptionSession {
         let normalized_path = resolved.normalized_path.clone();
         let source = Arc::new(StreamImage::build(stream, &plan, &resolved, key_material)?)
             as Arc<dyn ImageRead>;
-        Self::inspect_source_at(source, normalized_path, image_offset, image_length)
+        let mut session =
+            Self::inspect_source_at(source, normalized_path, image_offset, image_length)?;
+        session.source_path = Some(stream.to_owned());
+        session.snapshot = Some(format!(
+            "{} ({:#018x})",
+            plan.target.dataset_name, plan.target.to_guid
+        ));
+        Ok(session)
     }
 
     pub fn from_pool(member: &Path, dataset: &str, image_path: &str) -> Result<Self> {
@@ -271,12 +284,17 @@ impl InceptionSession {
             }
             None
         };
+        let source_path = pool.source_path.clone();
         let source = pool.into_image_file_with_key(dataset, image_path, key_material)?;
         let mut source = Arc::new(source) as Arc<dyn ImageRead>;
         if let Some(key) = datto_key {
             source = Arc::new(DettoImage::new(source, key)?) as Arc<dyn ImageRead>;
         }
-        Self::inspect_source_at(source, image_path.to_owned(), image_offset, image_length)
+        let mut session =
+            Self::inspect_source_at(source, image_path.to_owned(), image_offset, image_length)?;
+        session.source_path = Some(source_path);
+        session.snapshot = Some(dataset.to_owned());
+        Ok(session)
     }
 
     /// Build a session around any bounded source so tests can exercise nested
@@ -301,6 +319,15 @@ impl InceptionSession {
         let stored_size = image_length.unwrap_or(source.len() - image_offset);
         let window =
             Arc::new(SlicedImage::new(source, image_offset, stored_size)?) as Arc<dyn ImageRead>;
+        if stored_size >= 4 {
+            let mut signature = [0; 4];
+            window.read_exact_at(0, &mut signature)?;
+            if signature == [0x28, 0xb5, 0x2f, 0xfd] || signature.starts_with(&[0x1f, 0x8b, 0x08]) {
+                bail!(
+                    "Compressed backup download. Expand the .zst or .gz file, then open the expanded image or send file."
+                );
+            }
+        }
         if stored_size < 512 {
             bail!("nested image window is only {stored_size} bytes");
         }
@@ -318,6 +345,7 @@ impl InceptionSession {
                 offset: 0,
                 length: disk_size,
                 partition_type: "unpartitioned".to_owned(),
+                partition_guid: None,
                 name: String::new(),
             }]
         } else {
@@ -329,6 +357,8 @@ impl InceptionSession {
             .map(|layout| probe_volume(&source, layout))
             .collect::<Vec<_>>();
         Ok(Self {
+            source_path: None,
+            snapshot: None,
             source,
             image_path,
             stored_size,
@@ -363,6 +393,18 @@ impl InceptionSession {
         &self.volumes
     }
 
+    /// Read the file's logical length from its own metadata. NTFS directory
+    /// index entries can retain an earlier size than the unnamed data stream.
+    pub fn file_length(&self, selector: &str, path: &str) -> Result<u64> {
+        let volume = self.select_volume(Some(selector))?;
+        let fs = volume.filesystem.context("Unsupported filesystem")?;
+        inner_file_length(
+            self.volume_source(volume)?,
+            fs,
+            &normalized_inner_path(path)?,
+        )
+    }
+
     pub fn list_directory(&self, volume: Option<&str>, path: &str) -> Result<Vec<DirectoryEntry>> {
         let volume = self.select_volume(volume)?;
         let filesystem = volume.filesystem.ok_or_else(|| {
@@ -393,6 +435,22 @@ impl InceptionSession {
         output: &Path,
         force: bool,
     ) -> Result<NestedExtraction> {
+        let publication = crate::destination::RestoreDestination::prepare(
+            self.source_path.as_deref(),
+            output,
+            force,
+            true,
+        )?;
+        self.extract_to(volume, path, output, publication)
+    }
+
+    fn extract_to(
+        &self,
+        volume: Option<&str>,
+        path: &str,
+        output: &Path,
+        publication: crate::destination::RestoreDestination,
+    ) -> Result<NestedExtraction> {
         let volume = self.select_volume(volume)?;
         let filesystem = volume.filesystem.ok_or_else(|| {
             anyhow!(
@@ -400,12 +458,6 @@ impl InceptionSession {
                 volume.selector
             )
         })?;
-        if output.exists() && !force {
-            bail!(
-                "output {} already exists (pass --force to replace it)",
-                output.display()
-            );
-        }
         let source = self.volume_source(volume)?;
         let mut destination = ExtractionTarget::new(output)?;
         let logical_size = match filesystem {
@@ -416,7 +468,7 @@ impl InceptionSession {
             | FilesystemKind::Exfat => extract_fat(source, path, &mut destination)?,
             FilesystemKind::Ext4 => extract_ext4(source, path, &mut destination)?,
         };
-        let sha256 = destination.finish(output, logical_size, force)?;
+        let sha256 = destination.finish(publication, logical_size)?;
         Ok(NestedExtraction {
             logical_size,
             sha256,
@@ -437,15 +489,28 @@ impl InceptionSession {
     ) -> Result<RecursiveExtraction> {
         // Force volume selection once so an ambiguous image fails before the
         // staging directory is created.
-        self.select_volume(volume)?;
+        let selected = self.select_volume(volume)?;
+        let origin = format!(
+            "{} · {} · {}",
+            self.snapshot.as_deref().unwrap_or("Disk image"),
+            self.image_path,
+            selected.selector
+        );
         extract_directory_tree(
+            self.source_path.as_deref(),
+            &origin,
             path,
             output,
             force,
             |directory| self.list_directory(volume, directory),
             |source, destination| {
-                self.extract(volume, source, destination, false)
-                    .map(|result| result.logical_size)
+                self.extract_to(
+                    volume,
+                    source,
+                    destination,
+                    crate::destination::RestoreDestination::staged_member(destination),
+                )
+                .map(|result| result.logical_size)
             },
         )
     }
@@ -477,12 +542,15 @@ impl InceptionSession {
             path: normalized.clone(),
             len: length,
         }) as Arc<dyn ImageRead>;
-        Self::inspect_source_at(
+        let mut session = Self::inspect_source_at(
             image,
             format!("{}!{}:{}", self.image_path, volume.selector, normalized),
             image_offset,
             image_length,
-        )
+        )?;
+        session.source_path = self.source_path.clone();
+        session.snapshot = self.snapshot.clone();
+        Ok(session)
     }
 
     fn select_volume(&self, selector: Option<&str>) -> Result<&VolumeInfo> {
@@ -773,7 +841,11 @@ impl ExtractionTarget {
         Ok(())
     }
 
-    fn finish(mut self, output: &Path, length: u64, force: bool) -> Result<String> {
+    fn finish(
+        mut self,
+        publication: crate::destination::RestoreDestination,
+        length: u64,
+    ) -> Result<String> {
         if self.offset != length {
             bail!(
                 "inner filesystem returned {} bytes for a {length}-byte file",
@@ -782,12 +854,7 @@ impl ExtractionTarget {
         }
         self.temporary.as_file_mut().set_len(length)?;
         self.temporary.as_file_mut().sync_all()?;
-        if output.exists() && !force {
-            bail!("{} already exists", output.display());
-        }
-        self.temporary
-            .persist(output)
-            .map_err(|error| anyhow!("persisting {}: {}", output.display(), error.error))?;
+        publication.file(self.temporary, None)?;
         Ok(format!("{:x}", self.digest.finalize()))
     }
 }
@@ -1325,6 +1392,7 @@ struct PartitionLayout {
     offset: u64,
     length: u64,
     partition_type: String,
+    partition_guid: Option<String>,
     name: String,
 }
 
@@ -1345,6 +1413,7 @@ fn discover_partitions(source: &Arc<dyn ImageRead>) -> Result<Vec<PartitionLayou
         offset: 0,
         length: source.len(),
         partition_type: "unpartitioned".to_owned(),
+        partition_guid: None,
         name: String::new(),
     };
     if probe_volume(source, raw).filesystem.is_some() {
@@ -1488,6 +1557,10 @@ fn parse_gpt(
             offset,
             length,
             partition_type: format_gpt_guid(&entry[..16]),
+            partition_guid: entry[16..32]
+                .iter()
+                .any(|&b| b != 0)
+                .then(|| format_gpt_guid(&entry[16..32])),
             name: String::from_utf16_lossy(&name_units),
         });
     }
@@ -1635,6 +1708,7 @@ fn mbr_layout(
         offset,
         length,
         partition_type: format!("0x{kind:02x}"),
+        partition_guid: None,
         name: String::new(),
     })
 }
@@ -1706,6 +1780,7 @@ fn volume_info(
         offset: layout.offset,
         length: layout.length,
         partition_type: layout.partition_type,
+        partition_guid: layout.partition_guid,
         name: layout.name,
         filesystem,
         diagnostic,
@@ -1854,13 +1929,20 @@ enum BlockEncoding {
     },
 }
 
-struct StreamImage {
-    stream: PathBuf,
-    file: File,
+#[derive(Default)]
+struct ObjectSegments {
+    object_type: Option<u32>,
+    segments: SegmentMap,
+}
+
+type DecodedBlockCache = Arc<Mutex<Option<(u64, Arc<Vec<u8>>)>>>;
+pub(crate) struct StreamImage {
+    stream: Arc<Path>,
+    file: Arc<File>,
     len: u64,
     segments: SegmentMap,
-    keys: Vec<DatasetKey>,
-    cache: Mutex<Option<(u64, Arc<Vec<u8>>)>>,
+    keys: Arc<[DatasetKey]>,
+    cache: DecodedBlockCache,
 }
 
 impl StreamImage {
@@ -1870,16 +1952,40 @@ impl StreamImage {
         resolved: &ResolvedPath,
         key_material: Option<&[u8]>,
     ) -> Result<Self> {
+        let mut images = Self::build_many(
+            stream,
+            plan,
+            &BTreeMap::from([(resolved.object_id, resolved.logical_size)]),
+            key_material,
+        )?;
+        images
+            .remove(&resolved.object_id)
+            .context("Selected stream object is missing")
+    }
+
+    /// Index the extents of every requested object in one checksummed replay pass.
+    /// Each file shares the same read handle, unlocked keys, and one decoded block.
+    pub(crate) fn build_many(
+        stream: &Path,
+        plan: &SnapshotPlan,
+        sizes: &BTreeMap<u64, u64>,
+        key_material: Option<&[u8]>,
+    ) -> Result<BTreeMap<u64, Self>> {
+        if sizes.is_empty() {
+            return Ok(BTreeMap::new());
+        }
         let scanner = File::open(stream)
             .with_context(|| format!("opening ZFS send stream {}", stream.display()))?;
+        let file = Arc::new(scanner.try_clone()?);
         let mut reader = StreamReader::new(scanner);
         let selected = plan.chain.iter().copied().collect::<BTreeSet<_>>();
         let mut active = false;
         let mut current_key = None;
         let mut seen = BTreeSet::new();
-        let mut object_type = None;
-        let mut object_exists = false;
-        let mut segments = SegmentMap::default();
+        let mut objects: BTreeMap<_, _> = sizes
+            .keys()
+            .map(|&id| (id, ObjectSegments::default()))
+            .collect();
         let mut keys = Vec::new();
         let mut next_block_id = 1_u64;
 
@@ -1913,15 +2019,20 @@ impl StreamImage {
             }
 
             match record.kind {
-                RecordKind::Object(object) if object.object == resolved.object_id => {
-                    if object_type != Some(object.object_type) {
-                        segments.clear();
+                RecordKind::Object(object) => {
+                    let Some(target) = objects.get_mut(&object.object) else {
+                        continue;
+                    };
+                    if target.object_type != Some(object.object_type) {
+                        target.segments.clear();
                     }
-                    object_type = Some(object.object_type);
-                    object_exists = true;
+                    target.object_type = Some(object.object_type);
                 }
-                RecordKind::Write(write) if write.object == resolved.object_id => {
-                    if !object_exists {
+                RecordKind::Write(write) => {
+                    let Some(target) = objects.get_mut(&write.object) else {
+                        continue;
+                    };
+                    if target.object_type.is_none() {
                         bail!("nested image WRITE appears before its OBJECT record");
                     }
                     let encoding = if let Some(key_index) = current_key {
@@ -1947,9 +2058,14 @@ impl StreamImage {
                         encoding,
                     });
                     next_block_id += 1;
-                    segments.insert(write.offset, write.logical_size, descriptor)?;
+                    target
+                        .segments
+                        .insert(write.offset, write.logical_size, descriptor)?;
                 }
-                RecordKind::WriteEmbedded(write) if write.object == resolved.object_id => {
+                RecordKind::WriteEmbedded(write) => {
+                    let Some(target) = objects.get_mut(&write.object) else {
+                        continue;
+                    };
                     if current_key.is_some() {
                         bail!("raw encrypted embedded WRITE records are unsupported");
                     }
@@ -1966,22 +2082,22 @@ impl StreamImage {
                         },
                     });
                     next_block_id += 1;
-                    segments.remove(write.offset, write.length)?;
-                    segments.insert(
+                    target.segments.remove(write.offset, write.length)?;
+                    target.segments.insert(
                         write.offset,
                         u64::from(write.logical_size).min(write.length),
                         descriptor,
                     )?;
                 }
-                RecordKind::Free(free) if free.object == resolved.object_id => {
-                    segments.remove(free.offset, free.length)?;
+                RecordKind::Free(free) => {
+                    if let Some(target) = objects.get_mut(&free.object) {
+                        target.segments.remove(free.offset, free.length)?;
+                    }
                 }
                 RecordKind::FreeObjects(range) => {
                     let end = range.first_object.saturating_add(range.object_count);
-                    if resolved.object_id >= range.first_object && resolved.object_id < end {
-                        segments.clear();
-                        object_type = None;
-                        object_exists = false;
+                    for (_, target) in objects.range_mut(range.first_object..end) {
+                        *target = ObjectSegments::default();
                     }
                 }
                 RecordKind::WriteByRef => bail!("deduplicated WRITE_BYREF streams are unsupported"),
@@ -1995,20 +2111,51 @@ impl StreamImage {
         if seen.len() != plan.chain.len() {
             bail!("stream changed while indexing the nested image");
         }
-        if !object_exists {
-            bail!(
-                "nested image object {} is absent from the selected snapshot",
-                resolved.object_id
-            );
+        let stream: Arc<Path> = stream.into();
+        let keys: Arc<[DatasetKey]> = keys.into();
+        let cache = DecodedBlockCache::default();
+        objects
+            .into_iter()
+            .map(|(id, target)| {
+                if target.object_type.is_none() {
+                    bail!("file object {id} is absent from the selected snapshot");
+                }
+                Ok((
+                    id,
+                    Self {
+                        stream: stream.clone(),
+                        file: file.clone(),
+                        len: sizes[&id],
+                        segments: target.segments,
+                        keys: keys.clone(),
+                        cache: cache.clone(),
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// The caller owns a private staging directory. Write only allocated extents.
+    pub(crate) fn restore_staged(&self, path: &Path) -> Result<u64> {
+        let mut output = File::create_new(path)?;
+        sparse::prepare(&output)?;
+        for (&start, segment) in self.segments.0.range(..self.len) {
+            let count = usize::try_from(segment.end.min(self.len) - start)?;
+            let offset = usize::try_from(segment.block_offset)?;
+            let decoded = self.decode(&segment.block)?;
+            let bytes = decoded
+                .get(
+                    offset
+                        ..offset
+                            .checked_add(count)
+                            .context("Stream extent overflow")?,
+                )
+                .context("Invalid source extent length")?;
+            sparse::write_extent(&mut output, start, bytes)?;
         }
-        Ok(Self {
-            stream: stream.to_owned(),
-            file: File::open(stream)?,
-            len: resolved.logical_size,
-            segments,
-            keys,
-            cache: Mutex::new(None),
-        })
+        output.set_len(self.len)?;
+        output.sync_all()?;
+        Ok(self.len)
     }
 
     fn decode(&self, descriptor: &BlockDescriptor) -> Result<Arc<Vec<u8>>> {
@@ -2109,7 +2256,12 @@ impl ImageRead for StreamImage {
         if buffer.is_empty() {
             return Ok(());
         }
-        for (&segment_start, segment) in self.segments.0.range(..end) {
+        // Only the final preceding segment can overlap the start of this read.
+        let preceding = self.segments.0.range(..offset).next_back();
+        for (&segment_start, segment) in preceding
+            .into_iter()
+            .chain(self.segments.0.range(offset..end))
+        {
             if segment.end <= offset {
                 continue;
             }
@@ -2130,6 +2282,7 @@ impl ImageRead for StreamImage {
 }
 
 fn read_file_exact_at(file: &File, offset: u64, buffer: &mut [u8]) -> io::Result<()> {
+    crate::progress::read(buffer.len() as u64)?;
     let mut filled = 0usize;
     while filled < buffer.len() {
         #[cfg(unix)]

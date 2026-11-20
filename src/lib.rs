@@ -2,6 +2,7 @@
 //! pool members.
 
 mod compression;
+mod destination;
 mod ntfs_compression;
 
 pub mod client;
@@ -12,8 +13,11 @@ pub mod inception;
 pub mod operations;
 pub mod pool;
 pub mod presentation;
+pub mod progress;
+pub mod report;
 pub mod snapshot_time;
 pub mod source;
 pub mod sparse;
 pub mod stream;
 pub mod tree;
+pub mod versions;

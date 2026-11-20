@@ -52,8 +52,6 @@ checksum = "5c00781b62009bed91093230d1cd103d6155b264a574c661876b33154a4fad58"
 [[package]]
 name = "am-img-vmdk"
 version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc5a1861a5db32da366fe7596bb1c8376a4fc64e04a95f90a90cd426870bfc11"
 dependencies = [
  "am-fs-core",
 ]

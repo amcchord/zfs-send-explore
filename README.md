@@ -5,7 +5,7 @@
 The extraction machine does **not** need ZFS, `libzfs`, or a ZFS kernel module. The tool never invokes `zfs` or `zpool`, and pool members are opened read-only.
 
 > [!IMPORTANT]
-> This is an early `0.6.1` implementation. The CLI, desktop UIs, sidecar format, and supported on-disk profile may change. Stream and native-encryption pool fixtures are produced on little-endian OpenZFS systems. CI runs the test suite on Linux, Windows, Apple Silicon macOS, and Intel macOS, and builds native release packages.
+> This is an experimental implementation. The CLI, desktop UIs, sidecar format, and supported on-disk profile may change. Stream and native-encryption pool fixtures are produced on little-endian OpenZFS systems. CI runs the test suite on Linux, Windows, Apple Silicon macOS, and Intel macOS, and builds native release packages.
 
 Detailed implementation and validation material lives in:
 
@@ -38,7 +38,7 @@ Detailed implementation and validation material lives in:
 | Native Windows snapshot browser and extractor | Supported as `zfs-send-explore-windows.exe` |
 | Native Windows physical-drive discovery | Enumerates disk number, model, size, and media type; confirms the exact read-only selection |
 | Native macOS attached-drive discovery | Lists external disks and partitions Finder does not show; the macOS administrator prompt grants read-only access |
-| Direct password/key entry in Windows | ZFS, Datto LUKS, and Datto agent secrets use the non-persisting Windows credential prompt and zeroizing memory; key files remain supported |
+| Direct password/key entry in Windows | The app accepts a pasted key or a key file in its unlock dialog and clears stored credentials when the source closes |
 | Open a GPT/MBR whole-disk image or `\\.\PhysicalDriveN` | Supported when exactly one partition resolves to a supported plain or LUKS-wrapped ZFS member |
 | Preserve sparse holes during extraction and incremental updates | Supported; zero ranges are deallocated when the destination filesystem permits it |
 | Read compressed and embedded blocks from a pool member | LZJB, LZ4, gzip, ZLE, and Zstandard |
@@ -156,7 +156,7 @@ zfs-send-extract list backup.zfs /payload
 zfs-send-extract extract backup.zfs /payload/large.bin --output large.bin
 ```
 
-Paths inside ZFS are absolute. Existing output files are preserved unless `--force` is supplied.
+Paths inside ZFS are absolute. Desktop restores and default CLI restores require a new destination. For an intentional replacement in the CLI, use `--force`. The reader protects the open backup and its enclosing folders, and checks that the destination still matches the item selected for replacement.
 
 ### Select a snapshot
 
@@ -200,7 +200,7 @@ zfs-send-extract extract full-s1.zfs /payload/large.bin --output large.bin
 zfs-send-extract apply s1-to-s2.zfs large.bin
 ```
 
-Before applying changes, the CLI verifies the sidecar's base GUID, the target's current size, and its SHA-256 hash. It replays matching object and spill metadata, ordinary or compressed writes, embedded writes, and free records into a temporary file. Only after validation succeeds does it atomically replace the target and advance the sidecar to the new snapshot and hash.
+Before applying changes, the CLI verifies the sidecar's base GUID, the target's current size, and its SHA-256 hash. It replays matching object and spill metadata, ordinary or compressed writes, embedded writes, and free records into a temporary file. The verified file and new sidecar are staged together. A hidden pending record beside the target records their publication until both are durable. If the program stops during the save, leave the pending record and staging folder in place and retry with the same destination. Applying the same completed update again verifies the copy and returns its current result.
 
 The update fails safely if the file has been modified locally, the incremental stream starts from another snapshot, or the file was deleted and recreated under a different DMU object number.
 
@@ -308,6 +308,8 @@ allocation classes still requires a future multi-member pool reader.
 ## Browse an offline pool member
 
 The `pool` command family reads an exported vdev using positioned I/O. Pass an exact ZFS partition, file vdev, or image. A GPT/MBR whole-disk image is also accepted when exactly one partition resolves to a supported plain or LUKS-wrapped ZFS member; the Windows client uses the same discovery for `\\.\PhysicalDriveN`.
+
+To identify appliance members from read-only labels, run `zfs-send-extract pool layout member-a.img member-b.img`. Add `--json` for the pool GUID, member GUID, group ID, type and expected group count. Match pool GUIDs before grouping members. A two-disk stripe needs both original disks for pool recovery. An existing full send can be opened independently.
 
 Export a live pool first. This keeps the selected uberblock stable and prevents blocks from being freed and reused during traversal:
 
@@ -446,6 +448,8 @@ The CLI treats stream and pool metadata as untrusted input and fails closed when
 - supported pool block checksums, including the truncated/folded checksums used beside native-encryption MACs, are verified before decompression, with alternate DVA copies tried when present;
 - pool members are never written, imported, or mounted; and
 - extraction and incremental updates are built in a temporary file beside the destination, synchronized, and atomically renamed only after validation completes.
+
+Each folder restore saves a JSON Lines report inside the recovered folder. Its header identifies the source and restore point. Its entries list file lengths and SHA-256 hashes, directories, and the paths and reasons for skipped items. Verify a saved copy with `zfs-send-extract verify "recovered/ZFS Restore Report.jsonl"`. Use the filename shown on the receipt if that name already belonged to a backup entry. Verification reports the first missing or changed entry.
 
 The `.zfse.json` sidecar is part of an extracted file's update state. Keep it beside the file and do not edit it. Raw sidecars contain portable block-authentication metadata but never the encryption key; they may still reveal path, object, size, and snapshot information. Passphrases committed under `tests/fixtures` are intentionally public test credentials and must never be reused for real datasets.
 

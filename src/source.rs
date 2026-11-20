@@ -246,6 +246,7 @@ pub(crate) fn read_exact_at(
     Ok(())
 }
 fn positioned_read(file: &File, offset: u64, buffer: &mut [u8]) -> Result<()> {
+    crate::progress::read(buffer.len() as u64)?;
     let mut complete = 0;
     while complete < buffer.len() {
         let position = offset

@@ -56,6 +56,7 @@ jobs:
       - run: cargo test --locked --all-targets
       - run: ./scripts/test-macos-time.sh
       - run: ./scripts/test-macos-drives.sh
+      - run: python3 scripts/test-macos-full-destination.py
       - run: ./scripts/package-macos.sh
       - run: python3 scripts/verify-macos-package.py 'target/macos-package/ZFS Explore.app'
       - uses: actions/upload-artifact@v4
@@ -65,3 +66,17 @@ jobs:
             target/macos-package/*.zip
             target/macos-package/*.tar.gz
             target/macos-package/SHA256SUMS.txt
+      - name: Exercise the packaged Mac app
+        timeout-minutes: 12
+        run: ./scripts/test-macos-gui.sh "target/macos-package/zfs-send-explore-macos-${{ matrix.arch }}.zip" "$RUNNER_TEMP/package-gui"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-gui-results-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/package-gui/*.sha256
+            ${{ runner.temp }}/package-gui/verification.txt
+            ${{ runner.temp }}/package-gui/*.log
+            ${{ runner.temp }}/package-gui/restored
+            ${{ runner.temp }}/package-gui/occupied
+            ${{ runner.temp }}/package-gui/Qualification.xcresult

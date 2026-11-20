@@ -13,7 +13,7 @@ categories = ["command-line-utilities", "filesystem"]
 aes = "0.8"
 aes-gcm = "0.10"
 am-fs-core = "0.2.2"
-am-img-vmdk = "0.3.2"
+am-img-vmdk = { version = "0.3.2", path = "vendor/am-img-vmdk" }
 anyhow = "1.0"
 base64 = "0.22"
 ccm = "0.5"

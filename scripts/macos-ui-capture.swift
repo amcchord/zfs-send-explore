@@ -62,7 +62,10 @@ final class CaptureWindow: NSWindow {
         model.open(URL(fileURLWithPath: "\(inputs)/notes.txt")); await settle(model); snap("04-not-a-backup"); model.error = nil
 
         model.open(URL(fileURLWithPath: "\(fixtures)/multi-snapshot.zfs")); await settle(model); snap("05-send-newest")
-        model.select(0); await settle(model); snap("06-send-oldest")
+        model.findVersions("version.txt"); await settle(model); snap("05a-file-versions")
+        model.history = nil; await pause(0.3)
+        if let oldest = model.state?.views.lastIndex(where: { $0.snapshot == "s1" }) { model.select(oldest) }
+        await settle(model); snap("06-send-oldest")
         model.selection = model.state?.entries.first(where: { $0.regular })?.name; await pause(); snap("07-file-selected")
         if let name = model.selection {
             await model.run(["method": "extract", "name": name, "destination": scratch.appendingPathComponent(name).path], activity: "Restoring \(name)…", restore: true)

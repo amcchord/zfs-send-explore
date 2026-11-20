@@ -50,7 +50,7 @@ Once a backup is open:
 1. **Header** — the backup's name and what it is ("Slide backup · 12 restore
    points"), with **Close**, **Open drive…** and **Open backup…**.
 2. **Restore point** — the newest restore point that holds files is selected
-   automatically. Each entry shows its date, the backup it belongs to and how it
+   once a computer or dataset has been chosen. Each entry shows its date, the backup it belongs to and how it
    was captured ("full copy", "changes only", "live files, not a snapshot").
 3. **Part of the disk** — appears inside a disk image. The recommended part (the
    largest readable partition that isn't a helper partition) is chosen for you.
@@ -68,14 +68,25 @@ Once a backup is open:
 The menus hold the same actions plus Datto keys, settings and
 **Help › How to restore files**.
 
+During a scan or restore, the status bar reports bytes read, bytes written,
+and completed files. Choose **Cancel** or press **Esc** to stop at the next
+safe checkpoint. The read count includes each pass over the source.
+
 ## Open a backup and pick a restore point
 
 1. Choose **Open backup…** and select the file. The app recognizes send files,
    pool images and disk images automatically.
-2. The newest restore point is selected and its top folder is listed. Choose an
+2. If prompted, choose which computer or dataset to open. The newest restore
+   point for the selected dataset opens. Choose an
    earlier date in **Restore point** if you need an older copy.
 3. Double-click folders, use **Up** (Alt+Up or Backspace), or type a path and
    press **Enter**.
+
+Select any regular file and choose **Restore › Other versions of the selected
+file…** to compare that path across snapshots of its dataset. The list includes
+snapshot names, dates and sizes. Open a version to select its file in that
+restore point, then choose **Restore…**. Nested disk images reopen on the
+corresponding partition. Selecting an unavailable entry explains the issue.
 
 A send-file restore point is browseable only when the file also contains its
 complete history back to a full copy; a standalone incremental ("changes only")
@@ -125,18 +136,16 @@ QCOW1, QCOW2 backing-file overlays and encryption, split/flat/stream-optimized V
 1. Select a file or folder in the list.
 2. Choose **Restore…** (Ctrl+S). Double-clicking a regular file also restores it.
 3. Choose where to save the copy. The save dialog starts on the Desktop the
-   first time; confirm a replacement only if you intend to overwrite that file.
+   first time. Choose an unused name for the restored copy.
 4. The result names the copy and offers **Show in File Explorer**. **Show
    details** reveals the SHA-256 and whether update information was saved.
 
 ![The restored-file result with details expanded](screenshots/windows/restored.png)
 
-A restore is built in a temporary file in the destination directory. The result is synchronized and moved into place only after replay and hashing finish. A failed operation leaves the requested destination unchanged.
+A restore is built in a temporary file in the destination directory. The result is synchronized and moved into place only after replay and hashing finish. Interrupted saves can be recovered by retrying with the same destination. Leave the hidden pending record and staging directory in place until the retry completes.
 
 A folder is built in a unique staging directory beside its destination. The
-new tree is published only after every regular file succeeds. Confirming an
-overwrite first moves the previous tree into that staging directory, publishes
-the new tree, and then removes the replaced tree. Symlinks and unsupported
+new tree is published only after every regular file succeeds. Both desktop clients require an unused destination. Symlinks and unsupported
 special entries are never followed. Recursive restore recreates directory
 names and regular-file bytes, but not ACLs, ownership, permissions, alternate
 NTFS streams, or other filesystem metadata.
@@ -430,3 +439,24 @@ UTC, or a named zone grouped by region. This preference is saved in the existing
 settings file. Changing it updates the labels while preserving the selected
 snapshot and current directory. Original snapshot IDs remain in the labels,
 and UTC offsets distinguish repeated daylight-saving hours.
+
+
+## Checking a recovered folder
+
+The restore receipt gives the destination and report path. Open the JSON Lines report to see the selected source, file sizes and hashes, empty directories, and skipped entries. To recheck the copy later, pass the report path to `zfs-send-extract verify`. Keep it inside the restored folder so its relative paths continue to resolve.
+
+## Testing the Windows download
+
+From a signed-in Windows desktop, open Windows PowerShell in the checkout and
+run the following command. Supply the downloaded ZIP, its expected SHA-256 and
+a new directory for screenshots and test output.
+
+```powershell
+.\scripts\test-windows-package-ui.ps1 -Package $zip -ExpectedPackageSha256 $sha256 -FixtureDirectory .\tests\fixtures -OutputDirectory $newDirectory
+```
+
+The test checks the actual window's display scaling (125–200% by default), opens
+two public backup fixtures, retries an incorrect key, and restores an older
+snapshot. It hashes each recovered file and checks that a same-name retry
+preserves an existing file. The result and screenshots are saved in the output
+directory.
