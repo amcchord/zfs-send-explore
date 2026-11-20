@@ -131,6 +131,7 @@ pub struct NestedExtraction {
 
 /// An inspected inner disk image. All source access remains read-only.
 pub struct InceptionSession {
+    source_path: Option<PathBuf>,
     snapshot: Option<String>,
     source: Arc<dyn ImageRead>,
     image_path: String,
@@ -147,12 +148,14 @@ impl InceptionSession {
     /// inside ZFS; the file is never attached or mounted by the host.
     pub fn from_file_at(path: &Path, image_offset: u64, image_length: Option<u64>) -> Result<Self> {
         let source = Arc::new(FileImage::open(path)?) as Arc<dyn ImageRead>;
-        Self::inspect_source_at(
+        let mut session = Self::inspect_source_at(
             source,
             path.display().to_string(),
             image_offset,
             image_length,
-        )
+        )?;
+        session.source_path = Some(path.to_owned());
+        Ok(session)
     }
 
     pub fn from_send(
@@ -183,6 +186,7 @@ impl InceptionSession {
             as Arc<dyn ImageRead>;
         let mut session =
             Self::inspect_source_at(source, normalized_path, image_offset, image_length)?;
+        session.source_path = Some(stream.to_owned());
         session.snapshot = Some(format!(
             "{} ({:#018x})",
             plan.target.dataset_name, plan.target.to_guid
@@ -278,6 +282,7 @@ impl InceptionSession {
             }
             None
         };
+        let source_path = pool.source_path.clone();
         let source = pool.into_image_file_with_key(dataset, image_path, key_material)?;
         let mut source = Arc::new(source) as Arc<dyn ImageRead>;
         if let Some(key) = datto_key {
@@ -285,6 +290,7 @@ impl InceptionSession {
         }
         let mut session =
             Self::inspect_source_at(source, image_path.to_owned(), image_offset, image_length)?;
+        session.source_path = Some(source_path);
         session.snapshot = Some(dataset.to_owned());
         Ok(session)
     }
@@ -348,6 +354,7 @@ impl InceptionSession {
             .map(|layout| probe_volume(&source, layout))
             .collect::<Vec<_>>();
         Ok(Self {
+            source_path: None,
             snapshot: None,
             source,
             image_path,
@@ -413,6 +420,22 @@ impl InceptionSession {
         output: &Path,
         force: bool,
     ) -> Result<NestedExtraction> {
+        let publication = crate::destination::RestoreDestination::prepare(
+            self.source_path.as_deref(),
+            output,
+            force,
+            true,
+        )?;
+        self.extract_to(volume, path, output, publication)
+    }
+
+    fn extract_to(
+        &self,
+        volume: Option<&str>,
+        path: &str,
+        output: &Path,
+        publication: crate::destination::RestoreDestination,
+    ) -> Result<NestedExtraction> {
         let volume = self.select_volume(volume)?;
         let filesystem = volume.filesystem.ok_or_else(|| {
             anyhow!(
@@ -420,12 +443,6 @@ impl InceptionSession {
                 volume.selector
             )
         })?;
-        if output.exists() && !force {
-            bail!(
-                "output {} already exists (pass --force to replace it)",
-                output.display()
-            );
-        }
         let source = self.volume_source(volume)?;
         let mut destination = ExtractionTarget::new(output)?;
         let logical_size = match filesystem {
@@ -436,7 +453,7 @@ impl InceptionSession {
             | FilesystemKind::Exfat => extract_fat(source, path, &mut destination)?,
             FilesystemKind::Ext4 => extract_ext4(source, path, &mut destination)?,
         };
-        let sha256 = destination.finish(output, logical_size, force)?;
+        let sha256 = destination.finish(publication, logical_size)?;
         Ok(NestedExtraction {
             logical_size,
             sha256,
@@ -465,14 +482,20 @@ impl InceptionSession {
             selected.selector
         );
         extract_directory_tree(
+            self.source_path.as_deref(),
             &origin,
             path,
             output,
             force,
             |directory| self.list_directory(volume, directory),
             |source, destination| {
-                self.extract(volume, source, destination, false)
-                    .map(|result| result.logical_size)
+                self.extract_to(
+                    volume,
+                    source,
+                    destination,
+                    crate::destination::RestoreDestination::staged_member(destination),
+                )
+                .map(|result| result.logical_size)
             },
         )
     }
@@ -510,6 +533,7 @@ impl InceptionSession {
             image_offset,
             image_length,
         )?;
+        session.source_path = self.source_path.clone();
         session.snapshot = self.snapshot.clone();
         Ok(session)
     }
@@ -802,7 +826,11 @@ impl ExtractionTarget {
         Ok(())
     }
 
-    fn finish(mut self, output: &Path, length: u64, force: bool) -> Result<String> {
+    fn finish(
+        mut self,
+        publication: crate::destination::RestoreDestination,
+        length: u64,
+    ) -> Result<String> {
         if self.offset != length {
             bail!(
                 "inner filesystem returned {} bytes for a {length}-byte file",
@@ -811,12 +839,7 @@ impl ExtractionTarget {
         }
         self.temporary.as_file_mut().set_len(length)?;
         self.temporary.as_file_mut().sync_all()?;
-        if output.exists() && !force {
-            bail!("{} already exists", output.display());
-        }
-        self.temporary
-            .persist(output)
-            .map_err(|error| anyhow!("persisting {}: {}", output.display(), error.error))?;
+        publication.file(self.temporary, None)?;
         Ok(format!("{:x}", self.digest.finalize()))
     }
 }

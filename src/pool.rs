@@ -5,14 +5,13 @@
 //! a multi-terabyte member is never buffered in full.
 
 use crate::compression::decompress_block;
+use crate::destination::{RestoreDestination, temporary_for};
 use crate::encrypted::{
     DatasetKey, EncryptionParams, is_encrypted_object_type, pool_block_pointer_auth,
 };
 use crate::filesystem::DirectoryEntry;
 use crate::inception::ImageRead;
-use crate::operations::{
-    EncryptionRequirement, SIDECAR_VERSION, Sidecar, guid_string, save_sidecar, sidecar_path,
-};
+use crate::operations::{EncryptionRequirement, SIDECAR_VERSION, Sidecar, guid_string};
 use crate::sparse;
 use crate::tree::{RecursiveExtraction, extract_directory_tree};
 use anyhow::{Context, Result, anyhow, bail};
@@ -20,11 +19,11 @@ use luks::{DecryptedPayload, LuksVolume};
 use serde::Serialize;
 use sha2::{Digest, Sha256, Sha512};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use tempfile::NamedTempFile;
+
 use zfs_core::{
     BLKPTR_SIZE, Blkptr, ChecksumType, DMU_OST_META, DMU_OST_ZFS, DNODE_SIZE, Dnode, Endian,
     LABEL_SIZE, MAX_BLOCK_SIZE, MAX_INDIRECT_LEVELS, ObjsetPhys, Reader, SaLayouts, SaRegistry,
@@ -621,6 +620,7 @@ impl std::ops::Deref for PoolObjset {
 /// An opened offline vdev member. All methods are read-only with respect to the
 /// source; extraction writes only to the explicitly selected destination.
 pub struct PoolMember {
+    pub(crate) source_path: PathBuf,
     source: PoolSource,
     backup_format: String,
     container_encryption: Option<String>,
@@ -702,6 +702,7 @@ impl PoolMember {
 
         Ok(Self {
             source,
+            source_path: path.to_owned(),
             backup_format,
             container_encryption,
             pool_name,
@@ -1139,13 +1140,8 @@ impl PoolMember {
         if resolved.dirent_type != 8 {
             bail!("{} is not a regular file", resolved.normalized_path);
         }
-        if output.exists() && !force {
-            bail!(
-                "output {} already exists (pass --force to replace it)",
-                output.display()
-            );
-        }
-
+        let publication =
+            RestoreDestination::prepare(Some(&self.source_path), output, force, true)?;
         let mut temporary = temporary_for(output)?;
         sparse::prepare(temporary.as_file())?;
         let mut digest = Sha256::new();
@@ -1157,7 +1153,7 @@ impl PoolMember {
         )?;
         temporary.as_file_mut().set_len(resolved.logical_size)?;
         temporary.as_file_mut().sync_all()?;
-        persist_replace(temporary, output, force)?;
+
         let sha256 = format!("{:x}", digest.finalize());
 
         let sidecar_written = if let Some(snapshot_guid) = view.snapshot_guid {
@@ -1178,18 +1174,10 @@ impl PoolMember {
                 sha256: sha256.clone(),
                 raw_state: None,
             };
-            save_sidecar(output, &sidecar)?;
+            publication.file(temporary, Some(&sidecar))?;
             true
         } else {
-            let stale = sidecar_path(output);
-            if stale.exists() {
-                fs::remove_file(&stale).with_context(|| {
-                    format!(
-                        "removing stale incremental-send sidecar {} after current-head extraction",
-                        stale.display()
-                    )
-                })?;
-            }
+            publication.file(temporary, None)?;
             false
         };
 
@@ -1214,6 +1202,7 @@ impl PoolMember {
         key_material: Option<&[u8]>,
     ) -> Result<RecursiveExtraction> {
         extract_directory_tree(
+            Some(&self.source_path),
             selector,
             path,
             output,
@@ -1248,7 +1237,7 @@ impl PoolMember {
         )?;
         temporary.as_file_mut().set_len(resolved.logical_size)?;
         temporary.as_file_mut().sync_all()?;
-        persist_replace(temporary, output, false)?;
+        temporary.persist_noclobber(output)?;
         Ok(resolved.logical_size)
     }
 
@@ -2137,26 +2126,6 @@ fn normalize_path(path: &str) -> Result<String> {
     } else {
         Ok(format!("/{}", components.join("/")))
     }
-}
-
-fn temporary_for(path: &Path) -> Result<NamedTempFile> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    fs::create_dir_all(parent)?;
-    NamedTempFile::new_in(parent)
-        .with_context(|| format!("creating temporary file in {}", parent.display()))
-}
-
-fn persist_replace(temporary: NamedTempFile, path: &Path, force: bool) -> Result<()> {
-    if path.exists() && !force {
-        bail!("{} already exists", path.display());
-    }
-    temporary
-        .persist(path)
-        .map_err(|error| anyhow!("persisting {}: {}", path.display(), error.error))?;
-    Ok(())
 }
 
 #[cfg(test)]

@@ -125,18 +125,16 @@ QCOW1, QCOW2 backing-file overlays and encryption, split/flat/stream-optimized V
 1. Select a file or folder in the list.
 2. Choose **Restore…** (Ctrl+S). Double-clicking a regular file also restores it.
 3. Choose where to save the copy. The save dialog starts on the Desktop the
-   first time; confirm a replacement only if you intend to overwrite that file.
+   first time. Choose an unused name for the restored copy.
 4. The result names the copy and offers **Show in File Explorer**. **Show
    details** reveals the SHA-256 and whether update information was saved.
 
 ![The restored-file result with details expanded](screenshots/windows/restored.png)
 
-A restore is built in a temporary file in the destination directory. The result is synchronized and moved into place only after replay and hashing finish. A failed operation leaves the requested destination unchanged.
+A restore is built in a temporary file in the destination directory. The result is synchronized and moved into place only after replay and hashing finish. Interrupted saves can be recovered by retrying with the same destination. Leave the hidden pending record and staging directory in place until the retry completes.
 
 A folder is built in a unique staging directory beside its destination. The
-new tree is published only after every regular file succeeds. Confirming an
-overwrite first moves the previous tree into that staging directory, publishes
-the new tree, and then removes the replaced tree. Symlinks and unsupported
+new tree is published only after every regular file succeeds. Both desktop clients require an unused destination. Symlinks and unsupported
 special entries are never followed. Recursive restore recreates directory
 names and regular-file bytes, but not ACLs, ownership, permissions, alternate
 NTFS streams, or other filesystem metadata.

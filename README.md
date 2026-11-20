@@ -156,7 +156,7 @@ zfs-send-extract list backup.zfs /payload
 zfs-send-extract extract backup.zfs /payload/large.bin --output large.bin
 ```
 
-Paths inside ZFS are absolute. Existing output files are preserved unless `--force` is supplied.
+Paths inside ZFS are absolute. Desktop restores and default CLI restores require a new destination. For an intentional replacement in the CLI, use `--force`. The reader protects the open backup and its enclosing folders, and checks that the destination still matches the item selected for replacement.
 
 ### Select a snapshot
 
@@ -200,7 +200,7 @@ zfs-send-extract extract full-s1.zfs /payload/large.bin --output large.bin
 zfs-send-extract apply s1-to-s2.zfs large.bin
 ```
 
-Before applying changes, the CLI verifies the sidecar's base GUID, the target's current size, and its SHA-256 hash. It replays matching object and spill metadata, ordinary or compressed writes, embedded writes, and free records into a temporary file. Only after validation succeeds does it atomically replace the target and advance the sidecar to the new snapshot and hash.
+Before applying changes, the CLI verifies the sidecar's base GUID, the target's current size, and its SHA-256 hash. It replays matching object and spill metadata, ordinary or compressed writes, embedded writes, and free records into a temporary file. The verified file and new sidecar are staged together. A hidden pending record beside the target records their publication until both are durable. If the program stops during the save, leave the pending record and staging folder in place and retry with the same destination. Applying the same completed update again verifies the copy and returns its current result.
 
 The update fails safely if the file has been modified locally, the incremental stream starts from another snapshot, or the file was deleted and recreated under a different DMU object number.
 

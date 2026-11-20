@@ -39,7 +39,7 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::WindowsProgramming::MulDiv;
 use windows_sys::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, GetSaveFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY,
-    OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 use windows_sys::Win32::UI::Controls::{
     BCM_SETNOTE, BS_COMMANDLINK, ICC_BAR_CLASSES, ICC_LISTVIEW_CLASSES, ICC_STANDARD_CLASSES,
@@ -1504,7 +1504,7 @@ unsafe fn extract_selected(state: &mut AppState) {
                     .volumes
                     .get(volume_index.ok_or_else(|| anyhow::anyhow!("no inner volume selected"))?)
                     .ok_or_else(|| anyhow::anyhow!("selected inner volume no longer exists"))?;
-                inception.extract_tree(Some(&volume.selector), &source_path, &destination, true)?
+                inception.extract_tree(Some(&volume.selector), &source_path, &destination, false)?
             } else {
                 catalog
                     .as_ref()
@@ -1513,7 +1513,7 @@ unsafe fn extract_selected(state: &mut AppState) {
                         view.ok_or_else(|| anyhow::anyhow!("no source view is selected"))?,
                         &source_path,
                         &destination,
-                        true,
+                        false,
                         key.as_ref().map(SecretValue::bytes),
                     )?
             };
@@ -1529,7 +1529,7 @@ unsafe fn extract_selected(state: &mut AppState) {
                 .get(volume_index.ok_or_else(|| anyhow::anyhow!("no inner volume selected"))?)
                 .ok_or_else(|| anyhow::anyhow!("selected inner volume no longer exists"))?;
             (
-                inception.extract(Some(&volume.selector), &source_path, &destination, true)?,
+                inception.extract(Some(&volume.selector), &source_path, &destination, false)?,
                 true,
             )
         } else {
@@ -1541,7 +1541,7 @@ unsafe fn extract_selected(state: &mut AppState) {
                         view.ok_or_else(|| anyhow::anyhow!("no source view is selected"))?,
                         &source_path,
                         &destination,
-                        true,
+                        false,
                         key.as_ref().map(SecretValue::bytes),
                     )?,
                 false,
@@ -4203,11 +4203,7 @@ unsafe fn file_dialog(
             | OFN_HIDEREADONLY
             | OFN_NOCHANGEDIR
             | OFN_PATHMUSTEXIST
-            | if save {
-                OFN_OVERWRITEPROMPT
-            } else {
-                OFN_FILEMUSTEXIST
-            },
+            | if save { 0 } else { OFN_FILEMUSTEXIST },
         ..zeroed()
     };
     let accepted = if save {

@@ -54,29 +54,11 @@ fn validate_component(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn path_exists(path: &Path) -> bool {
-    fs::symlink_metadata(path).is_ok()
-}
-
-fn remove_staged_path(path: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(path).with_context(|| {
-        format!(
-            "reading replaced destination metadata at {}",
-            path.display()
-        )
-    })?;
-    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
-        fs::remove_dir_all(path)
-    } else {
-        fs::remove_file(path)
-    }
-    .with_context(|| format!("removing replaced destination staged at {}", path.display()))
-}
-
 /// Extract a source directory into a staged sibling and publish it only after
 /// every regular file succeeds. A forced replacement keeps the previous tree
 /// in the staging directory until the new tree has been renamed into place.
 pub(crate) fn extract_directory_tree<List, Extract>(
+    backup_file: Option<&Path>,
     source: &str,
     source_root: &str,
     destination: &Path,
@@ -88,12 +70,8 @@ where
     List: FnMut(&str) -> Result<Vec<DirectoryEntry>>,
     Extract: FnMut(&str, &Path) -> Result<u64>,
 {
-    if path_exists(destination) && !force {
-        bail!(
-            "destination {} already exists (pass --force to replace it)",
-            destination.display()
-        );
-    }
+    let publication =
+        crate::destination::RestoreDestination::prepare(backup_file, destination, force, false)?;
     let parent = destination
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -166,25 +144,7 @@ where
     }
 
     result.report_name = report.finish(&staged_root)?;
-    let previous = staging.path().join("previous");
-    if path_exists(destination) {
-        fs::rename(destination, &previous).with_context(|| {
-            format!(
-                "staging existing destination {} for replacement",
-                destination.display()
-            )
-        })?;
-    }
-    if let Err(error) = fs::rename(&staged_root, destination) {
-        if path_exists(&previous) {
-            let _ = fs::rename(&previous, destination);
-        }
-        return Err(error)
-            .with_context(|| format!("publishing recovered directory {}", destination.display()));
-    }
-    if path_exists(&previous) {
-        remove_staged_path(&previous)?;
-    }
+    publication.directory(&staged_root)?;
     Ok(result)
 }
 
@@ -199,6 +159,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let destination = temporary.path().join("recovered");
         let result = extract_directory_tree(
+            None,
             "test snapshot",
             "/Users",
             &destination,
@@ -235,6 +196,7 @@ mod tests {
 
         fs::write(destination.join("old.txt"), b"old").unwrap();
         extract_directory_tree(
+            None,
             "test snapshot",
             "/empty",
             &destination,
@@ -254,6 +216,7 @@ mod tests {
         fs::write(destination.join("old.txt"), b"old").unwrap();
 
         let result = extract_directory_tree(
+            None,
             "test snapshot",
             "/",
             &destination,
@@ -288,6 +251,7 @@ mod report_tests {
             logical_size: None,
         };
         let result = extract_directory_tree(
+            None,
             "tank/host@day1",
             "/docs",
             &dest,
