@@ -6,6 +6,7 @@
 
 use crate::compression::{decode_embedded_write, decode_replay_write};
 use crate::datto::{DettoImage, derive_agent_key};
+use crate::destination::PinnedSource;
 use crate::encrypted::{DatasetKey, EncryptionParams, decompress_block, is_encrypted_object_type};
 use crate::filesystem::{DirectoryEntry, ObjectIndex, ResolvedPath, SnapshotPlan, plan_snapshot};
 use crate::ntfs_compression::CompressedStream;
@@ -26,7 +27,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tempfile::NamedTempFile;
 use vmdk::VmdkReader;
@@ -133,7 +134,7 @@ pub struct NestedExtraction {
 
 /// An inspected inner disk image. All source access remains read-only.
 pub struct InceptionSession {
-    source_paths: Vec<PathBuf>,
+    source_paths: Vec<PinnedSource>,
     snapshot: Option<String>,
     source: Arc<dyn ImageRead>,
     image_path: String,
@@ -149,14 +150,16 @@ impl InceptionSession {
     /// read-only container, partition, and filesystem stack as images stored
     /// inside ZFS; the file is never attached or mounted by the host.
     pub fn from_file_at(path: &Path, image_offset: u64, image_length: Option<u64>) -> Result<Self> {
-        let source = Arc::new(FileImage::open(path)?) as Arc<dyn ImageRead>;
+        let image = FileImage::open(path)?;
+        let pinned = PinnedSource::capture(path, &image.file)?;
+        let source = Arc::new(image) as Arc<dyn ImageRead>;
         let mut session = Self::inspect_source_at(
             source,
             path.display().to_string(),
             image_offset,
             image_length,
         )?;
-        session.source_paths.push(path.to_owned());
+        session.source_paths.push(pinned);
         Ok(session)
     }
 
@@ -184,11 +187,12 @@ impl InceptionSession {
             bail!("{} is not a regular file", resolved.normalized_path);
         }
         let normalized_path = resolved.normalized_path.clone();
-        let source = Arc::new(StreamImage::build(stream, &plan, &resolved, key_material)?)
-            as Arc<dyn ImageRead>;
+        let image = StreamImage::build(stream, &plan, &resolved, key_material)?;
+        let pinned = PinnedSource::capture(stream, &image.file)?;
+        let source = Arc::new(image) as Arc<dyn ImageRead>;
         let mut session =
             Self::inspect_source_at(source, normalized_path, image_offset, image_length)?;
-        session.source_paths.push(stream.to_owned());
+        session.source_paths.push(pinned);
         session.snapshot = Some(format!(
             "{} ({:#018x})",
             plan.target.dataset_name, plan.target.to_guid
@@ -436,7 +440,7 @@ impl InceptionSession {
         force: bool,
     ) -> Result<NestedExtraction> {
         let publication = crate::destination::RestoreDestination::prepare_sources(
-            &self.source_paths,
+            PinnedSource::checked(&self.source_paths)?,
             output,
             force,
             true,
@@ -497,7 +501,7 @@ impl InceptionSession {
             selected.selector
         );
         extract_directory_tree_from_sources(
-            &self.source_paths,
+            PinnedSource::checked(&self.source_paths)?,
             &origin,
             path,
             output,

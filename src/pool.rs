@@ -5,7 +5,7 @@
 //! a multi-terabyte member is never buffered in full.
 
 use crate::compression::decompress_block;
-use crate::destination::{RestoreDestination, temporary_for};
+use crate::destination::{PinnedSource, RestoreDestination, temporary_for};
 use crate::encrypted::{
     DatasetKey, EncryptionParams, is_encrypted_object_type, pool_block_pointer_auth,
 };
@@ -97,6 +97,7 @@ impl std::fmt::Display for PoolLayout {
 impl std::error::Error for PoolLayout {}
 
 struct LabeledMember {
+    pinned_source: PinnedSource,
     source: PoolSource,
     active: VdevLabel,
     container_encryption: Option<String>,
@@ -783,7 +784,7 @@ impl std::ops::Deref for PoolObjset {
 /// source; extraction writes only to the explicitly selected destination.
 #[derive(Clone)]
 pub struct PoolMember {
-    pub(crate) source_paths: Vec<PathBuf>,
+    pub(crate) source_paths: Vec<PinnedSource>,
     sources: Arc<[PoolSource]>,
     member_guids: Vec<String>,
     source_bytes: u64,
@@ -879,6 +880,10 @@ impl PoolMember {
                 .checked_add(member.source.len())
                 .context("combined pool size exceeds u64")
         })?;
+        let source_paths = members
+            .iter()
+            .map(|member| member.pinned_source.clone())
+            .collect();
         let sources: Arc<[PoolSource]> = members.into_iter().map(|member| member.source).collect();
         let mos_block = read_block_from(&sources, &uberblock.rootbp_full()).with_context(|| {
             format!(
@@ -908,7 +913,7 @@ impl PoolMember {
 
         let pool = Self {
             sources,
-            source_paths: paths.to_vec(),
+            source_paths,
             member_guids,
             source_bytes,
             backup_format,
@@ -963,6 +968,7 @@ impl PoolMember {
 
     fn labels(path: &Path, container_key: Option<&[u8]>) -> Result<LabeledMember> {
         let file_source = FileSource::open(path)?;
+        let pinned_source = PinnedSource::capture(path, &file_source.file)?;
         let (mut parsed, mut failures) = read_labels(&file_source);
         let mut container_encryption = None;
         // A partition ending at the disk's end shares the whole disk's rear
@@ -1163,6 +1169,7 @@ impl PoolMember {
             guidance,
         };
         Ok(LabeledMember {
+            pinned_source,
             source,
             active,
             container_encryption,
@@ -1401,8 +1408,12 @@ impl PoolMember {
         if resolved.dirent_type != 8 {
             bail!("{} is not a regular file", resolved.normalized_path);
         }
-        let publication =
-            RestoreDestination::prepare_sources(&self.source_paths, output, force, true)?;
+        let publication = RestoreDestination::prepare_sources(
+            PinnedSource::checked(&self.source_paths)?,
+            output,
+            force,
+            true,
+        )?;
         let mut temporary = temporary_for(output)?;
         sparse::prepare(temporary.as_file())?;
         let mut digest = Sha256::new();
@@ -1463,7 +1474,7 @@ impl PoolMember {
         key_material: Option<&[u8]>,
     ) -> Result<RecursiveExtraction> {
         crate::tree::extract_directory_tree_from_sources(
-            &self.source_paths,
+            PinnedSource::checked(&self.source_paths)?,
             selector,
             path,
             output,

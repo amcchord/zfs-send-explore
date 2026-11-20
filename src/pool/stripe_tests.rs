@@ -54,6 +54,7 @@ fn stripe_member(id: u64, state: u64) -> LabeledMember {
     let image = tempfile::NamedTempFile::new().unwrap();
     image.as_file().set_len((4 * LABEL_SIZE) as u64).unwrap();
     LabeledMember {
+        pinned_source: PinnedSource::capture(image.path(), image.as_file()).unwrap(),
         source: PoolSource::Plain(FileSource::open(image.path()).unwrap()),
         active,
         container_encryption: None,
