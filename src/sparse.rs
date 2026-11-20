@@ -274,6 +274,14 @@ mod platform {
     use std::io;
     use std::os::fd::AsRawFd;
 
+    fn unsupported_sparse_operation(error: &io::Error) -> bool {
+        // HFS+ returns ENOTTY when asked for the data/hole map.
+        matches!(
+            error.raw_os_error(),
+            Some(libc::EINVAL | libc::ENOTSUP | libc::ENOTTY)
+        )
+    }
+
     pub fn prepare(_file: &File) -> Result<()> {
         Ok(())
     }
@@ -295,8 +303,7 @@ mod platform {
             return Ok(true);
         }
         let error = io::Error::last_os_error();
-        if matches!(error.raw_os_error(), Some(code) if code == libc::EOPNOTSUPP || code == libc::EINVAL)
-        {
+        if unsupported_sparse_operation(&error) {
             return Ok(false);
         }
         Err(error).context("punching a sparse file hole")
@@ -316,8 +323,7 @@ mod platform {
             return Ok(true);
         }
         let error = io::Error::last_os_error();
-        if matches!(error.raw_os_error(), Some(code) if code == libc::ENOTSUP || code == libc::EINVAL)
-        {
+        if unsupported_sparse_operation(&error) {
             return Ok(false);
         }
         Err(error).context("punching an APFS sparse file hole")
@@ -339,8 +345,7 @@ mod platform {
                 if error.raw_os_error() == Some(libc::ENXIO) {
                     break;
                 }
-                if matches!(error.raw_os_error(), Some(code) if code == libc::EINVAL || code == libc::ENOTSUP)
-                {
+                if unsupported_sparse_operation(&error) {
                     return Ok(false);
                 }
                 return Err(error).context("locating sparse file data");
@@ -349,8 +354,7 @@ mod platform {
             let hole = unsafe { libc::lseek(descriptor, data, libc::SEEK_HOLE) };
             if hole < 0 {
                 let error = io::Error::last_os_error();
-                if matches!(error.raw_os_error(), Some(code) if code == libc::EINVAL || code == libc::ENOTSUP)
-                {
+                if unsupported_sparse_operation(&error) {
                     return Ok(false);
                 }
                 return Err(error).context("locating sparse file hole");
