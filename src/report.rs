@@ -47,6 +47,7 @@ fn file_digest(path: &Path) -> Result<(u64, String)> {
     let mut bytes = 0;
     let mut buffer = [0; 128 * 1024];
     loop {
+        crate::progress::checkpoint()?;
         let n = file.read(&mut buffer)?;
         if n == 0 {
             break;

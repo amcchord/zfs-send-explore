@@ -13,6 +13,7 @@ pub mod inception;
 pub mod operations;
 pub mod pool;
 pub mod presentation;
+pub mod progress;
 pub mod report;
 pub mod snapshot_time;
 pub mod source;

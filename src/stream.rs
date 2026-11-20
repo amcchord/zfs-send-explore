@@ -322,6 +322,12 @@ impl<R: Read> StreamReader<R> {
                 source,
             })?;
 
+        crate::progress::read(RECORD_SIZE as u64 + payload_size).map_err(|source| {
+            StreamError::Io {
+                offset: record_offset,
+                source,
+            }
+        })?;
         let kind = decode_kind(&header, record_type, record_offset)?;
         if conclusion {
             if header[4..].iter().any(|byte| *byte != 0) {

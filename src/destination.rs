@@ -498,6 +498,7 @@ impl RestoreDestination {
 
     pub(crate) fn file(self, file: NamedTempFile, sidecar: Option<&Sidecar>) -> Result<()> {
         if self.data.is_none() && self.metadata.flatten().is_none() && sidecar.is_none() {
+            crate::progress::checkpoint()?;
             file.persist_noclobber(&self.path).with_context(|| {
                 format!(
                     "saving {} without replacing an existing file",
@@ -520,6 +521,7 @@ impl RestoreDestination {
 
     pub(crate) fn directory(self, staged: &Path) -> Result<()> {
         if self.data.is_none() {
+            crate::progress::checkpoint()?;
             rename_exclusive(staged, &self.path).with_context(|| {
                 format!(
                     "saving {} without replacing an existing directory",
@@ -594,6 +596,7 @@ impl RestoreDestination {
                 self.path.display()
             );
         }
+        crate::progress::checkpoint()?;
         let locked = pending
             .persist_noclobber(&journal)
             .with_context(|| format!("another restore is pending for {}", self.path.display()))?;

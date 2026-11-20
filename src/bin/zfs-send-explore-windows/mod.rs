@@ -139,6 +139,10 @@ const ID_WELCOME_PATH: u16 = 142;
 const ID_TIME_ZONE_BASE: u16 = 10_000;
 
 const WM_JOB_COMPLETE: u32 = WM_APP + 1;
+const WM_JOB_PROGRESS: u32 = WM_APP + 2;
+const ID_CANCEL_JOB: u16 = 188;
+
+use zfs_send_extract::progress::{JobControl, Progress};
 
 // Static control styles (System Services constants, defined here to avoid a feature).
 const SS_NOPREFIX: u32 = 0x0080;
@@ -213,6 +217,7 @@ struct Controls {
     header_title: HWND,
     header_detail: HWND,
     open_backup: HWND,
+    cancel_job: HWND,
     open_drive: HWND,
     close_source: HWND,
     welcome_heading: HWND,
@@ -274,6 +279,9 @@ struct AppState {
     inception: Vec<ImageFrame>,
     settings: UiSettings,
     busy: bool,
+    control: JobControl,
+    activity: String,
+    close_after_job: bool,
     pending_job: Option<PendingJob>,
     /// Friendly name of the physical drive chosen in the drive picker.
     drive_title: Option<(PathBuf, String)>,
@@ -391,6 +399,9 @@ impl Default for AppState {
             inception: Vec::new(),
             settings: load_settings(),
             busy: false,
+            control: JobControl::default(),
+            activity: String::new(),
+            close_after_job: false,
             pending_job: None,
             drive_title: None,
         }
@@ -642,13 +653,39 @@ unsafe extern "system" fn window_proc(
             handle_notify(&mut *state, lparam);
             0
         }
+        WM_JOB_PROGRESS if !state.is_null() => {
+            let progress = Box::from_raw(lparam as *mut Progress);
+            let state = &*state;
+            if state.busy && !state.control.is_cancelled() {
+                set_status(
+                    state,
+                    &format!(
+                        "{}   {} read · {} written · {} files finished",
+                        state.activity,
+                        presentation::format_size(progress.read_bytes),
+                        presentation::format_size(progress.written_bytes),
+                        progress.files
+                    ),
+                );
+            }
+            0
+        }
         WM_JOB_COMPLETE if !state.is_null() => {
             let result = Box::from_raw(lparam as *mut JobMessage);
-            finish_job(&mut *state, *result);
+            if (*state).close_after_job {
+                DestroyWindow(hwnd);
+            } else {
+                finish_job(&mut *state, *result);
+            }
             0
         }
         WM_CLOSE => {
-            DestroyWindow(hwnd);
+            if !state.is_null() && (*state).busy {
+                (*state).close_after_job = true;
+                cancel_job(&*state);
+            } else {
+                DestroyWindow(hwnd);
+            }
             0
         }
         WM_DESTROY => {
@@ -783,6 +820,8 @@ unsafe fn initialize_window(state: &mut AppState) -> Result<()> {
         SS_ENDELLIPSIS,
     );
     controls.open_backup = button(hwnd, instance, "Open backup…", ID_OPEN_BACKUP, false);
+    controls.cancel_job = button(hwnd, instance, "Cancel", ID_CANCEL_JOB, false);
+    ShowWindow(controls.cancel_job, SW_HIDE);
     controls.open_drive = button(hwnd, instance, "Open drive…", ID_OPEN_DRIVE, false);
     controls.close_source = button(hwnd, instance, "Close", ID_CLOSE_SOURCE, false);
 
@@ -1173,6 +1212,9 @@ unsafe fn handle_command(state: &mut AppState, wparam: WPARAM, _lparam: LPARAM) 
     let id = (wparam & 0xffff) as u16;
     let notification = ((wparam >> 16) & 0xffff) as u16;
     if state.busy && !matches!(id, ID_EXIT | ID_ABOUT) {
+        if matches!(id, ID_CANCEL_JOB | ID_LEAVE_IMAGE) {
+            cancel_job(state);
+        }
         return;
     }
     match id {
@@ -1183,6 +1225,9 @@ unsafe fn handle_command(state: &mut AppState, wparam: WPARAM, _lparam: LPARAM) 
         ID_OPEN_IMAGE => choose_source(state, OpenMode::Image),
         ID_CLOSE_SOURCE => close_source(state),
         ID_VIEW if notification == CBN_SELCHANGE as u16 => {
+            if let Some(catalog) = &state.catalog {
+                catalog.clear_browse_cache();
+            }
             leave_all_images(state, false);
             clear_directory_ui(state);
             if ensure_selected_view_key(state) {
@@ -1266,7 +1311,7 @@ unsafe fn handle_command(state: &mut AppState, wparam: WPARAM, _lparam: LPARAM) 
         ID_HOW_TO => show_how_to(state.hwnd),
         ID_SHORTCUTS => show_shortcuts(state.hwnd),
         ID_EXIT => {
-            DestroyWindow(state.hwnd);
+            SendMessageW(state.hwnd, WM_CLOSE, 0, 0);
         }
         ID_ABOUT => show_about(state.hwnd),
         _ => {}
@@ -1372,7 +1417,7 @@ unsafe fn open_source(state: &mut AppState, mode: OpenMode) {
         .clone()
         .filter(|value| secret_applies_to_source(value, &path));
     state.pending_job = Some(PendingJob::Open(mode));
-    spawn_job(state.hwnd, move || {
+    spawn_job(state, move || {
         let pool_key = container_key.as_ref().map(SecretValue::bytes);
         match mode {
             OpenMode::Image => InceptionCatalog::open_file(&path, 0, None).map(|catalog| {
@@ -1421,7 +1466,7 @@ unsafe fn browse(state: &mut AppState, path: String) {
     let key = active_zfs_key(state);
     set_busy(state, true, "Reading folder…");
     state.pending_job = Some(PendingJob::Browse);
-    spawn_job(state.hwnd, move || {
+    spawn_job(state, move || {
         let entries = if let Some(inception) = inception {
             let volume = inception
                 .volumes
@@ -1497,7 +1542,7 @@ unsafe fn extract_selected(state: &mut AppState) {
     let volume_index = selected_volume_index(state);
     set_busy(state, true, &format!("Restoring {}…", entry.name));
     state.pending_job = Some(PendingJob::Extract);
-    spawn_job(state.hwnd, move || {
+    spawn_job(state, move || {
         if is_directory {
             let extraction = if let Some(inception) = inception {
                 let volume = inception
@@ -1644,7 +1689,7 @@ unsafe fn explore_selected_image(state: &mut AppState) {
     let name = file_label(Path::new(&image_path));
     set_busy(state, true, &format!("Looking inside {name}…"));
     state.pending_job = Some(PendingJob::ExploreImage);
-    spawn_job(state.hwnd, move || {
+    spawn_job(state, move || {
         let child = if let Some(parent_image) = parent_image {
             let volume = parent_image
                 .volumes
@@ -1722,7 +1767,7 @@ unsafe fn update_extracted_file(state: &mut AppState) {
         "Checking the restored file and applying the incremental send…",
     );
     state.pending_job = Some(PendingJob::Update);
-    spawn_job(state.hwnd, move || {
+    spawn_job(state, move || {
         apply_incremental_with_key_material(&stream, &target, key.as_ref().map(SecretValue::bytes))
             .map(|sidecar| JobResult::Updated { target, sidecar })
     });
@@ -1874,7 +1919,13 @@ unsafe fn choose_agent_password_file(state: &mut AppState) -> bool {
 
 unsafe fn finish_job(state: &mut AppState, result: JobMessage) {
     let pending = state.pending_job.take();
+    let cancelled = state.control.is_cancelled() && result.is_err();
     set_busy(state, false, "Ready");
+    if cancelled {
+        restore_source_box_after_failed_open(state, pending);
+        set_status(state, "Operation cancelled");
+        return;
+    }
     match result {
         Err(error) => handle_job_error(state, &error, pending),
         Ok(JobResult::Catalog(catalog)) => {
@@ -2221,13 +2272,27 @@ fn entry_kind(entry: &DirectoryEntry) -> &'static str {
     }
 }
 
-fn spawn_job<F>(hwnd: HWND, operation: F)
+fn spawn_job<F>(state: &AppState, operation: F)
 where
     F: FnOnce() -> Result<JobResult> + Send + 'static,
 {
-    let window = hwnd as usize;
+    let window = state.hwnd as usize;
+    let control = state.control.clone();
     thread::spawn(move || {
-        let result = operation().map_err(|error| format!("{error:#}"));
+        let result = control
+            .run(
+                move |progress| {
+                    let pointer = Box::into_raw(Box::new(progress));
+                    // SAFETY: the UI consumes this progress snapshot or we reclaim it on posting failure.
+                    if unsafe { PostMessageW(window as HWND, WM_JOB_PROGRESS, 0, pointer as isize) }
+                        == 0
+                    {
+                        unsafe { drop(Box::from_raw(pointer)) };
+                    }
+                },
+                operation,
+            )
+            .map_err(|error| format!("{error:#}"));
         let pointer = Box::into_raw(Box::new(result));
         // SAFETY: `pointer` is consumed by WM_JOB_COMPLETE. If the window has
         // already closed, posting fails and this worker reclaims the box.
@@ -2239,7 +2304,26 @@ where
     });
 }
 
+unsafe fn cancel_job(state: &AppState) {
+    state.control.cancel();
+    EnableWindow(state.controls.cancel_job, 0);
+    set_status(state, "Cancelling…");
+}
+
 unsafe fn set_busy(state: &mut AppState, busy: bool, message: &str) {
+    if busy {
+        state.control = JobControl::default();
+    }
+    state.activity = message.to_owned();
+    ShowWindow(
+        state.controls.open_backup,
+        if busy { SW_HIDE } else { SW_SHOW },
+    );
+    ShowWindow(
+        state.controls.cancel_job,
+        if busy { SW_SHOW } else { SW_HIDE },
+    );
+    EnableWindow(state.controls.cancel_job, busy as i32);
     state.busy = busy;
     let enabled = (!busy) as i32;
     for control in [
@@ -3269,6 +3353,9 @@ unsafe fn clear_credentials(state: &mut AppState) {
 }
 
 unsafe fn clear_credentials_silent(state: &mut AppState) {
+    if let Some(catalog) = &state.catalog {
+        catalog.clear_browse_cache();
+    }
     state.keys.clear();
     state.container_key = None;
     state.agent_password = None;
@@ -3333,6 +3420,9 @@ unsafe fn active_zfs_key(state: &AppState) -> Option<SecretValue> {
 }
 
 unsafe fn store_zfs_key(state: &mut AppState, secret: SecretValue) {
+    if let Some(catalog) = &state.catalog {
+        catalog.clear_browse_cache();
+    }
     state
         .keys
         .retain(|existing| existing.source != secret.source || existing.view != secret.view);
@@ -3340,6 +3430,9 @@ unsafe fn store_zfs_key(state: &mut AppState, secret: SecretValue) {
 }
 
 unsafe fn remove_active_zfs_key(state: &mut AppState) {
+    if let Some(catalog) = &state.catalog {
+        catalog.clear_browse_cache();
+    }
     let source = credential_scope(state);
     let view = credential_view(state);
     state.keys.retain(|key| {
@@ -3721,6 +3814,14 @@ unsafe fn layout(state: &AppState) {
     state.header_height.set(header);
     let mut right = width - pad;
     let button_y = (header - row) / 2;
+    MoveWindow(
+        controls.cancel_job,
+        right - scale(140),
+        button_y,
+        scale(140),
+        row,
+        1,
+    );
     for (control, button_width) in [
         (controls.open_backup, scale(140)),
         (controls.open_drive, scale(130)),
@@ -4013,12 +4114,13 @@ unsafe fn command_link(parent: HWND, instance: HINSTANCE, text: &str, note: &str
     link
 }
 
-fn all_controls(controls: &Controls) -> [HWND; 31] {
+fn all_controls(controls: &Controls) -> [HWND; 32] {
     [
         controls.source_path,
         controls.header_title,
         controls.header_detail,
         controls.open_backup,
+        controls.cancel_job,
         controls.open_drive,
         controls.close_source,
         controls.welcome_heading,

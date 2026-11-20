@@ -112,8 +112,11 @@ incremental application remain CLI/Windows features. Single disk or single
 top-level mirror pool layouts are supported; RAIDZ and striped/multiple-vdev
 pools are not.
 
-Long operations show an indeterminate activity indicator and run off the main
-thread. Byte-level progress and cancel/resume are not yet provided.
+Long operations run in a background worker. The progress panel shows bytes
+read, bytes written, and completed files. **Cancel** stops at the next safe
+checkpoint. A cancelled restore can be retried in the same session. The app
+retains the active send snapshot’s directory index to speed up browsing.
+The read count includes each pass over the source.
 
 ## Snapshot dates
 

@@ -68,6 +68,10 @@ Once a backup is open:
 The menus hold the same actions plus Datto keys, settings and
 **Help › How to restore files**.
 
+During a scan or restore, the status bar reports bytes read, bytes written,
+and completed files. Choose **Cancel** or press **Esc** to stop at the next
+safe checkpoint. The read count includes each pass over the source.
+
 ## Open a backup and pick a restore point
 
 1. Choose **Open backup…** and select the file. The app recognizes send files,

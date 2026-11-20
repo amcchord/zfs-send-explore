@@ -20,6 +20,7 @@ pub fn prepare(file: &File) -> Result<()> {
 /// Write one logical extent while leaving all-zero chunks unallocated where
 /// the host filesystem supports holes.
 pub fn write_extent(file: &mut File, offset: u64, bytes: &[u8]) -> Result<()> {
+    crate::progress::written(bytes.len() as u64)?;
     let mut position = offset;
     for chunk in bytes.chunks(CHUNK_SIZE) {
         if chunk.iter().all(|byte| *byte == 0) {
@@ -89,6 +90,7 @@ fn copy_range(source: &mut File, destination: &mut File, offset: u64, length: u6
         let count = usize::try_from(remaining.min(CHUNK_SIZE as u64))
             .expect("chunk size always fits usize");
         source.read_exact(&mut buffer[..count])?;
+        crate::progress::written(count as u64)?;
         destination.write_all(&buffer[..count])?;
         remaining -= count as u64;
     }
@@ -102,6 +104,7 @@ fn write_zeros(file: &mut File, offset: u64, length: u64) -> Result<()> {
     while remaining != 0 {
         let count = usize::try_from(remaining.min(zeros.len() as u64))
             .expect("zero buffer size always fits usize");
+        crate::progress::checkpoint()?;
         file.write_all(&zeros[..count])?;
         remaining -= count as u64;
     }

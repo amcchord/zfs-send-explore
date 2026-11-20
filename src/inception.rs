@@ -26,7 +26,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tempfile::NamedTempFile;
 use vmdk::VmdkReader;
@@ -1906,13 +1906,20 @@ enum BlockEncoding {
     },
 }
 
-struct StreamImage {
-    stream: PathBuf,
-    file: File,
+#[derive(Default)]
+struct ObjectSegments {
+    object_type: Option<u32>,
+    segments: SegmentMap,
+}
+
+type DecodedBlockCache = Arc<Mutex<Option<(u64, Arc<Vec<u8>>)>>>;
+pub(crate) struct StreamImage {
+    stream: Arc<Path>,
+    file: Arc<File>,
     len: u64,
     segments: SegmentMap,
-    keys: Vec<DatasetKey>,
-    cache: Mutex<Option<(u64, Arc<Vec<u8>>)>>,
+    keys: Arc<[DatasetKey]>,
+    cache: DecodedBlockCache,
 }
 
 impl StreamImage {
@@ -1922,16 +1929,40 @@ impl StreamImage {
         resolved: &ResolvedPath,
         key_material: Option<&[u8]>,
     ) -> Result<Self> {
+        let mut images = Self::build_many(
+            stream,
+            plan,
+            &BTreeMap::from([(resolved.object_id, resolved.logical_size)]),
+            key_material,
+        )?;
+        images
+            .remove(&resolved.object_id)
+            .context("Selected stream object is missing")
+    }
+
+    /// Index the extents of every requested object in one checksummed replay pass.
+    /// Each file shares the same read handle, unlocked keys, and one decoded block.
+    pub(crate) fn build_many(
+        stream: &Path,
+        plan: &SnapshotPlan,
+        sizes: &BTreeMap<u64, u64>,
+        key_material: Option<&[u8]>,
+    ) -> Result<BTreeMap<u64, Self>> {
+        if sizes.is_empty() {
+            return Ok(BTreeMap::new());
+        }
         let scanner = File::open(stream)
             .with_context(|| format!("opening ZFS send stream {}", stream.display()))?;
+        let file = Arc::new(scanner.try_clone()?);
         let mut reader = StreamReader::new(scanner);
         let selected = plan.chain.iter().copied().collect::<BTreeSet<_>>();
         let mut active = false;
         let mut current_key = None;
         let mut seen = BTreeSet::new();
-        let mut object_type = None;
-        let mut object_exists = false;
-        let mut segments = SegmentMap::default();
+        let mut objects: BTreeMap<_, _> = sizes
+            .keys()
+            .map(|&id| (id, ObjectSegments::default()))
+            .collect();
         let mut keys = Vec::new();
         let mut next_block_id = 1_u64;
 
@@ -1965,15 +1996,20 @@ impl StreamImage {
             }
 
             match record.kind {
-                RecordKind::Object(object) if object.object == resolved.object_id => {
-                    if object_type != Some(object.object_type) {
-                        segments.clear();
+                RecordKind::Object(object) => {
+                    let Some(target) = objects.get_mut(&object.object) else {
+                        continue;
+                    };
+                    if target.object_type != Some(object.object_type) {
+                        target.segments.clear();
                     }
-                    object_type = Some(object.object_type);
-                    object_exists = true;
+                    target.object_type = Some(object.object_type);
                 }
-                RecordKind::Write(write) if write.object == resolved.object_id => {
-                    if !object_exists {
+                RecordKind::Write(write) => {
+                    let Some(target) = objects.get_mut(&write.object) else {
+                        continue;
+                    };
+                    if target.object_type.is_none() {
                         bail!("nested image WRITE appears before its OBJECT record");
                     }
                     let encoding = if let Some(key_index) = current_key {
@@ -1999,9 +2035,14 @@ impl StreamImage {
                         encoding,
                     });
                     next_block_id += 1;
-                    segments.insert(write.offset, write.logical_size, descriptor)?;
+                    target
+                        .segments
+                        .insert(write.offset, write.logical_size, descriptor)?;
                 }
-                RecordKind::WriteEmbedded(write) if write.object == resolved.object_id => {
+                RecordKind::WriteEmbedded(write) => {
+                    let Some(target) = objects.get_mut(&write.object) else {
+                        continue;
+                    };
                     if current_key.is_some() {
                         bail!("raw encrypted embedded WRITE records are unsupported");
                     }
@@ -2018,22 +2059,22 @@ impl StreamImage {
                         },
                     });
                     next_block_id += 1;
-                    segments.remove(write.offset, write.length)?;
-                    segments.insert(
+                    target.segments.remove(write.offset, write.length)?;
+                    target.segments.insert(
                         write.offset,
                         u64::from(write.logical_size).min(write.length),
                         descriptor,
                     )?;
                 }
-                RecordKind::Free(free) if free.object == resolved.object_id => {
-                    segments.remove(free.offset, free.length)?;
+                RecordKind::Free(free) => {
+                    if let Some(target) = objects.get_mut(&free.object) {
+                        target.segments.remove(free.offset, free.length)?;
+                    }
                 }
                 RecordKind::FreeObjects(range) => {
                     let end = range.first_object.saturating_add(range.object_count);
-                    if resolved.object_id >= range.first_object && resolved.object_id < end {
-                        segments.clear();
-                        object_type = None;
-                        object_exists = false;
+                    for (_, target) in objects.range_mut(range.first_object..end) {
+                        *target = ObjectSegments::default();
                     }
                 }
                 RecordKind::WriteByRef => bail!("deduplicated WRITE_BYREF streams are unsupported"),
@@ -2047,20 +2088,51 @@ impl StreamImage {
         if seen.len() != plan.chain.len() {
             bail!("stream changed while indexing the nested image");
         }
-        if !object_exists {
-            bail!(
-                "nested image object {} is absent from the selected snapshot",
-                resolved.object_id
-            );
+        let stream: Arc<Path> = stream.into();
+        let keys: Arc<[DatasetKey]> = keys.into();
+        let cache = DecodedBlockCache::default();
+        objects
+            .into_iter()
+            .map(|(id, target)| {
+                if target.object_type.is_none() {
+                    bail!("file object {id} is absent from the selected snapshot");
+                }
+                Ok((
+                    id,
+                    Self {
+                        stream: stream.clone(),
+                        file: file.clone(),
+                        len: sizes[&id],
+                        segments: target.segments,
+                        keys: keys.clone(),
+                        cache: cache.clone(),
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// The caller owns a private staging directory. Write only allocated extents.
+    pub(crate) fn restore_staged(&self, path: &Path) -> Result<u64> {
+        let mut output = File::create_new(path)?;
+        sparse::prepare(&output)?;
+        for (&start, segment) in self.segments.0.range(..self.len) {
+            let count = usize::try_from(segment.end.min(self.len) - start)?;
+            let offset = usize::try_from(segment.block_offset)?;
+            let decoded = self.decode(&segment.block)?;
+            let bytes = decoded
+                .get(
+                    offset
+                        ..offset
+                            .checked_add(count)
+                            .context("Stream extent overflow")?,
+                )
+                .context("Invalid source extent length")?;
+            sparse::write_extent(&mut output, start, bytes)?;
         }
-        Ok(Self {
-            stream: stream.to_owned(),
-            file: File::open(stream)?,
-            len: resolved.logical_size,
-            segments,
-            keys,
-            cache: Mutex::new(None),
-        })
+        output.set_len(self.len)?;
+        output.sync_all()?;
+        Ok(self.len)
     }
 
     fn decode(&self, descriptor: &BlockDescriptor) -> Result<Arc<Vec<u8>>> {
@@ -2161,7 +2233,12 @@ impl ImageRead for StreamImage {
         if buffer.is_empty() {
             return Ok(());
         }
-        for (&segment_start, segment) in self.segments.0.range(..end) {
+        // Only the final preceding segment can overlap the start of this read.
+        let preceding = self.segments.0.range(..offset).next_back();
+        for (&segment_start, segment) in preceding
+            .into_iter()
+            .chain(self.segments.0.range(offset..end))
+        {
             if segment.end <= offset {
                 continue;
             }
@@ -2182,6 +2259,7 @@ impl ImageRead for StreamImage {
 }
 
 fn read_file_exact_at(file: &File, offset: u64, buffer: &mut [u8]) -> io::Result<()> {
+    crate::progress::read(buffer.len() as u64)?;
     let mut filled = 0usize;
     while filled < buffer.len() {
         #[cfg(unix)]

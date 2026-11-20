@@ -5,8 +5,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use std::fs;
 use std::path::Path;
 
-const MAX_TREE_ENTRIES: u64 = 1_000_000;
-const MAX_TREE_DEPTH: usize = 256;
+pub(crate) const MAX_TREE_ENTRIES: u64 = 1_000_000;
+pub(crate) const MAX_TREE_DEPTH: usize = 256;
 
 #[derive(Debug, Clone, Default)]
 pub struct RecursiveExtraction {
@@ -18,7 +18,7 @@ pub struct RecursiveExtraction {
     pub report_name: String,
 }
 
-fn source_child(parent: &str, name: &str) -> String {
+pub(crate) fn source_child(parent: &str, name: &str) -> String {
     if parent == "/" {
         format!("/{name}")
     } else {
@@ -26,7 +26,7 @@ fn source_child(parent: &str, name: &str) -> String {
     }
 }
 
-fn validate_component(name: &str) -> Result<()> {
+pub(crate) fn validate_component(name: &str) -> Result<()> {
     if name.is_empty()
         || matches!(name, "." | "..")
         || name.contains('/')
@@ -101,6 +101,7 @@ where
             bail!("backup directory tree exceeds the {MAX_TREE_DEPTH}-level safety limit");
         }
         for entry in list(&source_directory)? {
+            crate::progress::checkpoint()?;
             let total = result
                 .files
                 .saturating_add(result.directories)
@@ -131,6 +132,7 @@ where
                         format!("extracting {source_path:?} to {}", target_path.display())
                     })?;
                     expected_bytes = bytes;
+                    crate::progress::completed_file();
                     result.files += 1;
                     result.logical_bytes = result
                         .logical_bytes

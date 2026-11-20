@@ -107,6 +107,10 @@ impl Session {
         } else {
             self.list(self.current_path())?
         };
+        self.state_with_entries(entries)
+    }
+
+    fn state_with_entries(&self, entries: Vec<DirectoryEntry>) -> Result<Value> {
         let mut entries: Vec<Value> = entries
             .iter()
             .map(|entry| {
@@ -246,6 +250,7 @@ impl Session {
             }
             Request::Select { index } => {
                 self.source()?.view(index)?;
+                self.source()?.clear_browse_cache();
                 // Switching views always forgets the previous dataset's key and nested readers.
                 let old_view = self.view;
                 let old_path = std::mem::replace(&mut self.path, "/".into());
@@ -284,20 +289,23 @@ impl Session {
                     bail!("Enter a key or choose a key file");
                 };
                 // Authenticate before retaining the supplied key.
-                self.source()?
-                    .list_directory_with_key_material(self.view, "/", Some(&material))?;
+                let entries = self.source()?.list_directory_with_key_material(
+                    self.view,
+                    "/",
+                    Some(&material),
+                )?;
                 self.key = Some(material);
                 self.path = "/".into();
-                self.state()
+                self.state_with_entries(entries)
             }
             Request::List { path } => {
-                self.list(&path)?;
+                let entries = self.list(&path)?;
                 if let Some(layer) = self.layers.last_mut() {
                     layer.path = path;
                 } else {
                     self.path = path;
                 }
-                self.state()
+                self.state_with_entries(entries)
             }
             Request::Enter { name } => {
                 if self.layers.len() >= 8 {
@@ -351,10 +359,10 @@ impl Session {
                 {
                     bail!("Choose a supported filesystem volume");
                 }
-                layer.catalog.list_directory(Some(&selector), "/")?;
+                let entries = layer.catalog.list_directory(Some(&selector), "/")?;
                 layer.volume = Some(selector);
                 layer.path = "/".into();
-                self.state()
+                self.state_with_entries(entries)
             }
             Request::Extract { name, destination } => {
                 let entry = self
@@ -587,12 +595,71 @@ fn authorize_device(_path: &Path) -> Result<()> {
     bail!("Device authorization is only available on macOS")
 }
 
-fn main() -> Result<()> {
-    let mut session = Session::default();
-    let mut input = std::io::stdin().lock();
+/// Each complete JSON line is written under one lock, including progress events.
+fn emit(value: Value) -> Result<()> {
     let mut output = std::io::stdout().lock();
+    serde_json::to_writer(&mut output, &value)?;
+    output.write_all(b"\n")?;
+    output.flush()?;
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex, mpsc::sync_channel};
+    use zfs_send_extract::progress::JobControl;
+
+    // The input thread must keep reading cancellation while the session worker
+    // owns a blocking filesystem operation. Callers without job IDs retain the
+    // original one-request, one-response protocol.
+    #[derive(Deserialize)]
+    struct Header {
+        method: String,
+        job: Option<String>,
+    }
+    type Work = (Zeroizing<Vec<u8>>, Option<String>, JobControl);
+    let (send, receive) = sync_channel::<Work>(1);
+    let jobs = Arc::new(Mutex::new(BTreeMap::<String, JobControl>::new()));
+    let running = jobs.clone();
+    let worker = std::thread::spawn(move || -> Result<()> {
+        let mut session = Session::default();
+        for (line, job, control) in receive {
+            let operation = || {
+                serde_json::from_slice::<Request>(&line)
+                    .context("Invalid desktop request")
+                    .and_then(|request| session.handle(request))
+            };
+            let result = if let Some(id) = job.clone() {
+                control.run(
+                    move |progress| {
+                        let _ = emit(json!({"job":id, "progress":progress}));
+                    },
+                    operation,
+                )
+            } else {
+                let mut operation = operation;
+                operation()
+            };
+            if let Some(id) = job {
+                running.lock().unwrap().remove(&id);
+            }
+            let response = match result {
+                Ok(value) => json!({"ok": true, "result": value}),
+                Err(_) if control.is_cancelled() => {
+                    json!({"ok":false,"title":"Operation cancelled","message":"You can try again when you are ready.","error":"Operation cancelled"})
+                }
+                Err(error) => {
+                    let raw = format!("{error:#}");
+                    let friendly = presentation::friendly_error(&raw);
+                    json!({"ok": false, "error": raw, "title": friendly.title, "message": friendly.message})
+                }
+            };
+            emit(response)?;
+        }
+        Ok(())
+    });
+    let mut input = std::io::stdin().lock();
     loop {
-        // Bound a request, including an accidentally pasted oversized key.
         let mut line = Zeroizing::new(Vec::new());
         let length = (&mut input)
             .take(64 * 1024 + 1)
@@ -603,21 +670,31 @@ fn main() -> Result<()> {
         if length > 64 * 1024 {
             bail!("Desktop request exceeds 64 KiB");
         }
-        let result = serde_json::from_slice::<Request>(&line)
-            .context("Invalid desktop request")
-            .and_then(|request| session.handle(request));
-        let response = match result {
-            Ok(value) => json!({"ok": true, "result": value}),
-            // Do not echo the original JSON request (it may contain credentials).
-            Err(error) => {
-                let raw = format!("{error:#}");
-                let friendly = presentation::friendly_error(&raw);
-                json!({"ok": false, "error": raw, "title": friendly.title, "message": friendly.message})
+        let header = serde_json::from_slice::<Header>(&line).ok();
+        if let Some(Header {
+            ref method,
+            ref job,
+        }) = header
+            && method == "cancel"
+        {
+            if let Some(control) = job
+                .as_ref()
+                .and_then(|id| jobs.lock().unwrap().get(id).cloned())
+            {
+                control.cancel();
             }
-        };
-        serde_json::to_writer(&mut output, &response)?;
-        output.write_all(b"\n")?;
-        output.flush()?;
+            continue;
+        }
+        let job = header.and_then(|h| h.job);
+        let control = JobControl::default();
+        if let Some(id) = &job {
+            jobs.lock().unwrap().insert(id.clone(), control.clone());
+        }
+        send.send((line, job, control))
+            .map_err(|_| anyhow::anyhow!("Desktop worker stopped"))?;
     }
-    Ok(())
+    drop(send);
+    worker
+        .join()
+        .map_err(|_| anyhow::anyhow!("Desktop worker stopped"))?
 }

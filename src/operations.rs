@@ -209,6 +209,33 @@ pub fn extract_tree_snapshot_with_key(
 ) -> Result<RecursiveExtraction> {
     let plan = plan_snapshot(stream, snapshot)?;
     let index = ObjectIndex::build_plan_with_key(stream, &plan, key_material)?;
+    // Select only files under this root before building a single extent index.
+    // Paths and traversal limits match the staged directory publisher.
+    let mut sizes = BTreeMap::new();
+    let mut directories = vec![(path.to_owned(), 0usize)];
+    let mut entries = 1u64;
+    while let Some((folder, depth)) = directories.pop() {
+        if depth > crate::tree::MAX_TREE_DEPTH {
+            bail!("Backup directory tree is too deep");
+        }
+        for entry in index.list_directory(&folder)? {
+            crate::progress::checkpoint()?;
+            entries += 1;
+            if entries > crate::tree::MAX_TREE_ENTRIES {
+                bail!("Backup directory tree has too many entries");
+            }
+            crate::tree::validate_component(&entry.name)?;
+            let child = crate::tree::source_child(&folder, &entry.name);
+            match entry.dirent_type {
+                4 => directories.push((child, depth + 1)),
+                8 => {
+                    sizes.insert(entry.object_id, index.resolve_path(&child)?.logical_size);
+                }
+                _ => {}
+            }
+        }
+    }
+    let images = crate::inception::StreamImage::build_many(stream, &plan, &sizes, key_material)?;
     extract_directory_tree(
         Some(stream),
         &format!(
@@ -222,18 +249,11 @@ pub fn extract_tree_snapshot_with_key(
         force,
         |directory| index.list_directory(directory),
         |source, destination| {
-            let resolved = index.resolve_path(source)?;
-            extract_resolved_snapshot(
-                stream,
-                &plan,
-                &index,
-                resolved,
-                destination,
-                false,
-                key_material,
-                false,
-            )
-            .map(|sidecar| sidecar.logical_size)
+            let id = index.resolve_path(source)?.object_id;
+            images
+                .get(&id)
+                .context("File missing from tree index")?
+                .restore_staged(destination)
         },
     )
 }
