@@ -2,6 +2,7 @@
 
 mod dialogs;
 mod drive_inventory;
+mod drive_picker;
 mod history;
 
 use anyhow::{Context, Result, bail};
@@ -151,7 +152,6 @@ use zfs_send_extract::progress::{JobControl, Progress};
 // Static control styles (System Services constants, defined here to avoid a feature).
 const SS_NOPREFIX: u32 = 0x0080;
 const SS_ENDELLIPSIS: u32 = 0x4000;
-const SS_CENTER: u32 = 0x0001;
 const LVS_REPORT: u32 = 0x0001;
 const LVS_SINGLESEL: u32 = 0x0004;
 const LVS_SHOWSELALWAYS: u32 = 0x0008;
@@ -229,7 +229,6 @@ struct Controls {
     welcome_file: HWND,
     welcome_drive: HWND,
     welcome_path: HWND,
-    welcome_steps: HWND,
     view_label: HWND,
     view: HWND,
     volume_label: HWND,
@@ -327,7 +326,9 @@ struct PhysicalDrive {
     number: u32,
     model: String,
     size: Option<u64>,
+    bus: i32,
     removable: bool,
+    serial: String,
     system: bool,
     system_known: bool,
     zfs_partition: bool,
@@ -342,21 +343,6 @@ impl PhysicalDrive {
             self.size
                 .map_or_else(|| "unknown size".to_owned(), presentation::format_size)
         )
-    }
-
-    fn note(&self) -> String {
-        let kind = if !self.system_known {
-            "Windows system disk status unknown"
-        } else if self.system {
-            "This computer’s Windows disk"
-        } else if self.zfs_partition {
-            "ZFS partition"
-        } else if self.removable {
-            "Removable drive"
-        } else {
-            "Fixed or USB drive"
-        };
-        format!("{kind} · {}", self.path.display())
     }
 }
 
@@ -785,7 +771,6 @@ unsafe fn color_static(state: &AppState, hdc: HDC, control: HWND) -> LRESULT {
     let muted = [
         controls.header_detail,
         controls.welcome_body,
-        controls.welcome_steps,
         controls.breadcrumb,
         controls.selection,
     ];
@@ -845,38 +830,34 @@ unsafe fn initialize_window(state: &mut AppState) -> Result<()> {
     controls.open_backup = button(hwnd, instance, "Open backup…", ID_OPEN_BACKUP, false);
     controls.cancel_job = button(hwnd, instance, "Cancel", ID_CANCEL_JOB, false);
     ShowWindow(controls.cancel_job, SW_HIDE);
-    controls.open_drive = button(hwnd, instance, "Open drive…", ID_OPEN_DRIVE, false);
+    controls.open_drive = button(hwnd, instance, "Connected drives…", ID_OPEN_DRIVE, false);
     controls.close_source = button(hwnd, instance, "Close", ID_CLOSE_SOURCE, false);
 
-    controls.welcome_heading = label("Get your files back", 0);
+    controls.welcome_heading = label("Open your backup", 0);
     controls.welcome_body = label(
-        "Open a backup, pick the date you want, and save copies of the files you need. ZFS Explore only reads your backup. It never changes it.",
+        "Choose a drive or backup file to browse and restore your files.",
         0,
+    );
+    controls.welcome_drive = command_link(
+        hwnd,
+        instance,
+        "Browse connected drives",
+        "Choose a backup drive, or select all the drives from one pool.",
+        ID_WELCOME_DRIVE,
     );
     controls.welcome_file = command_link(
         hwnd,
         instance,
         "Open a backup file",
-        "A ZFS send file, a Slide or ZFS pool image, or a RAW, QCOW2 or VMDK disk",
+        "Browse a ZFS send file or a disk image.",
         ID_WELCOME_FILE,
-    );
-    controls.welcome_drive = command_link(
-        hwnd,
-        instance,
-        "Open a connected drive",
-        "A drive from a Slide or Datto device. Windows can't show these drives in File Explorer.",
-        ID_WELCOME_DRIVE,
     );
     controls.welcome_path = command_link(
         hwnd,
         instance,
         "Open from a path",
-        "Type or paste the location of a backup, or a drive such as \\\\.\\PhysicalDrive1",
+        "Enter a file or device path.",
         ID_WELCOME_PATH,
-    );
-    controls.welcome_steps = label(
-        "1  Open your backup      ›      2  Pick a restore point      ›      3  Restore your files",
-        SS_CENTER,
     );
 
     controls.view_label = label("Restore point:", 0);
@@ -1047,11 +1028,7 @@ unsafe fn apply_fonts(state: &AppState) {
         state.fonts.heading as usize,
         1,
     );
-    for hwnd in [
-        controls.view_label,
-        controls.volume_label,
-        controls.welcome_steps,
-    ] {
+    for hwnd in [controls.view_label, controls.volume_label] {
         SendMessageW(hwnd, WM_SETFONT, state.fonts.strong as usize, 1);
     }
 }
@@ -1082,7 +1059,7 @@ unsafe fn create_menus(state: &AppState) {
         file_menu,
         MF_STRING,
         ID_OPEN_DRIVE as usize,
-        "Open connected drive…\tCtrl+D",
+        "Connected drives…\tCtrl+D",
     );
     append_menu(
         file_menu,
@@ -2499,7 +2476,6 @@ unsafe fn update_mode(state: &AppState) {
         controls.welcome_file,
         controls.welcome_drive,
         controls.welcome_path,
-        controls.welcome_steps,
     ] {
         ShowWindow(control, if open { SW_HIDE } else { SW_SHOW });
     }
@@ -2860,124 +2836,17 @@ fn open_automatically(path: PathBuf, container_key: Option<&[u8]>) -> Result<Job
 
 /// List physical drives in a native chooser and open the chosen one read-only.
 unsafe fn open_physical_drive(state: &mut AppState) {
-    let mut selected: Vec<PhysicalDrive> = Vec::new();
-    loop {
-        let mut drives = enumerate_physical_drives();
-        if selected.iter().any(|chosen| !drives.contains(chosen)) {
-            show_message(
-                state.hwnd,
-                DialogIcon::Warning,
-                "A selected drive changed",
-                "Choose the members again. A drive was removed or its identity changed.",
-            );
-            selected.clear();
-        }
-        drives.retain(|candidate| !selected.contains(candidate));
-        let titles = drives.iter().map(PhysicalDrive::title).collect::<Vec<_>>();
-        let notes = drives.iter().map(PhysicalDrive::note).collect::<Vec<_>>();
-        let mut actions = titles
-            .iter()
-            .zip(&notes)
-            .map(|(title, note)| (title.as_str(), note.as_str()))
-            .collect::<Vec<_>>();
-        actions.push(("Refresh the list", "Choose this after connecting a drive."));
-        let chosen = selected
-            .iter()
-            .map(PhysicalDrive::title)
-            .collect::<Vec<_>>()
-            .join("\n");
-        let content = if !selected.is_empty() {
-            format!(
-                "Selected members:\n{chosen}\n\nChoose another drive from the same offline pool. Connect a missing drive and choose Refresh."
-            )
-        } else if drives.is_empty() {
-            "No drives are visible to ZFS Explore. Connect the drive, then choose Refresh. Reading drives usually requires starting ZFS Explore with “Run as administrator”.".to_owned()
-        } else {
-            "Choose the drive that came from your Slide or Datto device. It opens read-only: nothing on it is written, mounted or initialized. If a drive is missing, connect it and choose Refresh.".to_owned()
-        };
-        let footer = "Drives can only be read when ZFS Explore runs as an administrator. Right-click the app and choose “Run as administrator” if Windows denies access.";
-        let task = Task {
-            actions: &actions,
-            footer: Some(footer),
-            ..Task::new(DialogIcon::Information, "Open a connected drive", &content)
-        };
-        match task_dialog(state.hwnd, &task) {
-            Some(index) if index < drives.len() => {
-                let drive = &drives[index];
-                if drive.system
-                    && task_dialog(
-                        state.hwnd,
-                        &Task {
-                            actions: &[("Open it anyway", "It still opens read-only.")],
-                            ..Task::new(
-                                DialogIcon::Warning,
-                                "This is the computer’s own Windows disk",
-                                "Backups are usually on a separate drive. Open this disk only if you are sure it holds the backup.",
-                            )
-                        },
-                    ) != Some(0)
-                {
-                    continue;
-                }
-                if !selected.is_empty() && drive.identity.is_none() {
-                    show_message(
-                        state.hwnd,
-                        DialogIcon::Warning,
-                        "Windows could not identify this drive",
-                        "Keeping several drives selected requires a stable device ID. Open offline images of the member drives together.",
-                    );
-                    continue;
-                }
-                selected.push(drive.clone());
-                let names = selected
-                    .iter()
-                    .map(|d| format!("{} · {}", d.title(), d.path.display()))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let mut actions = vec![(
-                    "Open read-only",
-                    "Read the selected drives without mounting or changing them.",
-                )];
-                if drive.identity.is_some() {
-                    actions.push((
-                        "Add another member",
-                        "Choose another drive from the same offline striped pool.",
-                    ));
-                }
-                match task_dialog(
-                    state.hwnd,
-                    &Task {
-                        actions: &actions,
-                        ..Task::new(DialogIcon::Information, "Review selected drives", &names)
-                    },
-                ) {
-                    Some(1) => continue,
-                    Some(0) => {}
-                    _ => return,
-                }
-                let current = enumerate_physical_drives();
-                if selected.iter().any(|chosen| !current.contains(chosen)) {
-                    show_message(
-                        state.hwnd,
-                        DialogIcon::Warning,
-                        "A selected drive changed",
-                        "Choose the members again. A drive was removed or its identity changed.",
-                    );
-                    selected.clear();
-                    continue;
-                }
-                let paths: Vec<_> = selected.iter().map(|drive| drive.path.clone()).collect();
-                if let [drive] = selected.as_slice() {
-                    state.drive_title = Some((drive.path.clone(), drive.title()));
-                }
-                set_input_paths(state, paths);
-                open_selected_sources(state, OpenMode::Auto);
-                return;
-            }
-            Some(_) => continue,
-            None => return,
-        }
+    let Some(selected) = drive_picker::choose(state.hwnd) else {
+        return;
+    };
+    if let [drive] = selected.as_slice() {
+        state.drive_title = Some((drive.path.clone(), drive.title()));
     }
+    set_input_paths(
+        state,
+        selected.into_iter().map(|drive| drive.path).collect(),
+    );
+    open_selected_sources(state, OpenMode::Auto);
 }
 
 fn enumerate_physical_drives() -> Vec<PhysicalDrive> {
@@ -3076,14 +2945,12 @@ fn inspect_physical_drive(number: u32, system: Option<&[u32]>) -> Option<Physica
                 ));
             }
         }
-        let (model, removable) =
+        let (model, removable, bus, serial) =
             if descriptor_ok && returned as usize >= size_of::<STORAGE_DEVICE_DESCRIPTOR>() {
                 let header = &*(descriptor.as_ptr().cast::<STORAGE_DEVICE_DESCRIPTOR>());
-                if identity.is_none() {
-                    let serial = descriptor_string(&descriptor, header.SerialNumberOffset);
-                    if !serial.is_empty() {
-                        identity = Some(format!("serial:{serial}"));
-                    }
+                let serial = descriptor_string(&descriptor, header.SerialNumberOffset);
+                if identity.is_none() && !serial.is_empty() {
+                    identity = Some(format!("serial:{serial}"));
                 }
                 let vendor = descriptor_string(&descriptor, header.VendorIdOffset);
                 let product = descriptor_string(&descriptor, header.ProductIdOffset);
@@ -3092,9 +2959,9 @@ fn inspect_physical_drive(number: u32, system: Option<&[u32]>) -> Option<Physica
                     .filter(|part| !part.is_empty())
                     .collect::<Vec<_>>()
                     .join(" ");
-                (model, header.RemovableMedia)
+                (model, header.RemovableMedia, header.BusType, serial)
             } else {
-                (String::new(), false)
+                (String::new(), false, 0, String::new())
             };
         let zfs_partition = system.is_some_and(|disks| !disks.contains(&number))
             && drive_inventory::has_zfs_partition(handle);
@@ -3111,6 +2978,8 @@ fn inspect_physical_drive(number: u32, system: Option<&[u32]>) -> Option<Physica
             },
             size,
             removable,
+            bus,
+            serial,
             system: system.is_some_and(|disks| disks.contains(&number)),
             system_known: system.is_some(),
         })
@@ -4018,7 +3887,7 @@ unsafe fn layout(state: &AppState) {
     );
     for (control, button_width) in [
         (controls.open_backup, scale(140)),
-        (controls.open_drive, scale(130)),
+        (controls.open_drive, scale(158)),
         (controls.close_source, scale(90)),
     ] {
         right -= button_width;
@@ -4047,28 +3916,23 @@ unsafe fn layout(state: &AppState) {
     if !source_open(state) {
         let column = (width - pad * 2).min(scale(640));
         let x = (width - column) / 2;
-        let content = scale(46 + 64 + 3 * 80 + 36);
-        let mut y = header + ((height - header - content) / 2).max(scale(28));
-        MoveWindow(controls.welcome_heading, x, y, column, scale(46), 1);
-        y += scale(50);
-        MoveWindow(controls.welcome_body, x, y, column, scale(48), 1);
-        y += scale(64);
-        for link in [
-            controls.welcome_file,
+        // Keep all three entry points above the status bar on short, high-DPI displays.
+        let available = (height - header - scale(20)).max(0);
+        let link = ((available - scale(76)) / 3).clamp(scale(44), scale(70));
+        let content = scale(76) + link * 3;
+        let mut y = header + ((height - header - content) / 2).max(scale(6));
+        MoveWindow(controls.welcome_heading, x, y, column, scale(38), 1);
+        y += scale(40);
+        MoveWindow(controls.welcome_body, x, y, column, scale(34), 1);
+        y += scale(36);
+        for action in [
             controls.welcome_drive,
+            controls.welcome_file,
             controls.welcome_path,
         ] {
-            MoveWindow(link, x, y, column, scale(70), 1);
-            y += scale(80);
+            MoveWindow(action, x, y, column, link - scale(2), 1);
+            y += link;
         }
-        MoveWindow(
-            controls.welcome_steps,
-            x,
-            y + scale(8),
-            column,
-            scale(24),
-            1,
-        );
         return;
     }
 
@@ -4308,7 +4172,7 @@ unsafe fn command_link(parent: HWND, instance: HINSTANCE, text: &str, note: &str
     link
 }
 
-fn all_controls(controls: &Controls) -> [HWND; 32] {
+fn all_controls(controls: &Controls) -> [HWND; 31] {
     [
         controls.source_path,
         controls.header_title,
@@ -4322,7 +4186,6 @@ fn all_controls(controls: &Controls) -> [HWND; 32] {
         controls.welcome_file,
         controls.welcome_drive,
         controls.welcome_path,
-        controls.welcome_steps,
         controls.view_label,
         controls.view,
         controls.volume_label,

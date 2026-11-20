@@ -3,3 +3,23 @@
 // unresolved name is stored as a custom type that Windows ignores.
 1 24 "packaging/windows/zfs-send-explore-windows.exe.manifest"
 101 ICON "packaging/icons/ZFSExplore.ico"
+
+#include <windows.h>
+#include <commctrl.h>
+
+// Sizes are dialog units. Windows scales the controls and font together at each DPI.
+210 DIALOGEX 0, 0, 342, 200
+STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Connected drives"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT "Choose one backup drive, or all the drives from the same pool. Selected drives open read-only.", -1, 10, 9, 322, 23
+    LTEXT "&Available drives", -1, 10, 34, 310, 10
+    CONTROL "", 2101, "SysListView32", WS_TABSTOP | WS_BORDER | LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | LVS_SHOWSELALWAYS, 10, 46, 322, 83
+    LTEXT "", 2105, 15, 53, 305, 68
+    CONTROL "Show &Windows system disk", 2102, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 135, 218, 13
+    LTEXT "", 2104, 10, 152, 322, 23
+    PUSHBUTTON "&Refresh", 2103, 10, 177, 56, 15
+    DEFPUSHBUTTON "&Open read-only", IDOK, 186, 177, 86, 15
+    PUSHBUTTON "Cancel", IDCANCEL, 277, 177, 55, 15
+END
