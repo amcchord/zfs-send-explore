@@ -145,7 +145,16 @@ Disk images stored as compressed NTFS files can also be browsed directly. Standa
 16-cluster units with 512–4096-byte clusters are supported. EFS-encrypted streams
 remain unsupported; this feature does not add WOF/CompactOS decompression.
 
-
 ## Checking a recovered folder
 
 The restore receipt gives the destination and report path. Open the JSON Lines report to see the selected source, file sizes and hashes, empty directories, and skipped entries. To recheck the copy later, pass the report path to `zfs-send-extract verify`. Keep it inside the restored folder so its relative paths continue to resolve.
+
+### Qualify a packaged Mac download
+
+On a Mac with Xcode, an active desktop session, and permission for Xcode UI testing, run the following command with the downloaded ZIP and a new directory for evidence. Close any running copy of ZFS Explore first.
+
+```sh
+./scripts/test-macos-gui.sh /path/to/zfs-send-explore-macos-arm64.zip /path/to/new-evidence
+```
+
+The external UI test opens the archived app, chooses public fixtures through its file dialog, retries a wrong passphrase, saves a file, attempts a same-name restore over a distinctive test file, and recovers the middle of three snapshots. It compares the output bytes to independently recorded SHA-256 values. The evidence directory contains the archive and executable hashes, screenshots, restored files, per-file comparisons and the Xcode test result. This check uses ordinary files and requires no administrator prompt.
