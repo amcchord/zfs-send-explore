@@ -1,6 +1,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 mod dialogs;
+mod drive_inventory;
 mod history;
 
 use anyhow::{Context, Result, bail};
@@ -27,7 +28,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, OPEN_EXISTING,
+    FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
 use windows_sys::Win32::System::IO::DeviceIoControl;
@@ -35,7 +36,7 @@ use windows_sys::Win32::System::Ioctl::{
     GET_LENGTH_INFORMATION, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, IOCTL_DISK_GET_LENGTH_INFO,
     IOCTL_STORAGE_GET_DEVICE_NUMBER_EX, IOCTL_STORAGE_QUERY_PROPERTY, PropertyStandardQuery,
     STORAGE_DEVICE_DESCRIPTOR, STORAGE_DEVICE_NUMBER_EX, STORAGE_PROPERTY_QUERY,
-    StorageDeviceProperty, VOLUME_DISK_EXTENTS,
+    StorageDeviceProperty,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::WindowsProgramming::MulDiv;
@@ -328,6 +329,8 @@ struct PhysicalDrive {
     size: Option<u64>,
     removable: bool,
     system: bool,
+    system_known: bool,
+    zfs_partition: bool,
 }
 
 impl PhysicalDrive {
@@ -342,8 +345,12 @@ impl PhysicalDrive {
     }
 
     fn note(&self) -> String {
-        let kind = if self.system {
+        let kind = if !self.system_known {
+            "Windows system disk status unknown"
+        } else if self.system {
             "This computer’s Windows disk"
+        } else if self.zfs_partition {
+            "ZFS partition"
         } else if self.removable {
             "Removable drive"
         } else {
@@ -2974,49 +2981,15 @@ unsafe fn open_physical_drive(state: &mut AppState) {
 }
 
 fn enumerate_physical_drives() -> Vec<PhysicalDrive> {
-    let system = system_disk_number();
-    (0..64)
-        .filter_map(|number| inspect_physical_drive(number, system))
+    let system = drive_inventory::windows_volume_disks().ok();
+    drive_inventory::physical_disk_numbers()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|number| inspect_physical_drive(number, system.as_deref()))
         .collect()
 }
 
-/// The disk number holding the Windows system volume, so it can be labeled.
-fn system_disk_number() -> Option<u32> {
-    let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_owned());
-    let path = wide(&format!(r"\\.\{drive}"));
-    // SAFETY: the handle is opened with zero desired access, the output buffer
-    // has the documented layout, and the handle is always closed.
-    unsafe {
-        let handle = CreateFileW(
-            path.as_ptr(),
-            0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            null(),
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            null_mut(),
-        );
-        if handle == INVALID_HANDLE_VALUE {
-            return None;
-        }
-        let mut extents = VOLUME_DISK_EXTENTS::default();
-        let mut returned = 0_u32;
-        let ok = DeviceIoControl(
-            handle,
-            IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
-            null(),
-            0,
-            (&mut extents as *mut VOLUME_DISK_EXTENTS).cast(),
-            size_of::<VOLUME_DISK_EXTENTS>() as u32,
-            &mut returned,
-            null_mut(),
-        ) != 0;
-        CloseHandle(handle);
-        (ok && extents.NumberOfDiskExtents >= 1).then_some(extents.Extents[0].DiskNumber)
-    }
-}
-
-fn inspect_physical_drive(number: u32, system: Option<u32>) -> Option<PhysicalDrive> {
+fn inspect_physical_drive(number: u32, system: Option<&[u32]>) -> Option<PhysicalDrive> {
     let path = format!(r"\\.\PhysicalDrive{number}");
     let path_wide = wide(&path);
     // SAFETY: the handle is opened with zero desired access and is closed on
@@ -3123,8 +3096,11 @@ fn inspect_physical_drive(number: u32, system: Option<u32>) -> Option<PhysicalDr
             } else {
                 (String::new(), false)
             };
+        let zfs_partition = system.is_some_and(|disks| !disks.contains(&number))
+            && drive_inventory::has_zfs_partition(handle);
         CloseHandle(handle);
         Some(PhysicalDrive {
+            zfs_partition,
             identity,
             path: PathBuf::from(&path),
             number,
@@ -3135,7 +3111,8 @@ fn inspect_physical_drive(number: u32, system: Option<u32>) -> Option<PhysicalDr
             },
             size,
             removable,
-            system: system == Some(number),
+            system: system.is_some_and(|disks| disks.contains(&number)),
+            system_known: system.is_some(),
         })
     }
 }
