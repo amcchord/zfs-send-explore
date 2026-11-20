@@ -2403,14 +2403,6 @@ unsafe fn set_busy(state: &mut AppState, busy: bool, message: &str) {
         state.control = JobControl::default();
     }
     state.activity = message.to_owned();
-    ShowWindow(
-        state.controls.open_backup,
-        if busy { SW_HIDE } else { SW_SHOW },
-    );
-    ShowWindow(
-        state.controls.cancel_job,
-        if busy { SW_SHOW } else { SW_HIDE },
-    );
     EnableWindow(state.controls.cancel_job, busy as i32);
     state.busy = busy;
     let enabled = (!busy) as i32;
@@ -2491,7 +2483,6 @@ unsafe fn update_mode(state: &AppState) {
     ] {
         ShowWindow(control, if open { SW_SHOW } else { SW_HIDE });
     }
-    ShowWindow(controls.close_source, if open { SW_SHOW } else { SW_HIDE });
     let menu = GetMenu(state.hwnd);
     windows_sys::Win32::UI::WindowsAndMessaging::EnableMenuItem(
         menu,
@@ -2540,6 +2531,14 @@ unsafe fn update_header(state: &AppState) {
 
 unsafe fn update_context_visibility(state: &AppState) {
     let open = source_open(state);
+    for (control, visible) in [
+        (state.controls.open_drive, open),
+        (state.controls.open_backup, open && !state.busy),
+        (state.controls.close_source, open),
+        (state.controls.cancel_job, state.busy),
+    ] {
+        ShowWindow(control, if visible { SW_SHOW } else { SW_HIDE });
+    }
     let in_image = !state.inception.is_empty();
     let show_view = open && state.catalog.is_some();
     let show_range = open && state.settings.show_advanced_image_range;
@@ -3885,17 +3884,19 @@ unsafe fn layout(state: &AppState) {
         row,
         1,
     );
-    for (control, button_width) in [
-        (controls.open_backup, scale(140)),
-        (controls.open_drive, scale(158)),
-        (controls.close_source, scale(90)),
-    ] {
-        if control == controls.close_source && !source_open(state) {
-            continue;
+    let open = source_open(state);
+    if open {
+        for (control, button_width) in [
+            (controls.open_backup, scale(140)),
+            (controls.open_drive, scale(158)),
+            (controls.close_source, scale(90)),
+        ] {
+            right -= button_width;
+            MoveWindow(control, right, button_y, button_width, row, 1);
+            right -= gap;
         }
-        right -= button_width;
-        MoveWindow(control, right, button_y, button_width, row, 1);
-        right -= gap;
+    } else if state.busy {
+        right -= scale(140) + gap;
     }
     let text_x = scale(18 + 36 + 14);
     let text_width = (right - text_x - gap).max(scale(120));
@@ -3916,7 +3917,7 @@ unsafe fn layout(state: &AppState) {
         1,
     );
 
-    if !source_open(state) {
+    if !open {
         let column = (width - pad * 2).min(scale(640));
         let x = (width - column) / 2;
         // Keep all three entry points above the status bar on short, high-DPI displays.
