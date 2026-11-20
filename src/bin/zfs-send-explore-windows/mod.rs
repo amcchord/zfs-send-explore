@@ -33,8 +33,9 @@ use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{
     GET_LENGTH_INFORMATION, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, IOCTL_DISK_GET_LENGTH_INFO,
-    IOCTL_STORAGE_QUERY_PROPERTY, PropertyStandardQuery, STORAGE_DEVICE_DESCRIPTOR,
-    STORAGE_PROPERTY_QUERY, StorageDeviceProperty, VOLUME_DISK_EXTENTS,
+    IOCTL_STORAGE_GET_DEVICE_NUMBER_EX, IOCTL_STORAGE_QUERY_PROPERTY, PropertyStandardQuery,
+    STORAGE_DEVICE_DESCRIPTOR, STORAGE_DEVICE_NUMBER_EX, STORAGE_PROPERTY_QUERY,
+    StorageDeviceProperty, VOLUME_DISK_EXTENTS,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::WindowsProgramming::MulDiv;
@@ -318,8 +319,9 @@ struct ImageFrame {
     parent_volume: Option<usize>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PhysicalDrive {
+    identity: Option<String>,
     path: PathBuf,
     number: u32,
     model: String,
@@ -1455,10 +1457,7 @@ unsafe fn open_path_dialog(state: &mut AppState) {
 }
 
 unsafe fn open_source(state: &mut AppState, mode: OpenMode) {
-    let paths = state.input_paths.clone();
-    let Some(path) = paths.first().cloned() else {
-        return choose_source(state, mode);
-    };
+    let paths = &state.input_paths;
     if paths.len() > 1
         && state.settings.confirm_physical_drive
         && paths.iter().any(|path| is_physical_path(path))
@@ -1472,7 +1471,7 @@ unsafe fn open_source(state: &mut AppState, mode: OpenMode) {
                 ..Task::new(
                     DialogIcon::Warning,
                     "Open the selected disks together?",
-                    &path_text(&paths),
+                    &path_text(paths),
                 )
             },
         ) != Some(0)
@@ -1480,6 +1479,14 @@ unsafe fn open_source(state: &mut AppState, mode: OpenMode) {
         restore_source_box_after_failed_open(state, Some(PendingJob::Open(mode)));
         return;
     }
+    open_selected_sources(state, mode);
+}
+
+unsafe fn open_selected_sources(state: &mut AppState, mode: OpenMode) {
+    let paths = state.input_paths.clone();
+    let Some(path) = paths.first().cloned() else {
+        return choose_source(state, mode);
+    };
     let status = if paths.len() > 1 {
         format!("Opening {} pool members…", paths.len())
     } else {
@@ -2846,8 +2853,19 @@ fn open_automatically(path: PathBuf, container_key: Option<&[u8]>) -> Result<Job
 
 /// List physical drives in a native chooser and open the chosen one read-only.
 unsafe fn open_physical_drive(state: &mut AppState) {
+    let mut selected: Vec<PhysicalDrive> = Vec::new();
     loop {
-        let drives = enumerate_physical_drives();
+        let mut drives = enumerate_physical_drives();
+        if selected.iter().any(|chosen| !drives.contains(chosen)) {
+            show_message(
+                state.hwnd,
+                DialogIcon::Warning,
+                "A selected drive changed",
+                "Choose the members again. A drive was removed or its identity changed.",
+            );
+            selected.clear();
+        }
+        drives.retain(|candidate| !selected.contains(candidate));
         let titles = drives.iter().map(PhysicalDrive::title).collect::<Vec<_>>();
         let notes = drives.iter().map(PhysicalDrive::note).collect::<Vec<_>>();
         let mut actions = titles
@@ -2856,16 +2874,25 @@ unsafe fn open_physical_drive(state: &mut AppState) {
             .map(|(title, note)| (title.as_str(), note.as_str()))
             .collect::<Vec<_>>();
         actions.push(("Refresh the list", "Choose this after connecting a drive."));
-        let content = if drives.is_empty() {
-            "No drives are visible to ZFS Explore. Connect the drive, then choose Refresh. Reading drives usually requires starting ZFS Explore with “Run as administrator”."
+        let chosen = selected
+            .iter()
+            .map(PhysicalDrive::title)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let content = if !selected.is_empty() {
+            format!(
+                "Selected members:\n{chosen}\n\nChoose another drive from the same offline pool. Connect a missing drive and choose Refresh."
+            )
+        } else if drives.is_empty() {
+            "No drives are visible to ZFS Explore. Connect the drive, then choose Refresh. Reading drives usually requires starting ZFS Explore with “Run as administrator”.".to_owned()
         } else {
-            "Choose the drive that came from your Slide or Datto device. It opens read-only: nothing on it is written, mounted or initialized. If a drive is missing, connect it and choose Refresh."
+            "Choose the drive that came from your Slide or Datto device. It opens read-only: nothing on it is written, mounted or initialized. If a drive is missing, connect it and choose Refresh.".to_owned()
         };
         let footer = "Drives can only be read when ZFS Explore runs as an administrator. Right-click the app and choose “Run as administrator” if Windows denies access.";
         let task = Task {
             actions: &actions,
             footer: Some(footer),
-            ..Task::new(DialogIcon::Information, "Open a connected drive", content)
+            ..Task::new(DialogIcon::Information, "Open a connected drive", &content)
         };
         match task_dialog(state.hwnd, &task) {
             Some(index) if index < drives.len() => {
@@ -2885,9 +2912,59 @@ unsafe fn open_physical_drive(state: &mut AppState) {
                 {
                     continue;
                 }
-                state.drive_title = Some((drive.path.clone(), drive.title()));
-                set_input_paths(state, vec![drive.path.clone()]);
-                open_source(state, OpenMode::Auto);
+                if !selected.is_empty() && drive.identity.is_none() {
+                    show_message(
+                        state.hwnd,
+                        DialogIcon::Warning,
+                        "Windows could not identify this drive",
+                        "Keeping several drives selected requires a stable device ID. Open offline images of the member drives together.",
+                    );
+                    continue;
+                }
+                selected.push(drive.clone());
+                let names = selected
+                    .iter()
+                    .map(|d| format!("{} · {}", d.title(), d.path.display()))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let mut actions = vec![(
+                    "Open read-only",
+                    "Read the selected drives without mounting or changing them.",
+                )];
+                if drive.identity.is_some() {
+                    actions.push((
+                        "Add another member",
+                        "Choose another drive from the same offline striped pool.",
+                    ));
+                }
+                match task_dialog(
+                    state.hwnd,
+                    &Task {
+                        actions: &actions,
+                        ..Task::new(DialogIcon::Information, "Review selected drives", &names)
+                    },
+                ) {
+                    Some(1) => continue,
+                    Some(0) => {}
+                    _ => return,
+                }
+                let current = enumerate_physical_drives();
+                if selected.iter().any(|chosen| !current.contains(chosen)) {
+                    show_message(
+                        state.hwnd,
+                        DialogIcon::Warning,
+                        "A selected drive changed",
+                        "Choose the members again. A drive was removed or its identity changed.",
+                    );
+                    selected.clear();
+                    continue;
+                }
+                let paths: Vec<_> = selected.iter().map(|drive| drive.path.clone()).collect();
+                if let [drive] = selected.as_slice() {
+                    state.drive_title = Some((drive.path.clone(), drive.title()));
+                }
+                set_input_paths(state, paths);
+                open_selected_sources(state, OpenMode::Auto);
                 return;
             }
             Some(_) => continue,
@@ -3003,9 +3080,38 @@ fn inspect_physical_drive(number: u32, system: Option<u32>) -> Option<PhysicalDr
             &mut returned,
             null_mut(),
         ) != 0;
+        let mut number_ex = STORAGE_DEVICE_NUMBER_EX::default();
+        let mut id_bytes = 0;
+        let mut identity = None;
+        if DeviceIoControl(
+            handle,
+            IOCTL_STORAGE_GET_DEVICE_NUMBER_EX,
+            null(),
+            0,
+            (&mut number_ex as *mut STORAGE_DEVICE_NUMBER_EX).cast(),
+            size_of::<STORAGE_DEVICE_NUMBER_EX>() as u32,
+            &mut id_bytes,
+            null_mut(),
+        ) != 0
+            && id_bytes as usize >= size_of::<STORAGE_DEVICE_NUMBER_EX>()
+        {
+            let guid = number_ex.DeviceGuid;
+            if (guid.data1, guid.data2, guid.data3, guid.data4) != (0, 0, 0, [0; 8]) {
+                identity = Some(format!(
+                    "guid:{:08x}-{:04x}-{:04x}-{:02x?}",
+                    guid.data1, guid.data2, guid.data3, guid.data4
+                ));
+            }
+        }
         let (model, removable) =
             if descriptor_ok && returned as usize >= size_of::<STORAGE_DEVICE_DESCRIPTOR>() {
                 let header = &*(descriptor.as_ptr().cast::<STORAGE_DEVICE_DESCRIPTOR>());
+                if identity.is_none() {
+                    let serial = descriptor_string(&descriptor, header.SerialNumberOffset);
+                    if !serial.is_empty() {
+                        identity = Some(format!("serial:{serial}"));
+                    }
+                }
                 let vendor = descriptor_string(&descriptor, header.VendorIdOffset);
                 let product = descriptor_string(&descriptor, header.ProductIdOffset);
                 let model = [vendor, product]
@@ -3019,6 +3125,7 @@ fn inspect_physical_drive(number: u32, system: Option<u32>) -> Option<PhysicalDr
             };
         CloseHandle(handle);
         Some(PhysicalDrive {
+            identity,
             path: PathBuf::from(&path),
             number,
             model: if model.is_empty() {

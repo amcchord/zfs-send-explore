@@ -201,6 +201,11 @@ For a physical drive:
 2. Choose **Open drive…** (Ctrl+D). Each drive is listed with its disk number,
    model, size and type; the computer's own Windows disk is labelled and asks
    for a second confirmation. Choose **Refresh the list** after connecting a drive.
+   Review the selected drive, then choose **Open read-only**. For a striped pool,
+   choose **Add another member** until every disk is listed, then choose **Open
+   read-only**. The app verifies the selected drives are still present before
+   opening them. For a device that reports neither an ID nor a serial number,
+   use offline images to assemble multiple members.
 3. Choose the drive. It opens read-only.
 4. If Windows reports that access was denied, close ZFS Explore, right-click it,
    choose **Run as administrator**, and open the drive again.

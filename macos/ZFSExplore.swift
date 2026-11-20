@@ -190,7 +190,7 @@ final class Engine: @unchecked Sendable {
     @Published var showPath = false
     @Published var showDrives = false
     @Published var drives: [AttachedDrive] = []
-    @Published var driveSelection: String?
+    @Published var driveSelection = Set<String>()
     @Published var showPreferences = false
     @Published var sourcePath = ""
     /// Name of the drive chosen in the picker, shown instead of its device node.
@@ -290,20 +290,24 @@ final class Engine: @unchecked Sendable {
     }
     func chooseDrive() {
         refreshDrives()
-        driveSelection = drives.first?.suggested.id
+        driveSelection = Set(drives.first.map { [$0.suggested.id] } ?? [])
         showDrives = true
     }
     func refreshDrives() {
         drives = AttachedDrive.scan()
-        let slices = drives.flatMap { [$0.disk] + $0.partitions }
-        // A removed disk must not silently select a different attached drive.
-        if !slices.contains(where: { $0.id == driveSelection }) { driveSelection = nil }
+        if !driveSelection.isEmpty, AttachedDrive.resolve(driveSelection, in: drives) == nil {
+            driveSelection.removeAll()
+        }
     }
     func openDrive() {
-        guard let drive = drives.first(where: { ([$0.disk] + $0.partitions).contains { $0.id == driveSelection } }),
-              let selected = ([drive.disk] + drive.partitions).first(where: { $0.id == driveSelection }) else { return }
+        let selection = driveSelection
+        refreshDrives()
+        guard let selected = AttachedDrive.resolve(selection, in: drives) else { return }
+        let (drive, slice) = selected[0]
+        let title = slice.whole ? drive.name : "\(drive.name) · \(slice.typeLabel)"
         showDrives = false
-        open([URL(fileURLWithPath: selected.path)], drive: (selected.path, selected.whole ? drive.name : "\(drive.name) · \(selected.typeLabel)"))
+        open(selected.map { URL(fileURLWithPath: $0.1.path) },
+             drive: selected.count == 1 ? (slice.path, title) : nil)
     }
     func openPath() {
         showPath = false
@@ -1119,7 +1123,7 @@ struct DrivePicker: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Label("Open a connected drive", systemImage: "externaldrive.connected.to.line.below").font(.title2.bold())
-            Text("Backup drives from Slide or Datto devices don’t appear in Finder because macOS can’t read them. Choose the drive below; ZFS Explore suggests the part that holds the backup.")
+            Text("Choose your backup drive or its suggested partition. For a striped pool, hold Command and click one member on each drive.")
                 .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             List(selection: $model.driveSelection) {
                 ForEach(model.drives) { drive in
@@ -1146,7 +1150,8 @@ struct DrivePicker: View {
                 Button("Refresh") { model.refreshDrives() }
                 Spacer()
                 Button("Cancel") { model.showDrives = false }.keyboardShortcut(.cancelAction)
-                Button("Open Drive") { model.openDrive() }.keyboardShortcut(.defaultAction).disabled(model.driveSelection == nil)
+                Button(model.driveSelection.count > 1 ? "Open \(model.driveSelection.count) Members" : "Open Drive") { model.openDrive() }
+                    .keyboardShortcut(.defaultAction).disabled(model.driveSelection.isEmpty)
             }
         }
         .padding(26).frame(width: 580)

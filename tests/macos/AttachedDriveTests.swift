@@ -19,6 +19,13 @@ import Foundation
         precondition(slice("disk99s2", "516E7CBA-6ECF-11D6-8FF8-00022D09712B").typeLabel == "ZFS")
         precondition(zfs.path == "/dev/disk99s2")
         precondition(slice("disk99", "", whole: true, media: 1).id != slice("disk99", "", whole: true, media: 2).id, "Reused BSD names must not keep a prior selection")
+        let second = AttachedDrive(disk: slice("disk100", "", whole: true, media: 3), name: "Second", bus: "USB", partitions: [])
+        let pair: Set<String> = [drive.disk.id, second.disk.id]
+        precondition(AttachedDrive.resolve(pair, in: [drive, second])?.map { $0.1.path } == ["/dev/disk99", "/dev/disk100"])
+        precondition(AttachedDrive.resolve(pair, in: [drive]) == nil, "Missing members must clear the entire selection")
+        let replacement = AttachedDrive(disk: slice("disk100", "", whole: true, media: 4), name: "Second", bus: "USB", partitions: [])
+        precondition(AttachedDrive.resolve(pair, in: [drive, replacement]) == nil)
+        precondition(AttachedDrive.resolve([second.disk.id], in: [second])?.count == 1)
         let actual = AttachedDrive.scan()
         for d in actual { print("\(d.disk.path) \(d.title) \(d.partitions.map(\.path))") }
         print("PASS: ZFS/Linux selection, mounted/system fallback, device identity and live discovery")
