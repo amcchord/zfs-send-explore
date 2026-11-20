@@ -1,0 +1,1 @@
+Version 0.3.2 from the original Cargo.lock. Verified crate archive SHA-256 `cc5a1861a5db32da366fe7596bb1c8376a4fc64e04a95f90a90cd426870bfc11`. Source, tests, manifest, license and upstream README are included. The public registry index entry was unavailable during the November 2026 build.
