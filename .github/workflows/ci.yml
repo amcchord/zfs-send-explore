@@ -19,6 +19,26 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all-targets
 
+      - name: Restore a real two-member stripe
+        timeout-minutes: 12
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install --yes --no-install-recommends zfsutils-linux
+          if ! modinfo zfs >/dev/null 2>&1; then
+            sudo apt-get install --yes "linux-modules-extra-$(uname -r)"
+          fi
+          sudo modprobe zfs
+          cargo build --locked --bin zfs-send-extract
+          fixture="$RUNNER_TEMP/zfse-stripe"
+          sudo ./scripts/create-striped-pool-fixture.sh "$fixture"
+          foreign="zfse_other_${GITHUB_RUN_ID}"
+          sudo truncate -s 96M "$fixture/other.img"
+          sudo zpool create -o cachefile=none -O mountpoint=none "$foreign" "$fixture/other.img"
+          sudo zpool export "$foreign"
+          sudo chown -R "$(id -u):$(id -g)" "$fixture"
+          python3 scripts/verify-striped-pool.py target/debug/zfs-send-extract "$fixture" \
+            "$RUNNER_TEMP/stripe-restores" --foreign-member "$fixture/other.img"
+
   windows:
     runs-on: windows-latest
     steps:
