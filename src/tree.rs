@@ -15,6 +15,7 @@ pub struct RecursiveExtraction {
     pub logical_bytes: u64,
     /// Symlinks and unsupported special entries are reported but never followed.
     pub skipped_entries: u64,
+    pub report_name: String,
 }
 
 fn source_child(parent: &str, name: &str) -> String {
@@ -76,6 +77,7 @@ fn remove_staged_path(path: &Path) -> Result<()> {
 /// every regular file succeeds. A forced replacement keeps the previous tree
 /// in the staging directory until the new tree has been renamed into place.
 pub(crate) fn extract_directory_tree<List, Extract>(
+    source: &str,
     source_root: &str,
     destination: &Path,
     force: bool,
@@ -114,6 +116,7 @@ where
         directories: 1,
         ..RecursiveExtraction::default()
     };
+    let mut report = crate::report::ReportWriter::new(staging.path(), source, source_root)?;
     let mut stack = vec![(source_root.to_owned(), staged_root.clone(), 0usize)];
     while let Some((source_directory, target_directory, depth)) = stack.pop() {
         if depth > MAX_TREE_DEPTH {
@@ -130,18 +133,26 @@ where
             validate_component(&entry.name)?;
             let source_path = source_child(&source_directory, &entry.name);
             let target_path = target_directory.join(&entry.name);
+            let relative = target_path
+                .strip_prefix(&staged_root)?
+                .components()
+                .map(|p| p.as_os_str().to_str().context("invalid name"))
+                .collect::<Result<Vec<_>>>()?
+                .join("/");
+            let mut expected_bytes = 0;
             match entry.dirent_type {
                 4 => {
                     fs::create_dir(&target_path).with_context(|| {
                         format!("creating recovered directory {}", target_path.display())
                     })?;
                     result.directories += 1;
-                    stack.push((source_path, target_path, depth + 1));
+                    stack.push((source_path, target_path.clone(), depth + 1));
                 }
                 8 => {
                     let bytes = extract(&source_path, &target_path).with_context(|| {
                         format!("extracting {source_path:?} to {}", target_path.display())
                     })?;
+                    expected_bytes = bytes;
                     result.files += 1;
                     result.logical_bytes = result
                         .logical_bytes
@@ -150,9 +161,11 @@ where
                 }
                 _ => result.skipped_entries += 1,
             }
+            report.entry(&relative, &target_path, entry.dirent_type, expected_bytes)?;
         }
     }
 
+    result.report_name = report.finish(&staged_root)?;
     let previous = staging.path().join("previous");
     if path_exists(destination) {
         fs::rename(destination, &previous).with_context(|| {
@@ -186,6 +199,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let destination = temporary.path().join("recovered");
         let result = extract_directory_tree(
+            "test snapshot",
             "/Users",
             &destination,
             false,
@@ -221,6 +235,7 @@ mod tests {
 
         fs::write(destination.join("old.txt"), b"old").unwrap();
         extract_directory_tree(
+            "test snapshot",
             "/empty",
             &destination,
             true,
@@ -239,6 +254,7 @@ mod tests {
         fs::write(destination.join("old.txt"), b"old").unwrap();
 
         let result = extract_directory_tree(
+            "test snapshot",
             "/",
             &destination,
             true,
@@ -255,5 +271,62 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(fs::read(destination.join("old.txt")).unwrap(), b"old");
         assert!(!destination.join("new.txt").exists());
+    }
+}
+
+#[cfg(test)]
+mod report_tests {
+    use super::*;
+    #[test]
+    fn reports_files_empty_folders_and_skipped_links_and_detects_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join("restored");
+        let entry = |name: &str, kind| DirectoryEntry {
+            name: name.into(),
+            object_id: 1,
+            dirent_type: kind,
+            logical_size: None,
+        };
+        let result = extract_directory_tree(
+            "tank/host@day1",
+            "/docs",
+            &dest,
+            false,
+            |p| {
+                Ok(if p == "/docs" {
+                    vec![
+                        entry("empty", 4),
+                        entry("link", 10),
+                        entry("ZFS Restore Report.jsonl", 8),
+                    ]
+                } else {
+                    vec![]
+                })
+            },
+            |_, p| {
+                fs::write(p, b"document")?;
+                Ok(8)
+            },
+        )
+        .unwrap();
+        assert_eq!(result.report_name, "ZFS Restore Report (1).jsonl");
+        let report = dest.join(result.report_name);
+        assert_eq!(crate::report::verify(&report).unwrap(), 3);
+        let records: Vec<serde_json::Value> = fs::read_to_string(&report)
+            .unwrap()
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        assert_eq!(records[0]["source"], "tank/host@day1");
+        assert!(records.iter().any(|v| v["kind"] == "skipped"
+            && v["path"] == "link"
+            && v["reason"] == "symbolic link"));
+        fs::write(dest.join("ZFS Restore Report.jsonl"), b"changed").unwrap();
+        assert!(
+            crate::report::verify(&report)
+                .unwrap_err()
+                .to_string()
+                .contains("ZFS Restore Report.jsonl")
+        );
     }
 }

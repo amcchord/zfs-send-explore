@@ -131,6 +131,7 @@ pub struct NestedExtraction {
 
 /// An inspected inner disk image. All source access remains read-only.
 pub struct InceptionSession {
+    snapshot: Option<String>,
     source: Arc<dyn ImageRead>,
     image_path: String,
     stored_size: u64,
@@ -180,7 +181,13 @@ impl InceptionSession {
         let normalized_path = resolved.normalized_path.clone();
         let source = Arc::new(StreamImage::build(stream, &plan, &resolved, key_material)?)
             as Arc<dyn ImageRead>;
-        Self::inspect_source_at(source, normalized_path, image_offset, image_length)
+        let mut session =
+            Self::inspect_source_at(source, normalized_path, image_offset, image_length)?;
+        session.snapshot = Some(format!(
+            "{} ({:#018x})",
+            plan.target.dataset_name, plan.target.to_guid
+        ));
+        Ok(session)
     }
 
     pub fn from_pool(member: &Path, dataset: &str, image_path: &str) -> Result<Self> {
@@ -276,7 +283,10 @@ impl InceptionSession {
         if let Some(key) = datto_key {
             source = Arc::new(DettoImage::new(source, key)?) as Arc<dyn ImageRead>;
         }
-        Self::inspect_source_at(source, image_path.to_owned(), image_offset, image_length)
+        let mut session =
+            Self::inspect_source_at(source, image_path.to_owned(), image_offset, image_length)?;
+        session.snapshot = Some(dataset.to_owned());
+        Ok(session)
     }
 
     /// Build a session around any bounded source so tests can exercise nested
@@ -301,6 +311,15 @@ impl InceptionSession {
         let stored_size = image_length.unwrap_or(source.len() - image_offset);
         let window =
             Arc::new(SlicedImage::new(source, image_offset, stored_size)?) as Arc<dyn ImageRead>;
+        if stored_size >= 4 {
+            let mut signature = [0; 4];
+            window.read_exact_at(0, &mut signature)?;
+            if signature == [0x28, 0xb5, 0x2f, 0xfd] || signature.starts_with(&[0x1f, 0x8b, 0x08]) {
+                bail!(
+                    "Compressed backup download. Expand the .zst or .gz file, then open the expanded image or send file."
+                );
+            }
+        }
         if stored_size < 512 {
             bail!("nested image window is only {stored_size} bytes");
         }
@@ -329,6 +348,7 @@ impl InceptionSession {
             .map(|layout| probe_volume(&source, layout))
             .collect::<Vec<_>>();
         Ok(Self {
+            snapshot: None,
             source,
             image_path,
             stored_size,
@@ -437,8 +457,15 @@ impl InceptionSession {
     ) -> Result<RecursiveExtraction> {
         // Force volume selection once so an ambiguous image fails before the
         // staging directory is created.
-        self.select_volume(volume)?;
+        let selected = self.select_volume(volume)?;
+        let origin = format!(
+            "{} · {} · {}",
+            self.snapshot.as_deref().unwrap_or("Disk image"),
+            self.image_path,
+            selected.selector
+        );
         extract_directory_tree(
+            &origin,
             path,
             output,
             force,
@@ -477,12 +504,14 @@ impl InceptionSession {
             path: normalized.clone(),
             len: length,
         }) as Arc<dyn ImageRead>;
-        Self::inspect_source_at(
+        let mut session = Self::inspect_source_at(
             image,
             format!("{}!{}:{}", self.image_path, volume.selector, normalized),
             image_offset,
             image_length,
-        )
+        )?;
+        session.snapshot = self.snapshot.clone();
+        Ok(session)
     }
 
     fn select_volume(&self, selector: Option<&str>) -> Result<&VolumeInfo> {

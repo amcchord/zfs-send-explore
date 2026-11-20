@@ -193,6 +193,7 @@ impl Session {
             Ok(source) => candidate.source = Some(source),
             Err(send_error) => match SourceCatalog::open_pool(source_path) {
                 Ok(source) => candidate.source = Some(source),
+                Err(e) if e.is::<zfs_send_extract::pool::PoolLayout>() => return Err(e),
                 Err(pool_error) => match InceptionCatalog::open_file(source_path, 0, None) {
                     Ok(image) => candidate.layers.push(Self::new_layer(image)),
                     Err(image_error) => bail!(
@@ -362,6 +363,20 @@ impl Session {
                     .find(|e| e.name == name)
                     .context("Select an existing file or folder first")?;
                 let path = child_path(self.current_path(), &name)?;
+                let origin = self
+                    .source
+                    .as_ref()
+                    .and_then(|s| s.views.get(self.view))
+                    .map(|v| v.label.as_str())
+                    .unwrap_or(&self.title);
+                let source = match self.layers.last() {
+                    Some(layer) => format!(
+                        "{origin} · {} · {}",
+                        layer.catalog.image_path,
+                        layer.volume.as_deref().unwrap_or("")
+                    ),
+                    None => origin.to_owned(),
+                };
                 let destination = Path::new(&destination);
                 // Never overwrite from the desktop bridge, even after a Save dialog replacement prompt.
                 if std::fs::symlink_metadata(destination).is_ok() {
@@ -387,8 +402,8 @@ impl Session {
                         )?
                     };
                     Ok(
-                        json!({"restored": destination, "bytes": result.logical_bytes, "files": result.files,
-                        "skipped": result.skipped_entries}),
+                        json!({"restored": destination, "source": source, "source_path": path, "bytes": result.logical_bytes, "files": result.files,
+                        "report": destination.join(&result.report_name), "skipped": result.skipped_entries}),
                     )
                 } else if entry.dirent_type == 8 {
                     let result = if let Some(layer) = self.layers.last() {
@@ -405,7 +420,7 @@ impl Session {
                         )?
                     };
                     Ok(
-                        json!({"restored": destination, "bytes": result.logical_size, "sha256": result.sha256, "files": 1, "skipped": 0}),
+                        json!({"restored": destination, "source": source, "source_path": path, "bytes": result.logical_size, "sha256": result.sha256, "files": 1, "skipped": 0}),
                     )
                 } else {
                     bail!(

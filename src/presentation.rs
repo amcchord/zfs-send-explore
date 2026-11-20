@@ -195,7 +195,14 @@ pub struct FriendlyError {
 /// Turn an engine error into a headline, a next step, and retained details.
 pub fn friendly_error(raw: &str) -> FriendlyError {
     let lower = raw.to_ascii_lowercase();
-    let (title, message) = if lower.contains("could not open this backup")
+    let (title, message) = if lower.starts_with("pool layout for ") {
+        ("This pool layout needs a different recovery source", raw)
+    } else if lower.contains("compressed backup download") {
+        (
+            "Expand this backup first",
+            "Decompress the download, then open the expanded image or send file. For a .zst file, use zstd -d or a Zstandard-compatible archive tool.",
+        )
+    } else if lower.contains("could not open this backup")
         || lower.contains("source was not recognized")
     {
         (

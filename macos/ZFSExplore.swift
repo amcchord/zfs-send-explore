@@ -38,7 +38,7 @@ struct BrowserState: Decodable {
     var selectedView: BackupView? { views.indices.contains(view) ? views[view] : nil }
     var needsVolume: Bool { !layers.isEmpty && volume == nil && !volumes.isEmpty }
 }
-struct RestoreResult: Decodable { let restored: String; let bytes: UInt64; let files: UInt64; let skipped: UInt64; let sha256: String? }
+struct RestoreResult: Decodable { let restored: String; let bytes: UInt64; let files: UInt64; let skipped: UInt64; let sha256: String?; let source: String?; let source_path: String?; let report: String? }
 struct ServiceError: LocalizedError {
     var title = "That didn’t work"
     let message: String
@@ -147,7 +147,7 @@ final class Engine: @unchecked Sendable {
     func run(_ request: [String: Any], activity: String, restore: Bool = false) async -> Bool {
         guard !busy else { return false }
         busy = true; self.activity = activity; error = nil
-        if !restore { restored = nil }
+        restored = nil
         defer { busy = false }
         do {
             let result = try await engine.request(try JSONSerialization.data(withJSONObject: request))
@@ -248,6 +248,7 @@ final class Engine: @unchecked Sendable {
     func close() { perform(["method": "close"], activity: "Closing backup…"); restored = nil }
     func restore() {
         guard let entry = selected, entry.restorable else { return }
+        restored = nil; error = nil
         let panel = NSSavePanel(); panel.title = entry.directory ? "Restore Folder" : "Restore File"
         panel.prompt = "Restore"; panel.nameFieldStringValue = entry.name
         panel.message = "Choose where to save a copy of “\(entry.name)”. Existing files are never replaced."
@@ -875,7 +876,13 @@ struct RestoredBanner: View {
             }
             if details {
                 VStack(alignment: .leading, spacing: 4) {
+                    if let source = result.source, let path = result.source_path {
+                        Text("From \(source) · \(path)").font(.caption).textSelection(.enabled)
+                    }
                     Text(result.restored).font(.caption).textSelection(.enabled)
+                    if let report = result.report {
+                        Button("Show restore report") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: report)]) }
+                    }
                     if let hash = result.sha256 { Text("SHA-256  \(hash)").font(.system(size: 11, design: .monospaced)).textSelection(.enabled) }
                     Text("Only file contents are restored; owners, permissions and timestamps are not.").font(.caption).foregroundStyle(.secondary)
                 }.padding(.leading, 44)

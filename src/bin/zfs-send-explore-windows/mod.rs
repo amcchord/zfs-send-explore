@@ -413,11 +413,13 @@ enum JobResult {
         entries: Vec<DirectoryEntry>,
     },
     Extracted {
+        origin: String,
         destination: PathBuf,
         extraction: ClientExtraction,
         nested: bool,
     },
     TreeExtracted {
+        origin: String,
         destination: PathBuf,
         extraction: RecursiveExtraction,
     },
@@ -1474,6 +1476,22 @@ unsafe fn extract_selected(state: &mut AppState) {
             return;
         }
     };
+    let mut origin = catalog
+        .as_ref()
+        .and_then(|c| view.and_then(|v| c.views.get(v)))
+        .map(|v| v.label.clone())
+        .unwrap_or_default();
+    if let Some(frame) = state.inception.last() {
+        origin.push_str(&format!(
+            " {} {}",
+            frame.catalog.image_path,
+            selected_volume_index(state)
+                .and_then(|i| frame.catalog.volumes.get(i))
+                .map(|v| v.selector.as_str())
+                .unwrap_or("")
+        ));
+    }
+    let origin = format!("{} · {}", origin.trim(), source_path);
     let key = active_zfs_key(state);
     let inception = state.inception.last().map(|frame| frame.catalog.clone());
     let volume_index = selected_volume_index(state);
@@ -1500,6 +1518,7 @@ unsafe fn extract_selected(state: &mut AppState) {
                     )?
             };
             return Ok(JobResult::TreeExtracted {
+                origin,
                 destination,
                 extraction,
             });
@@ -1529,6 +1548,7 @@ unsafe fn extract_selected(state: &mut AppState) {
             )
         };
         Ok(JobResult::Extracted {
+            origin,
             destination,
             extraction,
             nested,
@@ -1992,6 +2012,7 @@ unsafe fn finish_job(state: &mut AppState, result: JobMessage) {
             browse(state, "/".to_owned());
         }
         Ok(JobResult::Extracted {
+            origin,
             destination,
             extraction,
             nested,
@@ -2003,7 +2024,7 @@ unsafe fn finish_job(state: &mut AppState, result: JobMessage) {
             } else {
                 "\n\nThis copy came from current files, not a snapshot, so it can't be updated from an incremental send."
             };
-            let details = format!("SHA-256: {}{update}", extraction.sha256);
+            let details = format!("From {origin}\nSHA-256: {}{update}", extraction.sha256);
             show_restored(
                 state,
                 &destination,
@@ -2017,6 +2038,7 @@ unsafe fn finish_job(state: &mut AppState, result: JobMessage) {
             set_status(state, &format!("Restored {}", destination.display()));
         }
         Ok(JobResult::TreeExtracted {
+            origin,
             destination,
             extraction,
         }) => {
@@ -2055,7 +2077,10 @@ unsafe fn finish_job(state: &mut AppState, result: JobMessage) {
                     destination.display(),
                     presentation::format_size(extraction.logical_bytes),
                 ),
-                "Only file contents are restored; owners, permissions and timestamps are not. Links are never followed.",
+                &format!(
+                    "Report: {}\nFrom {origin}\nFile contents and directory names were restored. Ownership, permissions and timestamps are omitted.",
+                    destination.join(&extraction.report_name).display()
+                ),
             );
             set_status(
                 state,
@@ -2610,6 +2635,7 @@ fn open_automatically(path: PathBuf, container_key: Option<&[u8]>) -> Result<Job
     }
     match SourceCatalog::open_pool_with_container_key_material(&path, container_key) {
         Ok(catalog) => return Ok(JobResult::Catalog(catalog)),
+        Err(error) if error.is::<zfs_send_extract::pool::PoolLayout>() => return Err(error),
         Err(error) => errors.push(format!("pool member: {error:#}")),
     }
     if !send_first {

@@ -214,6 +214,12 @@ pub fn extract_tree_snapshot_with_key(
     let plan = plan_snapshot(stream, snapshot)?;
     let index = ObjectIndex::build_plan_with_key(stream, &plan, key_material)?;
     extract_directory_tree(
+        &format!(
+            "{} · {} ({})",
+            stream.display(),
+            plan.target.dataset_name,
+            guid_string(plan.target.to_guid)
+        ),
         path,
         output,
         force,

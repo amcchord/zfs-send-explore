@@ -20,6 +20,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Check the files and directories listed in a saved folder restore report.
+    Verify { report: PathBuf },
     /// Validate a stream and show its header and replay-record counts.
     Inspect {
         /// Full or incremental ZFS send stream.
@@ -106,6 +108,15 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum PoolCommand {
+    /// Identify each supplied disk from read-only labels, including unsupported pool layouts.
+    Layout {
+        #[arg(required = true, num_args = 1..)]
+        members: Vec<PathBuf>,
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        container: ContainerKeyInput,
+    },
     /// Validate a member and summarize its active pool state.
     Inspect {
         /// ZFS vdev partition, file vdev, or supported GPT/MBR whole disk/image (read-only).
@@ -378,6 +389,10 @@ enum PoolInceptionCommand {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Command::Verify { report } => {
+            let entries = zfs_send_extract::report::verify(&report)?;
+            println!("Verified restore report ({entries} entries).");
+        }
         Command::Inspect { stream, json } => {
             let inspection = operations::inspect_stream(&stream)?;
             if json {
@@ -525,6 +540,28 @@ fn main() -> Result<()> {
 
 fn run_pool(command: PoolCommand, time_zone: SnapshotTimeZone) -> Result<()> {
     match command {
+        PoolCommand::Layout {
+            members,
+            json,
+            container,
+        } => {
+            let key = load_optional_secret_file(
+                container.container_key_file.as_ref(),
+                "LUKS container passphrase",
+                4096,
+            )?;
+            let mut layouts = Vec::new();
+            for member in members {
+                let layout = PoolMember::layout(&member, key.as_deref().map(Vec::as_slice))?;
+                if !json {
+                    println!("{} — {layout}", member.display());
+                }
+                layouts.push((member, layout));
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&layouts)?);
+            }
+        }
         PoolCommand::Inspect {
             member,
             json,
@@ -918,6 +955,10 @@ fn print_tree_extraction(
         },
         extraction.logical_bytes,
         output.display()
+    );
+    println!(
+        "Restore report: {}",
+        output.join(&extraction.report_name).display()
     );
     if extraction.skipped_entries != 0 {
         println!(

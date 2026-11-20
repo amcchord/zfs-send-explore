@@ -151,3 +151,29 @@ fn invalid_device_authorization_preserves_the_existing_backup() {
         true
     );
 }
+
+#[test]
+fn unreadable_documents_and_compressed_downloads_preserve_the_open_source() {
+    let mut desktop = Desktop::start();
+    let original = fixture("tiny-full.zfs");
+    assert_eq!(
+        desktop.request(json!({"method":"open", "path":original}))["ok"],
+        true
+    );
+    let temporary = tempfile::tempdir().unwrap();
+    let document = temporary.path().join("document.txt");
+    std::fs::write(&document, "ordinary document\n".repeat(100)).unwrap();
+    for (path, title) in [
+        (document, "This file isn't a backup ZFS Explore can open"),
+        (
+            std::path::PathBuf::from(fixture("native-encrypted-pool.img.zst")),
+            "Expand this backup first",
+        ),
+    ] {
+        let failed = desktop.request(json!({"method":"open", "path":path}));
+        assert_eq!(failed["ok"], false, "{failed}");
+        assert_eq!(failed["title"], title, "{failed}");
+        let state = desktop.request(json!({"method":"list","path":"/"}));
+        assert_eq!(state["result"]["title"], "tiny-full.zfs");
+    }
+}

@@ -136,6 +136,19 @@ impl InceptionCatalog {
     }
 
     fn from_session(session: InceptionSession) -> Result<Self> {
+        if !session
+            .volumes()
+            .iter()
+            .any(|volume| volume.filesystem.is_some())
+        {
+            let reasons = session
+                .volumes()
+                .iter()
+                .filter_map(|volume| volume.diagnostic.as_deref())
+                .collect::<Vec<_>>()
+                .join("; ");
+            bail!("No readable filesystem in this disk image. {reasons}");
+        }
         let session = Arc::new(session);
         Ok(Self {
             image_path: session.image_path().to_owned(),
