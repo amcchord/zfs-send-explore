@@ -38,6 +38,7 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" "$fixture"
           python3 scripts/verify-striped-pool.py target/debug/zfs-send-extract "$fixture" \
             "$RUNNER_TEMP/stripe-restores" --foreign-member "$fixture/other.img"
+          ZFSE_STRIPE_FIXTURE="$fixture" cargo test --locked --test desktop_service desktop_restores_versions_and_nested_files_from_a_stripe -- --ignored --exact
 
   windows:
     runs-on: windows-latest
