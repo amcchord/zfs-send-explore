@@ -249,7 +249,7 @@ RAIDZ/dRAID, stripes of mirrors, encrypted big-endian pools, special/dedup alloc
 5. The recommended part of the disk is selected. Browse to the file or folder
    and choose **Restore…**.
 
-For an exported stripe of ordinary disks or file vdevs, Ctrl-click every member
+For an offline stripe of ordinary disks or file vdevs, Ctrl-click every member
 image in **Open backup…**. Use **Open from a path…** for members in different
 folders or physical disk paths, one per line. Each top-level group needs its
 own member. A missing or unrelated member produces a diagnostic, and the

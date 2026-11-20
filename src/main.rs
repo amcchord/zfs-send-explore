@@ -117,7 +117,7 @@ enum PoolCommand {
         #[command(flatten)]
         container: ContainerKeyInput,
     },
-    /// Validate a member and summarize its active pool state.
+    /// Validate the selected members and summarize the pool state.
     Inspect {
         #[command(flatten)]
         source: PoolInput,
@@ -125,7 +125,7 @@ enum PoolCommand {
         #[arg(long)]
         json: bool,
     },
-    /// List filesystem datasets reachable from the member.
+    /// List filesystem datasets reachable from the selected pool.
     Datasets {
         #[command(flatten)]
         source: PoolInput,

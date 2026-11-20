@@ -29,7 +29,7 @@ Detailed implementation and validation material lives in:
 | Read compressed blocks in raw sends | LZJB, LZ4, gzip, ZLE, and Zstandard |
 | Read compressed replay records from `zfs send -c` | Supported |
 | Read embedded-data replay records from `zfs send -e` | Supported |
-| Browse an exported disk/file vdev, an ordinary disk/file stripe, or one leaf of a single top-level mirror | Supported. Supply every member of a stripe. |
+| Browse an offline disk/file vdev, an ordinary disk/file stripe, or one leaf of a single top-level mirror | Supported. Supply every member of a stripe. |
 | Browse current datasets and named snapshots directly from a pool member | Supported |
 | Explore a raw or sparse disk image stored as a regular ZFS file | Supported, including explicit byte offset/length windows; validated across every subordinate filesystem below |
 | Explore self-contained QCOW2 and VMDK sparse containers stored on ZFS | QCOW2 v2/v3 and VMDK `monolithicSparse`; sparse QCOW2 v3 and VMDK are in the full matrix |
@@ -47,7 +47,7 @@ Detailed implementation and validation material lives in:
 | Open a Datto Reverse RoundTrip drive | Built-in read-only LUKS1/LUKS2 AES-XTS source; no `cryptsetup`, driver, or host mount required |
 | Browse Datto `.datto` and encrypted `.detto` volumes | Supported; `.detto` keys are authenticated and derived from `.encryptionKeyStash` plus the agent password |
 | Recursively recover a folder | Supported for send snapshots, pool datasets/snapshots, and subordinate filesystems; symlinks and special entries are not followed |
-| Read RAIDZ/dRAID or pools with several top-level vdevs | Not yet supported |
+| Read RAIDZ/dRAID, striped mirrors or special allocation classes | Not yet supported |
 
 The tool extracts individual regular files or recursively stages a selected directory tree. Recursive recovery never follows symlinks or special entries and does not recreate ownership, permissions, ACLs, alternate NTFS streams, or other filesystem metadata.
 
@@ -305,9 +305,9 @@ Both vendor paths use the pool layouts described below.
 
 ## Browse an offline pool
 
-The `pool` command family reads an exported vdev using positioned I/O. Pass an exact ZFS partition, file vdev, or image. A GPT/MBR whole-disk image is also accepted when exactly one partition resolves to a supported plain or LUKS-wrapped ZFS member; the Windows client uses the same discovery for `\\.\PhysicalDriveN`.
+The `pool` command family opens offline pool members read-only. Pass an exact ZFS partition, file vdev, or image. A GPT/MBR whole-disk image is also accepted when exactly one partition resolves to a supported plain or LUKS-wrapped ZFS member; the Windows client uses the same discovery for `\\.\PhysicalDriveN`.
 
-For a striped pool, supply one image or device for each top-level disk or file. The reader identifies their order from the ZFS labels. Use members from the same offline capture. An existing full send remains independently readable when the complete stripe is unavailable.
+For a striped pool, supply one image or device for each top-level disk or file. The reader identifies their order from the ZFS labels. Use a cleanly exported pool or a consistent offline capture of every member at the same transaction group. An existing full send remains independently readable when the complete stripe is unavailable.
 
 ```sh
 zfs-send-extract pool layout disk-a.img disk-b.img
@@ -474,12 +474,12 @@ This remains experimental software, not a replacement for maintaining independen
 | `inception extract <stream> <image> <path> -o <file> [--volume ...] [...]` | Extract one regular file from a subordinate filesystem |
 | `inception extract-tree <stream> <image> <path> -o <directory> [...]` | Recursively recover a subordinate directory tree |
 | `pool layout <member>... [--json]` | Identify disk groups from their read-only labels |
-| `pool inspect <member> [--member ...] [--json] [--container-key-file ...]` | Validate a vdev member, including a built-in LUKS source, and summarize its active pool state |
-| `pool datasets <member>` | List reachable filesystem datasets |
-| `pool snapshots <member> [dataset]` | List named snapshots, optionally for one dataset |
-| `pool list <member> <dataset[@snapshot]> [path] [--key-file ...]` | List one directory from a dataset head or snapshot |
-| `pool extract <member> <dataset[@snapshot]> <path> -o <file> [--key-file ...] [--force]` | Extract one regular file directly from the member |
-| `pool extract-tree <member> <dataset[@snapshot]> <path> -o <directory> [...]` | Recursively recover a ZFS directory tree |
+| `pool inspect <member> [--member ...] [--json] [--container-key-file ...]` | Validate the selected pool members and summarize the pool state |
+| `pool datasets <member> [--member ...]` | List reachable filesystem datasets |
+| `pool snapshots <member> [--member ...] [dataset]` | List named snapshots, optionally for one dataset |
+| `pool list <member> [--member ...] <dataset[@snapshot]> [path] [--key-file ...]` | List one directory from a dataset head or snapshot |
+| `pool extract <member> [--member ...] <dataset[@snapshot]> <path> -o <file> [--key-file ...] [--force]` | Extract one regular file directly from the member |
+| `pool extract-tree <member> [--member ...] <dataset[@snapshot]> <path> -o <directory> [...]` | Recursively recover a ZFS directory tree |
 | `pool inception inspect/list/extract/extract-tree ...` | Explore `.raw`, `.datto`, `.detto`, QCOW2, or VMDK files; Datto adds `--container-key-file` and, for `.detto`, `--agent-password-file` |
 
 Run `zfs-send-extract <command> --help` for complete argument details.

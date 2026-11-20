@@ -51,7 +51,7 @@ The window guides you through four steps, shown in the step bar at the top:
    connected drive** (⇧⌘D; see below). You can also drag a backup file into the
    window, or use **Open from a path…** (⇧⌘O) for a pasted path such as
    `/Volumes/Backups/slide.img` or a device such as `/dev/disk4s2`.
-   For an exported stripe of ordinary disk/file vdevs, Command-click all member
+   For an offline stripe of ordinary disk/file vdevs, Command-click all member
    images in the Open panel, drop them together, or enter one path per line.
    Every top-level group is required. The app identifies members from ZFS labels,
    and asks for read access to each selected device that needs authorization.
