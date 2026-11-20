@@ -14,14 +14,15 @@ use zfs_send_extract::filesystem::DirectoryEntry;
 use zfs_send_extract::presentation;
 #[cfg(target_os = "macos")]
 use zfs_send_extract::source::register_authorized_source;
-use zfs_send_extract::source::release_authorized_sources;
+use zfs_send_extract::source::retain_authorized_sources;
 use zfs_send_extract::versions::{ImageLocation, VersionPath};
 
 #[derive(Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 enum Request {
     Open {
-        path: String,
+        path: Option<PathBuf>,
+        paths: Option<Vec<PathBuf>>,
         /// Ask the operating system for read access when the device is denied.
         #[serde(default)]
         authorize: bool,
@@ -72,8 +73,8 @@ struct Session {
     path: String,
     key: Option<Zeroizing<Vec<u8>>>,
     layers: Vec<Layer>,
-    /// Device path whose read-only handle came from an authorization prompt.
-    authorized: Option<PathBuf>,
+    /// Device paths with read-only handles approved for this session.
+    authorized: Vec<PathBuf>,
 }
 
 impl Session {
@@ -216,7 +217,10 @@ impl Session {
         }
     }
 
-    fn open_source(source_path: &Path) -> Result<(Self, Value)> {
+    fn open_sources(paths: &[PathBuf]) -> Result<(Self, Value)> {
+        let source_path = paths
+            .first()
+            .context("Choose at least one backup file or device")?;
         let mut candidate = Self {
             path: "/".into(),
             title: source_path
@@ -226,18 +230,24 @@ impl Session {
                 .into(),
             ..Self::default()
         };
-        match SourceCatalog::open_send(source_path) {
-            Ok(source) => candidate.source = Some(source),
-            Err(send_error) => match SourceCatalog::open_pool(source_path) {
+        if paths.len() > 1 {
+            let source = SourceCatalog::open_pool_members(paths, None)?;
+            candidate.title = source.title.clone();
+            candidate.source = Some(source);
+        } else {
+            match SourceCatalog::open_send(source_path) {
                 Ok(source) => candidate.source = Some(source),
-                Err(e) if e.is::<zfs_send_extract::pool::PoolLayout>() => return Err(e),
-                Err(pool_error) => match InceptionCatalog::open_file(source_path, 0, None) {
-                    Ok(image) => candidate.layers.push(Self::new_layer(image)),
-                    Err(image_error) => bail!(
-                        "Could not open this backup. Choose a ZFS send, an offline single-disk/mirror pool image, or a supported disk image.\n\nZFS stream: {send_error:#}\nZFS pool: {pool_error:#}\nDisk image: {image_error:#}"
-                    ),
+                Err(send_error) => match SourceCatalog::open_pool(source_path) {
+                    Ok(source) => candidate.source = Some(source),
+                    Err(e) if e.is::<zfs_send_extract::pool::PoolLayout>() => return Err(e),
+                    Err(pool_error) => match InceptionCatalog::open_file(source_path, 0, None) {
+                        Ok(image) => candidate.layers.push(Self::new_layer(image)),
+                        Err(image_error) => bail!(
+                            "Could not open this backup. Choose a ZFS send, the members of an offline ZFS pool, or a supported disk image.\n\nZFS stream: {send_error:#}\nZFS pool: {pool_error:#}\nDisk image: {image_error:#}"
+                        ),
+                    },
                 },
-            },
+            }
         }
         // Keep an empty catalog from creating an unusable desktop session.
         if candidate
@@ -272,21 +282,47 @@ impl Session {
             bail!("Choose a computer or dataset first");
         }
         match request {
-            Request::Open { path, authorize } => {
-                let source_path = Path::new(&path);
-                if authorize {
-                    authorize_device(source_path)?;
-                }
-                match Self::open_source(source_path) {
+            Request::Open {
+                path,
+                paths,
+                authorize,
+            } => {
+                let paths = match (path, paths) {
+                    (Some(path), None) => vec![path],
+                    (None, Some(paths)) if !paths.is_empty() => paths,
+                    _ => bail!("Provide one backup path or a list of pool member paths"),
+                };
+                let mut approved: Vec<PathBuf> = self
+                    .authorized
+                    .iter()
+                    .filter(|path| paths.contains(path))
+                    .cloned()
+                    .collect();
+                let result = (|| {
+                    if authorize {
+                        let devices: Vec<_> =
+                            paths.iter().filter(|p| p.starts_with("/dev")).collect();
+                        if devices.is_empty() {
+                            bail!("Choose a disk device to request read access");
+                        }
+                        for device in devices {
+                            if !approved.contains(device) {
+                                authorize_device(device)?;
+                                approved.push(device.clone());
+                            }
+                        }
+                    }
+                    Self::open_sources(&paths)
+                })();
+                match result {
                     Ok((mut candidate, state)) => {
-                        candidate.authorized = authorize.then(|| source_path.to_owned());
-                        release_authorized_sources(candidate.authorized.as_deref());
+                        candidate.authorized = approved;
+                        retain_authorized_sources(&candidate.authorized);
                         *self = candidate;
                         Ok(state)
                     }
                     Err(error) => {
-                        // A failed open leaves the current session and its handle in place.
-                        release_authorized_sources(self.authorized.as_deref());
+                        retain_authorized_sources(&self.authorized);
                         Err(error)
                     }
                 }
@@ -526,7 +562,7 @@ impl Session {
             }
             Request::Close => {
                 *self = Self::default();
-                release_authorized_sources(None);
+                retain_authorized_sources(&[]);
                 self.state()
             }
         }

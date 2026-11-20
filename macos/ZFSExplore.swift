@@ -256,15 +256,37 @@ final class Engine: @unchecked Sendable {
     func chooseSource() {
         let panel = NSOpenPanel()
         panel.title = "Open a Backup"; panel.prompt = "Open"
-        panel.message = "Choose a ZFS send file, a Slide or ZFS pool image, or a virtual disk (RAW, QCOW2 or VMDK)."
-        panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
-        if panel.runModal() == .OK, let url = panel.url { driveTitle = nil; open(url) }
+        panel.message = "Choose a backup file or disk image. For a striped ZFS pool, select all its member images together."
+        panel.canChooseDirectories = false; panel.allowsMultipleSelection = true
+        if panel.runModal() == .OK { open(panel.urls) }
     }
-    func open(_ url: URL) {
-        // Device nodes are root-owned; the engine asks macOS for read access when denied.
-        let device = url.path.hasPrefix("/dev/")
-        perform(["method": "open", "path": url.path, "authorize": device],
-                activity: device ? "Waiting for permission to read \(url.lastPathComponent)…" : "Opening \(url.lastPathComponent)…")
+    func open(_ url: URL) { open([url]) }
+    func open(_ urls: [URL], drive: (path: String, title: String)? = nil) {
+        guard let first = urls.first else { return }
+        let device = urls.contains { $0.path.hasPrefix("/dev/") }
+        let activity = device ? "Requesting read access to the selected disks…" :
+            (urls.count == 1 ? "Opening \(first.lastPathComponent)…" : "Opening \(urls.count) pool members…")
+        Task {
+            if await run(["method": "open", "paths": urls.map(\.path), "authorize": device], activity: activity) {
+                driveTitle = drive
+            }
+        }
+    }
+    func openDropped(_ providers: [NSItemProvider]) {
+        Task {
+            var urls: [URL] = []
+            for provider in providers {
+                let url: URL? = await withCheckedContinuation { continuation in
+                    _ = provider.loadObject(ofClass: URL.self) { url, _ in continuation.resume(returning: url) }
+                }
+                guard let url, url.isFileURL else {
+                    error = ServiceError(message: "Choose the backup files again using Open.")
+                    return
+                }
+                urls.append(url)
+            }
+            open(urls)
+        }
     }
     func chooseDrive() {
         refreshDrives()
@@ -281,13 +303,13 @@ final class Engine: @unchecked Sendable {
         guard let drive = drives.first(where: { ([$0.disk] + $0.partitions).contains { $0.id == driveSelection } }),
               let selected = ([drive.disk] + drive.partitions).first(where: { $0.id == driveSelection }) else { return }
         showDrives = false
-        driveTitle = (selected.path, selected.whole ? drive.name : "\(drive.name) · \(selected.typeLabel)")
-        open(URL(fileURLWithPath: selected.path))
+        open([URL(fileURLWithPath: selected.path)], drive: (selected.path, selected.whole ? drive.name : "\(drive.name) · \(selected.typeLabel)"))
     }
     func openPath() {
         showPath = false
-        driveTitle = nil
-        open(URL(fileURLWithPath: (sourcePath.trimmingCharacters(in: .whitespacesAndNewlines) as NSString).expandingTildeInPath))
+        let paths = sourcePath.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        open(paths.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) })
     }
     func select(_ index: Int) {
         guard state?.choose_dataset == true || index != state?.view else { return }
@@ -432,10 +454,8 @@ struct ContentView: View {
         .sheet(isPresented: $model.showPreferences) { TimeZonePreferences(selection: $timeZone).tint(.teal) }
         .onOpenURL { model.open($0) }
         .onDrop(of: [.fileURL], isTargeted: $dropTargeted) { providers in
-            guard let provider = providers.first else { return false }
-            _ = provider.loadObject(ofClass: URL.self) { url, _ in
-                if let url { Task { @MainActor in model.open(url) } }
-            }
+            guard !providers.isEmpty else { return false }
+            model.openDropped(providers)
             return true
         }
         .overlay {
@@ -1081,9 +1101,11 @@ struct OpenPathSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Label("Open from a path", systemImage: "text.cursor").font(.title2.bold())
-            Text("Paste the full path to a backup file, disk image or disk device, such as /Volumes/Backups/slide.img or /dev/disk4s2.")
+            Text("Enter the full path to a backup file or disk device. For a striped pool, enter one member path per line.")
                 .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            TextField("/Volumes/Backups/slide.img", text: $model.sourcePath).textFieldStyle(.roundedBorder).onSubmit { if !model.sourcePath.isEmpty { model.openPath() } }
+            TextEditor(text: $model.sourcePath)
+                .font(.body.monospaced()).frame(height: 76).border(.quaternary)
+                .accessibilityLabel("Backup paths")
             HStack { Spacer(); Button("Cancel") { model.showPath = false }.keyboardShortcut(.cancelAction); Button("Open") { model.openPath() }.keyboardShortcut(.defaultAction).disabled(model.sourcePath.isEmpty) }
         }.padding(26).frame(width: 500)
     }

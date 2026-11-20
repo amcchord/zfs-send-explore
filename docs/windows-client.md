@@ -229,10 +229,11 @@ Direct pool support is intentionally conservative:
 
 - one top-level disk or file vdev;
 - one healthy leaf from one top-level mirror;
+- a complete stripe of ordinary disk or file vdevs, matched by their ZFS labels;
 - plaintext or native-encrypted little-endian ZFS filesystem datasets; and
 - the checksum, compression, ZAP, System Attribute, and indirection profiles listed in the main README.
 
-RAIDZ/dRAID, several top-level vdevs, encrypted big-endian pools, special/dedup allocation classes, device-removal maps, gang blocks, and ZVOL file browsing are rejected. A send file can still be used when the direct member reader cannot assemble the pool layout.
+RAIDZ/dRAID, stripes of mirrors, encrypted big-endian pools, special/dedup allocation classes, device-removal maps, gang blocks, and ZVOL file browsing are rejected. A send file can still be used when the direct member reader cannot assemble the pool layout.
 
 ## Recover a Slide Box
 
@@ -248,8 +249,12 @@ RAIDZ/dRAID, several top-level vdevs, encrypted big-endian pools, special/dedup 
 5. The recommended part of the disk is selected. Browse to the file or folder
    and choose **Restore…**.
 
-The current direct-pool constraints still apply. A Slide Box using RAIDZ or
-several top-level vdevs cannot yet be reconstructed from multiple members.
+For an exported stripe of ordinary disks or file vdevs, Ctrl-click every member
+image in **Open backup…**. Use **Open from a path…** for members in different
+folders or physical disk paths, one per line. Each top-level group needs its
+own member. A missing or unrelated member produces a diagnostic, and the
+previous backup stays available. RAIDZ and stripes of mirrors require a
+different recovery source.
 
 ## Recover a Datto Reverse RoundTrip drive
 

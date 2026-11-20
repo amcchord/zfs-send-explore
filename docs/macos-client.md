@@ -51,6 +51,10 @@ The window guides you through four steps, shown in the step bar at the top:
    connected drive** (⇧⌘D; see below). You can also drag a backup file into the
    window, or use **Open from a path…** (⇧⌘O) for a pasted path such as
    `/Volumes/Backups/slide.img` or a device such as `/dev/disk4s2`.
+   For an exported stripe of ordinary disk/file vdevs, Command-click all member
+   images in the Open panel, drop them together, or enter one path per line.
+   Every top-level group is required. The app identifies members from ZFS labels,
+   and asks for read access to each selected device that needs authorization.
 2. If the backup contains several computers or datasets, choose the one you need.
    The newest restore point in that dataset opens. Pick another date in the
    sidebar's **Restore points** list if you need an older copy. Live dataset
@@ -115,9 +119,9 @@ The CLI needs an already readable device or an administrator launch; it does not
 show the desktop authorization prompt.
 
 The Mac app supports ZFS native encryption; Datto LUKS and agent-password UI and
-incremental application remain CLI/Windows features. Single disk or single
-top-level mirror pool layouts are supported; RAIDZ and striped/multiple-vdev
-pools are not.
+incremental application remain CLI/Windows features. Direct recovery supports a single disk, a healthy leaf of a single mirror,
+and a stripe of ordinary disks or image files with every member present.
+RAIDZ, stripes of mirrors, and special allocation classes require another recovery source.
 
 Long operations run in a background worker. The progress panel shows bytes
 read, bytes written, and completed files. **Cancel** stops at the next safe

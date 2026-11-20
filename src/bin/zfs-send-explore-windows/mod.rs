@@ -39,8 +39,8 @@ use windows_sys::Win32::System::Ioctl::{
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::WindowsProgramming::MulDiv;
 use windows_sys::Win32::UI::Controls::Dialogs::{
-    GetOpenFileNameW, GetSaveFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY,
-    OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    GetOpenFileNameW, GetSaveFileNameW, OFN_ALLOWMULTISELECT, OFN_EXPLORER, OFN_FILEMUSTEXIST,
+    OFN_HIDEREADONLY, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 use windows_sys::Win32::UI::Controls::{
     BCM_SETNOTE, BS_COMMANDLINK, ICC_BAR_CLASSES, ICC_LISTVIEW_CLASSES, ICC_STANDARD_CLASSES,
@@ -273,6 +273,7 @@ struct AppState {
     guide: Cell<Guide>,
     icon_cache: RefCell<HashMap<String, i32>>,
     catalog: Option<SourceCatalog>,
+    input_paths: Vec<PathBuf>,
     entries: Vec<DirectoryEntry>,
     current_path: String,
     keys: Vec<SecretValue>,
@@ -292,12 +293,12 @@ struct AppState {
 #[derive(Clone)]
 struct SecretValue {
     material: std::sync::Arc<Zeroizing<Vec<u8>>>,
-    source: Option<PathBuf>,
+    source: Option<Vec<PathBuf>>,
     view: Option<String>,
 }
 
 impl SecretValue {
-    fn new(material: Vec<u8>, source: Option<PathBuf>, view: Option<String>) -> Self {
+    fn new(material: Vec<u8>, source: Option<Vec<PathBuf>>, view: Option<String>) -> Self {
         Self {
             material: std::sync::Arc::new(Zeroizing::new(material)),
             source,
@@ -393,6 +394,7 @@ impl Default for AppState {
             guide: Cell::new(Guide::None),
             icon_cache: RefCell::new(HashMap::new()),
             catalog: None,
+            input_paths: Vec::new(),
             entries: Vec::new(),
             current_path: "/".to_owned(),
             keys: Vec::new(),
@@ -549,8 +551,9 @@ unsafe fn run_ui() -> Result<()> {
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
 
-    if let Some(argument) = std::env::args_os().nth(1) {
-        set_text((*state).controls.source_path, &argument.to_string_lossy());
+    let arguments: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+    if !arguments.is_empty() {
+        set_input_paths(&mut *state, arguments);
         PostMessageW(hwnd, WM_COMMAND, ID_OPEN_AUTO as usize, 0);
     }
 
@@ -1377,35 +1380,54 @@ unsafe fn source_open(state: &AppState) -> bool {
 }
 
 unsafe fn choose_source(state: &mut AppState, mode: OpenMode) {
-    let (title, filter) = match mode {
-        OpenMode::Image => ("Open a disk image file", SourceFilter::Image),
-        OpenMode::Auto => ("Open a backup", SourceFilter::Backup),
+    let paths = match mode {
+        OpenMode::Image => {
+            open_file_dialog(state.hwnd, "Open a disk image file", SourceFilter::Image)
+                .map(|path| vec![path])
+        }
+        OpenMode::Auto => file_dialog(
+            state.hwnd,
+            "Open a backup",
+            SourceFilter::Backup,
+            None,
+            false,
+            true,
+        ),
     };
-    let Some(path) = open_file_dialog(state.hwnd, title, filter) else {
-        return;
-    };
-    set_text(state.controls.source_path, &path.display().to_string());
+    let Some(paths) = paths else { return };
+    set_input_paths(state, paths);
     open_source(state, mode);
 }
 
 unsafe fn open_path_dialog(state: &mut AppState) {
-    let current = get_text(state.controls.source_path);
+    let current = path_text(&state.input_paths);
     let form = Form {
         heading: "Open from a path",
-        body: "Type or paste the full location of a backup file or disk image, or a drive such as \\\\.\\PhysicalDrive1. Drives open read-only.",
-        field: "Location",
+        body: "Enter a backup path, or one member path per line for a striped pool. A device such as \\\\.\\PhysicalDrive1 opens read-only.",
+        field: "Locations",
         initial: &current,
         password: false,
         primary: "Open",
         secondary: Some("Browse…"),
     };
-    match form_dialog(state.hwnd, &form) {
+    match dialogs::path_dialog(state.hwnd, &form) {
         FormResult::Submitted(text) => {
-            let path = String::from_utf16_lossy(&text)
-                .trim()
-                .trim_matches('"')
-                .to_owned();
-            if path.starts_with(r"\\.\")
+            let paths: Vec<PathBuf> = String::from_utf16_lossy(&text)
+                .lines()
+                .map(|line| line.trim().trim_matches('"'))
+                .filter(|line| !line.is_empty())
+                .map(PathBuf::from)
+                .collect();
+            if paths.is_empty() {
+                return;
+            }
+            let devices: Vec<_> = paths
+                .iter()
+                .filter(|p| is_physical_path(p))
+                .cloned()
+                .collect();
+            if paths.len() == 1
+                && !devices.is_empty()
                 && state.settings.confirm_physical_drive
                 && task_dialog(
                     state.hwnd,
@@ -1414,13 +1436,17 @@ unsafe fn open_path_dialog(state: &mut AppState) {
                             "Open read-only",
                             "Nothing on the drive is written, mounted or initialized.",
                         )],
-                        ..Task::new(DialogIcon::Warning, "Open this drive?", &path)
+                        ..Task::new(
+                            DialogIcon::Warning,
+                            "Open the selected devices?",
+                            &path_text(&devices),
+                        )
                     },
                 ) != Some(0)
             {
                 return;
             }
-            set_text(state.controls.source_path, &path);
+            set_input_paths(state, paths);
             open_source(state, OpenMode::Auto);
         }
         FormResult::Secondary => choose_source(state, OpenMode::Auto),
@@ -1429,15 +1455,41 @@ unsafe fn open_path_dialog(state: &mut AppState) {
 }
 
 unsafe fn open_source(state: &mut AppState, mode: OpenMode) {
-    let path = PathBuf::from(get_text(state.controls.source_path));
-    if path.as_os_str().is_empty() {
+    let paths = state.input_paths.clone();
+    let Some(path) = paths.first().cloned() else {
         return choose_source(state, mode);
+    };
+    if paths.len() > 1
+        && state.settings.confirm_physical_drive
+        && paths.iter().any(|path| is_physical_path(path))
+        && task_dialog(
+            state.hwnd,
+            &Task {
+                actions: &[(
+                    "Open these members read-only",
+                    "Open the selected disks without mounting or modifying them.",
+                )],
+                ..Task::new(
+                    DialogIcon::Warning,
+                    "Open the selected disks together?",
+                    &path_text(&paths),
+                )
+            },
+        ) != Some(0)
+    {
+        restore_source_box_after_failed_open(state, Some(PendingJob::Open(mode)));
+        return;
     }
-    set_busy(state, true, &format!("Opening {}…", file_label(&path)));
+    let status = if paths.len() > 1 {
+        format!("Opening {} pool members…", paths.len())
+    } else {
+        format!("Opening {}…", file_label(&path))
+    };
+    set_busy(state, true, &status);
     let container_key = state
         .container_key
         .clone()
-        .filter(|value| secret_applies_to_source(value, &path));
+        .filter(|key| secret_applies_to_source(key, &paths));
     state.pending_job = Some(PendingJob::Open(mode));
     spawn_job(state, move || {
         let pool_key = container_key.as_ref().map(SecretValue::bytes);
@@ -1450,6 +1502,9 @@ unsafe fn open_source(state: &mut AppState, mode: OpenMode) {
                     standalone: true,
                 }
             }),
+            OpenMode::Auto if paths.len() > 1 => {
+                SourceCatalog::open_pool_members(&paths, pool_key).map(JobResult::Catalog)
+            }
             OpenMode::Auto => open_automatically(path, pool_key),
         }
     });
@@ -1466,7 +1521,7 @@ unsafe fn close_source(state: &mut AppState) {
     state.inception.clear();
     SendMessageW(state.controls.view, CB_RESETCONTENT, 0, 0);
     SendMessageW(state.controls.volume, CB_RESETCONTENT, 0, 0);
-    set_text(state.controls.source_path, "");
+    set_input_paths(state, Vec::new());
     close_source_ui(state);
 }
 
@@ -1951,7 +2006,8 @@ unsafe fn finish_job(state: &mut AppState, result: JobMessage) {
     match result {
         Err(error) => handle_job_error(state, &error, pending),
         Ok(JobResult::Catalog(catalog)) => {
-            activate_source(state, &catalog.path);
+            activate_source(state, &catalog.paths);
+            state.inception.clear();
             SendMessageW(state.controls.volume, CB_RESETCONTENT, 0, 0);
             SendMessageW(state.controls.view, CB_RESETCONTENT, 0, 0);
             let zone = state
@@ -1974,7 +2030,7 @@ unsafe fn finish_job(state: &mut AppState, result: JobMessage) {
             if let Some(index) = start {
                 SendMessageW(state.controls.view, CB_SETCURSEL, index, 0);
             }
-            let title = format!("{} — {}", source_title(state, &catalog.path), APP_TITLE);
+            let title = format!("{} — {}", catalog_title(state, &catalog), APP_TITLE);
             set_text(state.hwnd, &title);
             set_status(state, &presentation::source_description(&catalog));
             state.catalog = Some(catalog);
@@ -2028,7 +2084,7 @@ unsafe fn finish_job(state: &mut AppState, result: JobMessage) {
                 return;
             };
             if standalone {
-                activate_source(state, Path::new(&catalog.image_path));
+                activate_source(state, &[PathBuf::from(&catalog.image_path)]);
                 state.catalog = None;
                 state.inception.clear();
                 clear_directory_ui(state);
@@ -2461,7 +2517,7 @@ unsafe fn update_mode(state: &AppState) {
 unsafe fn update_header(state: &AppState) {
     let controls = &state.controls;
     if let Some(catalog) = &state.catalog {
-        set_text(controls.header_title, &source_title(state, &catalog.path));
+        set_text(controls.header_title, &catalog_title(state, catalog));
         let mut detail = presentation::source_description(catalog);
         if let Some(frame) = state.inception.last() {
             detail.push_str(&format!(
@@ -2830,10 +2886,7 @@ unsafe fn open_physical_drive(state: &mut AppState) {
                     continue;
                 }
                 state.drive_title = Some((drive.path.clone(), drive.title()));
-                set_text(
-                    state.controls.source_path,
-                    &drive.path.display().to_string(),
-                );
+                set_input_paths(state, vec![drive.path.clone()]);
                 open_source(state, OpenMode::Auto);
                 return;
             }
@@ -3141,11 +3194,11 @@ unsafe fn retry_pending_job(state: &mut AppState, pending: Option<PendingJob>) {
     }
 }
 
-unsafe fn restore_source_box_after_failed_open(state: &AppState, pending: Option<PendingJob>) {
+unsafe fn restore_source_box_after_failed_open(state: &mut AppState, pending: Option<PendingJob>) {
     if matches!(pending, Some(PendingJob::Open(_)))
-        && let Some(path) = active_source_path(state)
+        && let Some(paths) = active_source_paths(state)
     {
-        set_text(state.controls.source_path, &path.display().to_string());
+        set_input_paths(state, paths);
     }
 }
 
@@ -3236,7 +3289,12 @@ unsafe fn handle_job_error(state: &mut AppState, error: &str, pending: Option<Pe
         return;
     }
 
-    if matches!(pending, Some(PendingJob::Open(_))) && lower.contains("source was not recognized") {
+    if matches!(pending, Some(PendingJob::Open(_)))
+        && (lower.contains("source was not recognized")
+            || lower.contains("could not assemble the selected pool members")
+            || lower.contains("missing stripe members")
+            || lower.starts_with("pool layout for "))
+    {
         let friendly = presentation::friendly_error(error);
         let task = Task {
             actions: &[(
@@ -3402,7 +3460,7 @@ unsafe fn clear_credentials_silent(state: &mut AppState) {
     state.agent_password = None;
 }
 
-unsafe fn clear_credentials_for_source(state: &mut AppState, source: &Path) {
+unsafe fn clear_credentials_for_source(state: &mut AppState, source: &[PathBuf]) {
     state
         .keys
         .retain(|value| value.source.as_deref().is_none_or(|path| path == source));
@@ -3422,13 +3480,12 @@ unsafe fn clear_credentials_for_source(state: &mut AppState, source: &Path) {
     }
 }
 
-unsafe fn credential_scope(state: &AppState) -> Option<PathBuf> {
-    active_source_path(state).or_else(|| source_box_scope(state))
+unsafe fn credential_scope(state: &AppState) -> Option<Vec<PathBuf>> {
+    active_source_paths(state).or_else(|| source_box_scope(state))
 }
 
-unsafe fn source_box_scope(state: &AppState) -> Option<PathBuf> {
-    let path = PathBuf::from(get_text(state.controls.source_path));
-    (!path.as_os_str().is_empty()).then_some(path)
+fn source_box_scope(state: &AppState) -> Option<Vec<PathBuf>> {
+    (!state.input_paths.is_empty()).then(|| state.input_paths.clone())
 }
 
 unsafe fn credential_view(state: &AppState) -> Option<String> {
@@ -3437,12 +3494,12 @@ unsafe fn credential_view(state: &AppState) -> Option<String> {
     Some(view.selector.clone())
 }
 
-fn secret_applies_to_source(secret: &SecretValue, source: &Path) -> bool {
+fn secret_applies_to_source(secret: &SecretValue, source: &[PathBuf]) -> bool {
     secret.source.as_deref().is_none_or(|path| path == source)
 }
 
 unsafe fn active_zfs_key(state: &AppState) -> Option<SecretValue> {
-    let source = active_source_path(state).or_else(|| source_box_scope(state));
+    let source = active_source_paths(state).or_else(|| source_box_scope(state));
     let view = credential_view(state);
     state
         .keys
@@ -3529,23 +3586,23 @@ unsafe fn clear_directory_ui(state: &mut AppState) {
     update_breadcrumb(state);
 }
 
-unsafe fn active_source_path(state: &AppState) -> Option<PathBuf> {
+fn active_source_paths(state: &AppState) -> Option<Vec<PathBuf>> {
     state
         .catalog
         .as_ref()
-        .map(|catalog| catalog.path.clone())
+        .map(|catalog| catalog.paths.clone())
         .or_else(|| {
             state.inception.first().and_then(|frame| {
                 frame
                     .parent_path
                     .is_none()
-                    .then(|| PathBuf::from(&frame.catalog.image_path))
+                    .then(|| vec![PathBuf::from(&frame.catalog.image_path)])
             })
         })
 }
 
-unsafe fn activate_source(state: &mut AppState, source: &Path) {
-    if source_is_changing(state, source) {
+unsafe fn activate_source(state: &mut AppState, source: &[PathBuf]) {
+    if active_source_paths(state).is_some_and(|current| current != source) {
         if state.settings.clear_credentials_on_source_change {
             clear_credentials_for_source(state, source);
         }
@@ -3555,17 +3612,29 @@ unsafe fn activate_source(state: &mut AppState, source: &Path) {
         SendMessageW(state.controls.view, CB_RESETCONTENT, 0, 0);
         SendMessageW(state.controls.volume, CB_RESETCONTENT, 0, 0);
     }
-    set_text(state.controls.source_path, &source.display().to_string());
+    set_input_paths(state, source.to_vec());
 }
 
-fn source_is_changing(state: &AppState, path: &Path) -> bool {
-    state
-        .catalog
-        .as_ref()
-        .is_some_and(|catalog| catalog.path != path)
-        || state.inception.first().is_some_and(|frame| {
-            frame.parent_path.is_none() && frame.catalog.image_path != path.display().to_string()
-        })
+fn path_text(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|p| p.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("\r\n")
+}
+
+unsafe fn set_input_paths(state: &mut AppState, mut paths: Vec<PathBuf>) {
+    // The same set in a different picker order has the same credential scope.
+    paths.sort();
+    set_text(state.controls.source_path, &path_text(&paths));
+    state.input_paths = paths;
+}
+
+fn is_physical_path(path: &Path) -> bool {
+    let path = path.to_string_lossy().to_ascii_lowercase();
+    path.starts_with(r"\\.\")
+        || path.starts_with(r"\\?\physicaldrive")
+        || path.starts_with(r"\\?\globalroot\device\")
 }
 
 unsafe fn leave_all_images(state: &mut AppState, clear_list: bool) {
@@ -3617,7 +3686,7 @@ unsafe fn populate_volumes(state: &AppState, catalog: &InceptionCatalog, preferr
 unsafe fn update_breadcrumb(state: &AppState) {
     let mut parts = Vec::new();
     if let Some(catalog) = &state.catalog {
-        parts.push(source_title(state, &catalog.path));
+        parts.push(catalog_title(state, catalog));
     }
     for frame in &state.inception {
         parts.push(file_label(Path::new(&frame.catalog.image_path)));
@@ -4280,7 +4349,7 @@ enum SourceFilter {
 }
 
 unsafe fn open_file_dialog(owner: HWND, title: &str, filter: SourceFilter) -> Option<PathBuf> {
-    file_dialog(owner, title, filter, None, false)
+    file_dialog(owner, title, filter, None, false, false)?.pop()
 }
 
 unsafe fn save_extraction_dialog(owner: HWND, name: &str, directory: bool) -> Option<PathBuf> {
@@ -4294,7 +4363,9 @@ unsafe fn save_extraction_dialog(owner: HWND, name: &str, directory: bool) -> Op
         SourceFilter::All,
         Some(name),
         true,
-    )
+        false,
+    )?
+    .pop()
 }
 
 unsafe fn file_dialog(
@@ -4303,7 +4374,8 @@ unsafe fn file_dialog(
     filter: SourceFilter,
     initial_name: Option<&str>,
     save: bool,
-) -> Option<PathBuf> {
+    multiple: bool,
+) -> Option<Vec<PathBuf>> {
     let filter = match filter {
         SourceFilter::Send => wide_nul_groups(&[
             "ZFS send files",
@@ -4345,6 +4417,7 @@ unsafe fn file_dialog(
         Flags: OFN_EXPLORER
             | OFN_HIDEREADONLY
             | OFN_NOCHANGEDIR
+            | if multiple { OFN_ALLOWMULTISELECT } else { 0 }
             | OFN_PATHMUSTEXIST
             | if save { 0 } else { OFN_FILEMUSTEXIST },
         ..zeroed()
@@ -4357,11 +4430,16 @@ unsafe fn file_dialog(
     if accepted == 0 {
         return None;
     }
-    let length = file
-        .iter()
-        .position(|value| *value == 0)
-        .unwrap_or(file.len());
-    Some(PathBuf::from(OsString::from_wide(&file[..length])))
+    let mut parts = file
+        .split(|&unit| unit == 0)
+        .take_while(|part| !part.is_empty())
+        .map(|part| PathBuf::from(OsString::from_wide(part)));
+    let first = parts.next()?;
+    let mut paths: Vec<_> = parts.map(|name| first.join(name)).collect();
+    if paths.is_empty() {
+        paths.push(first);
+    }
+    Some(paths)
 }
 
 fn desktop_folder() -> Option<Vec<u16>> {
@@ -4434,6 +4512,14 @@ fn wide_nul_groups(values: &[&str]) -> Vec<u16> {
     }
     output.push(0);
     output
+}
+
+fn catalog_title(state: &AppState, catalog: &SourceCatalog) -> String {
+    if catalog.paths.len() > 1 {
+        catalog.title.clone()
+    } else {
+        source_title(state, &catalog.path)
+    }
 }
 
 /// A drive chosen from the picker keeps its model name; files show their name.

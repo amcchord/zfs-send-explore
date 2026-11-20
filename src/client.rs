@@ -132,17 +132,31 @@ impl std::fmt::Debug for BrowseIndex {
     }
 }
 
-/// Lightweight description retained by the UI after opening a source.
-#[derive(Debug, Clone)]
+/// Description retained by the UI after opening a source.
+#[derive(Clone)]
 pub struct SourceCatalog {
     browse_index: Arc<Mutex<Option<BrowseIndex>>>,
     pub kind: SourceKind,
     pub path: PathBuf,
+    /// Every source chosen for this session, including the first path above.
+    pub paths: Vec<PathBuf>,
+    /// All stripe views and nested images use the same read-only member handles and checkpoint.
+    pinned_pool: Option<Arc<PoolMember>>,
     pub title: String,
     pub summary: String,
     pub views: Vec<SourceView>,
     container_key_file: Option<PathBuf>,
     container_key_material: Option<Arc<Zeroizing<Vec<u8>>>>,
+}
+
+impl std::fmt::Debug for SourceCatalog {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fmt.debug_struct("SourceCatalog")
+            .field("kind", &self.kind)
+            .field("paths", &self.paths)
+            .field("views", &self.views)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Result of extracting one selected file.
@@ -334,6 +348,8 @@ impl SourceCatalog {
         Ok(Self {
             browse_index: Default::default(),
             kind: SourceKind::SendStream,
+            pinned_pool: None,
+            paths: vec![path.to_owned()],
             path: path.to_owned(),
             title,
             summary: format!(
@@ -362,7 +378,7 @@ impl SourceCatalog {
         let container_key =
             read_secret_file(container_key_file, "LUKS container passphrase", 4096)?;
         Self::open_pool_with_container_key(
-            path,
+            &[path.as_ref().to_owned()],
             container_key.as_deref().map(Vec::as_slice),
             container_key_file.map(Path::to_owned),
         )
@@ -374,16 +390,22 @@ impl SourceCatalog {
         path: impl AsRef<Path>,
         container_key: Option<&[u8]>,
     ) -> Result<Self> {
-        Self::open_pool_with_container_key(path, container_key, None)
+        Self::open_pool_with_container_key(&[path.as_ref().to_owned()], container_key, None)
+    }
+
+    /// Assemble the explicitly selected files or devices from one pool.
+    pub fn open_pool_members(paths: &[PathBuf], container_key: Option<&[u8]>) -> Result<Self> {
+        Self::open_pool_with_container_key(paths, container_key, None)
+            .context("Could not assemble the selected pool members")
     }
 
     fn open_pool_with_container_key(
-        path: impl AsRef<Path>,
+        paths: &[PathBuf],
         container_key: Option<&[u8]>,
         container_key_file: Option<PathBuf>,
     ) -> Result<Self> {
-        let path = path.as_ref();
-        let pool = PoolMember::open_with_container_key(path, container_key)?;
+        let path = paths.first().context("Select a pool member first")?;
+        let pool = PoolMember::open_members(paths, container_key)?;
         let inspection = pool.inspect()?;
         let datasets = pool.datasets()?;
         let mut snapshots = pool.snapshots(None)?;
@@ -456,6 +478,8 @@ impl SourceCatalog {
         Ok(Self {
             browse_index: Default::default(),
             kind: SourceKind::PoolMember,
+            paths: paths.to_vec(),
+            pinned_pool: (paths.len() > 1).then(|| Arc::new(pool)),
             path: path.to_owned(),
             title: format!("{vendor} — {}", inspection.pool_name),
             summary: format!(
@@ -875,6 +899,9 @@ impl SourceCatalog {
     }
 
     fn open_pool_member(&self) -> Result<PoolMember> {
+        if let Some(pool) = &self.pinned_pool {
+            return Ok(pool.as_ref().clone());
+        }
         if let Some(key) = &self.container_key_material {
             return PoolMember::open_with_container_key(&self.path, Some(key.as_slice()));
         }
