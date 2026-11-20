@@ -444,3 +444,19 @@ and UTC offsets distinguish repeated daylight-saving hours.
 ## Checking a recovered folder
 
 The restore receipt gives the destination and report path. Open the JSON Lines report to see the selected source, file sizes and hashes, empty directories, and skipped entries. To recheck the copy later, pass the report path to `zfs-send-extract verify`. Keep it inside the restored folder so its relative paths continue to resolve.
+
+## Testing the Windows download
+
+From a signed-in Windows desktop, open Windows PowerShell in the checkout and
+run the following command. Supply the downloaded ZIP, its expected SHA-256 and
+a new directory for screenshots and test output.
+
+```powershell
+.\scripts\test-windows-package-ui.ps1 -Package $zip -ExpectedPackageSha256 $sha256 -FixtureDirectory .\tests\fixtures -OutputDirectory $newDirectory
+```
+
+The test checks the actual window's display scaling (125–200% by default), opens
+two public backup fixtures, retries an incorrect key, and restores an older
+snapshot. It hashes each recovered file and checks that a same-name retry
+preserves an existing file. The result and screenshots are saved in the output
+directory.
