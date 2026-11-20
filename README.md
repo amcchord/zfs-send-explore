@@ -114,13 +114,10 @@ open 'target/macos-package/ZFS Explore.app'
 
 ![ZFS Explore on macOS showing a Slide backup and its disk image](docs/screenshots/macos/slide-backup.png)
 
-The app walks through four steps: open a backup (or connected drive), pick a
-restore point, unlock it if needed, then find and restore files. The newest
-restore point is selected automatically, Slide and Datto backups point straight
-to the protected computer's disk image, and the recommended partition is marked.
-**Restore…** saves a copy to a new destination. The source is read-only and
-existing destination files are preserved. See the
-[Mac guide](docs/macos-client.md) for packaging, key handling, and current limits.
+Choose **Connected drives** (⇧⌘D) to open an attached backup disk. The picker lists disks even when Finder cannot mount them. Identify the disk by model, size and disk number. Check every member of a striped pool. Expand a row to choose a particular partition.
+
+For a send file or disk image, choose **Open a backup file** (⌘O). After opening either source, select a restore point, unlock it if needed, and use **Restore…** to save a copy. [Mac guide](docs/macos-client.md)
+
 Local development builds are ad-hoc signed. The [Mac release signing procedure](docs/macos-signing.md) signs and notarizes the CI-built archives before publication.
 
 ### Native Windows client
@@ -136,7 +133,9 @@ cargo build --release --bin zfs-send-explore-windows
 
 The GUI binary is `target\release\zfs-send-explore-windows.exe`; the packaging script also builds `zfs-send-extract.exe` and creates a distributable ZIP containing both clients and the illustrated documentation. It uses Win32 common controls, Windows file dialogs, the Segoe UI system typeface, per-monitor DPI scaling, and background workers so long stream scans do not block the window.
 
-Start from **Open a backup file**, **Open a connected drive** or **Open from a path** on the welcome page. The newest restore point is selected, a guidance bar suggests the next step (unlock, or open the computer's disk image), and the recommended part of a disk image is chosen automatically. **Open drive…** lists drives by model and size and labels the computer's own Windows disk; reading a drive may require **Run as administrator**. Encrypted restore points open a single unlock dialog that accepts a pasted key or a key file. See the [Windows client guide](docs/windows-client.md) and the [desktop UX audit](docs/desktop-ux-audit.md) for the complete workflow, shortcuts, settings, and safety constraints.
+Choose **Browse connected drives** (Ctrl+D) on the welcome screen, or **Connected drives…** while browsing a backup. Identify a disk by its model, size and disk number. Check one disk or all members of a striped pool and choose **Open read-only**. The list updates when a disk is connected or removed. Use **Show Windows system disk** to include the disk containing Windows.
+
+For a send file or disk image, choose **Open a backup file** (Ctrl+O). The app selects the newest restore point and prompts for its key when needed. [Windows guide](docs/windows-client.md)
 
 ## Browse and extract from a send file
 
