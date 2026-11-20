@@ -824,7 +824,7 @@ unsafe fn initialize_window(state: &mut AppState) -> Result<()> {
     );
     controls.header_title = label(APP_TITLE, SS_ENDELLIPSIS);
     controls.header_detail = label(
-        "Recover files from ZFS, Slide and Datto backups",
+        "Read-only recovery for ZFS, Slide and Datto.",
         SS_ENDELLIPSIS,
     );
     controls.open_backup = button(hwnd, instance, "Open backup…", ID_OPEN_BACKUP, false);
@@ -2533,7 +2533,7 @@ unsafe fn update_header(state: &AppState) {
         set_text(controls.header_title, APP_TITLE);
         set_text(
             controls.header_detail,
-            "Recover files from ZFS, Slide and Datto backups. Your backup is only read, never changed.",
+            "Read-only recovery for ZFS, Slide and Datto.",
         );
     }
 }
@@ -3890,6 +3890,9 @@ unsafe fn layout(state: &AppState) {
         (controls.open_drive, scale(158)),
         (controls.close_source, scale(90)),
     ] {
+        if control == controls.close_source && !source_open(state) {
+            continue;
+        }
         right -= button_width;
         MoveWindow(control, right, button_y, button_width, row, 1);
         right -= gap;
@@ -4422,7 +4425,7 @@ unsafe fn show_how_to(owner: HWND) {
         owner,
         DialogIcon::Information,
         "How to restore files",
-        "1.  Open your backup: choose Open backup for a file, or Open drive for a drive from a Slide or Datto device.\n\n2.  Pick a restore point: the newest one is chosen for you. Use the Restore point list for an earlier date.\n\n3.  Unlock it if asked, with the key from your Slide console or its key file.\n\n4.  Open the disk image if the guide suggests it, then double-click folders to find your files.\n\n5.  Select a file or folder and choose Restore. Pick a place to save the copy.\n\nYour backup is only read. ZFS Explore never changes it.",
+        "1.  Choose Connected drives for attached backup disks, or Open backup for a file.\n\n2.  Pick a restore point: the newest one is chosen for you. Use the Restore point list for an earlier date.\n\n3.  Unlock it if asked, with the key from your Slide console or its key file.\n\n4.  Open the disk image if the guide suggests it, then double-click folders to find your files.\n\n5.  Select a file or folder and choose Restore. Pick a place to save the copy.\n\nYour backup is only read. ZFS Explore never changes it.",
     );
 }
 
