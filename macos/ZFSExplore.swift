@@ -1123,13 +1123,22 @@ struct DrivePicker: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Label("Open a connected drive", systemImage: "externaldrive.connected.to.line.below").font(.title2.bold())
-            Text("Choose your backup drive or its suggested partition. For a striped pool, hold Command and click one member on each drive.")
+            Text("Choose your backup drive or its suggested partition. For a striped pool, check one member on each drive.")
                 .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            List(selection: $model.driveSelection) {
+            List {
                 ForEach(model.drives) { drive in
                     Section(drive.title) {
                         ForEach([drive.disk] + drive.partitions) { slice in
-                            row(slice, suggested: slice.id == drive.suggested.id).tag(slice.id)
+                            Toggle(isOn: Binding(
+                                get: { model.driveSelection.contains(slice.id) },
+                                set: { checked in
+                                    if checked { model.driveSelection.insert(slice.id) }
+                                    else { model.driveSelection.remove(slice.id) }
+                                })) {
+                                    row(slice, suggested: slice.id == drive.suggested.id)
+                                }
+                                .toggleStyle(.checkbox)
+                                .accessibilityLabel("\(drive.name), \(slice.path)")
                         }
                     }
                 }

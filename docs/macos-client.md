@@ -99,7 +99,7 @@ connected drive** lists external disks directly from DiskArbitration instead, wh
 not Finder shows them, with each partition's type and size. A ZFS-typed
 partition is suggested first, then the largest partition macOS left unmounted.
 Choosing **Whole disk** also works when exactly one partition holds the pool.
-For a striped pool, hold **Command** while clicking one member on each external
+For a striped pool, check the box beside one member on each external
 drive, then choose **Open 2 Members** (the number reflects your selection).
 The picker rechecks the selected devices immediately before opening them. If a
 member is unplugged or replaced, select the full set again.
