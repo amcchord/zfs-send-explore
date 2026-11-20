@@ -316,7 +316,7 @@ zfs-send-extract pool snapshots disk-a.img --member disk-b.img
 zfs-send-extract pool extract disk-a.img --member disk-b.img tank/data@backup /docs/file.txt -o recovered.txt
 ```
 
-Repeat `--member PATH` for each additional member. The same option works for folder restores and for browsing a disk image stored inside a ZFS dataset. Use `pool layout --json` to compare pool GUIDs, member GUIDs, group IDs and expected group counts before opening a set.
+Repeat `--member PATH` for each additional member. The same option works for folder restores and for browsing a disk image stored inside a ZFS dataset. Use `pool layout --json` to compare pool GUIDs, member GUIDs, group IDs and expected group counts before opening a set. The container passphrase option accepts one shared passphrase for a set of LUKS-wrapped members. For mixed container protection or different passphrases, supply the read-only decrypted member views. Native ZFS dataset keys are selected separately when opening a dataset.
 
 For a single exported vdev, pass its device or image directly.
 
