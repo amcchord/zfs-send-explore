@@ -27,8 +27,8 @@ if [ "$#" -eq 5 ]; then
     echo "Specify the dataset and its independently recorded SHA-256 for across.bin." >&2
     exit 2
   fi
-  if [ "$(ls -A "$stripe_directory")" != "$(printf 'left.img\nright.img')" ]; then
-    echo "Place only left.img and right.img in the member directory for this UI check." >&2
+  if [ ! -f "$stripe_directory/left.img" ] || [ ! -f "$stripe_directory/right.img" ]; then
+    echo "Place left.img and right.img in the member directory for this UI check." >&2
     exit 2
   fi
   shasum -a 256 "$stripe_directory"/{left,right}.img > "$output/stripe-members.sha256"
