@@ -101,6 +101,30 @@ jobs:
               'cli_and_worker_match': True, 'sha256': hashlib.sha256(expected).hexdigest()
           }, indent=2)+'\n')
           PY
+      - name: Get the external desktop test driver
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          path: gui-qualification
+          persist-credentials: false
+          sparse-checkout: |
+            scripts
+            tests/macos-ui
+            tests/fixtures
+      - name: Restore files using the downloaded signed app
+        timeout-minutes: 12
+        run: gui-qualification/scripts/test-macos-gui.sh "dist/zfs-send-explore-macos-$MAC_ARCH.zip" "$RUNNER_TEMP/release-gui"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: signed-macos-gui-verification-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/release-gui/*.sha256
+            ${{ runner.temp }}/release-gui/*.log
+            ${{ runner.temp }}/release-gui/verification.txt
+            ${{ runner.temp }}/release-gui/restored
+            ${{ runner.temp }}/release-gui/occupied
+            ${{ runner.temp }}/release-gui/Qualification.xcresult
       - uses: actions/upload-artifact@v4
         if: always()
         with:
