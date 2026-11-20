@@ -439,3 +439,8 @@ UTC, or a named zone grouped by region. This preference is saved in the existing
 settings file. Changing it updates the labels while preserving the selected
 snapshot and current directory. Original snapshot IDs remain in the labels,
 and UTC offsets distinguish repeated daylight-saving hours.
+
+
+## Checking a recovered folder
+
+The restore receipt gives the destination and report path. Open the JSON Lines report to see the selected source, file sizes and hashes, empty directories, and skipped entries. To recheck the copy later, pass the report path to `zfs-send-extract verify`. Keep it inside the restored folder so its relative paths continue to resolve.

@@ -264,6 +264,7 @@ mod report_tests {
                         entry("empty", 4),
                         entry("link", 10),
                         entry("ZFS Restore Report.jsonl", 8),
+                        entry("ZFS Restore Report (1).jsonl", 10),
                     ]
                 } else {
                     vec![]
@@ -275,9 +276,9 @@ mod report_tests {
             },
         )
         .unwrap();
-        assert_eq!(result.report_name, "ZFS Restore Report (1).jsonl");
+        assert_eq!(result.report_name, "ZFS Restore Report (2).jsonl");
         let report = dest.join(result.report_name);
-        assert_eq!(crate::report::verify(&report).unwrap(), 3);
+        assert_eq!(crate::report::verify(&report).unwrap(), 4);
         let records: Vec<serde_json::Value> = fs::read_to_string(&report)
             .unwrap()
             .lines()

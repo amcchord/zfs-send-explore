@@ -864,7 +864,7 @@ impl PoolMember {
         let vdev_id = vdev
             .get_u64("id")
             .context("active vdev label has no group ID")?;
-        let vdev_guid = vdev.get_u64("guid").unwrap_or(0);
+        let vdev_guid = vdev.get_u64("guid").context("missing group GUID")?;
 
         for (_, label) in &parsed {
             if let Some(other) = label.config.get_u64("pool_guid")
@@ -887,8 +887,16 @@ impl PoolMember {
             }
             .to_owned()
         } else {
+            let member_requirement = match vdev_type.as_str() {
+                "disk" | "file" => "Keep this member. This group has no redundant copy.",
+                "mirror" => "Keep a healthy member of this mirror group.",
+                "raidz" => {
+                    "Retain all available RAIDZ members. Recovery depends on the parity level and the number of healthy members."
+                }
+                _ => "Retain all available members of this group.",
+            };
             format!(
-                "This member identifies group {vdev_id}. Recovery of this pool requires the data-bearing groups and enough healthy members of each group. Keep the original disks together. ZFS Explore cannot assemble this layout. Open an existing full ZFS send or self-contained send history instead."
+                "This label identifies group {vdev_id} of {top_level_vdevs} top-level groups. {member_requirement} Recovery requires every data-bearing group. ZFS Explore cannot assemble this layout. Open an existing full ZFS send or self-contained send history instead."
             )
         };
         let layout = PoolLayout {

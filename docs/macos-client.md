@@ -144,3 +144,8 @@ fragmented attribute lists, partial final units and initialized-length zero fill
 Disk images stored as compressed NTFS files can also be browsed directly. Standard
 16-cluster units with 512–4096-byte clusters are supported. EFS-encrypted streams
 remain unsupported; this feature does not add WOF/CompactOS decompression.
+
+
+## Checking a recovered folder
+
+The restore receipt gives the destination and report path. Open the JSON Lines report to see the selected source, file sizes and hashes, empty directories, and skipped entries. To recheck the copy later, pass the report path to `zfs-send-extract verify`. Keep it inside the restored folder so its relative paths continue to resolve.

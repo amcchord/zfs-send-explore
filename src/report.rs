@@ -2,9 +2,10 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
 const VERSION: u32 = 1;
@@ -38,6 +39,7 @@ enum Record {
 
 pub(crate) struct ReportWriter {
     file: BufWriter<NamedTempFile>,
+    skipped_report_names: HashSet<String>,
     entries: u64,
 }
 
@@ -63,6 +65,7 @@ impl ReportWriter {
         let mut report = Self {
             file: BufWriter::new(NamedTempFile::new_in(staging)?),
             entries: 0,
+            skipped_report_names: HashSet::new(),
         };
         report.line(Record::Restore {
             version: VERSION,
@@ -87,6 +90,13 @@ impl ReportWriter {
         expected: u64,
     ) -> Result<()> {
         let path = relative.to_owned();
+        // A skipped root entry still owns its original name in the inventory.
+        if !matches!(kind, 4 | 8) && !relative.contains('/') {
+            let name = relative.to_ascii_lowercase();
+            if name.starts_with("zfs restore report") && name.ends_with(".jsonl") {
+                self.skipped_report_names.insert(name);
+            }
+        }
         let record = match kind {
             4 => Record::Directory { path },
             8 => {
@@ -127,6 +137,12 @@ impl ReportWriter {
             } else {
                 format!("ZFS Restore Report ({n}).jsonl")
             };
+            if self
+                .skipped_report_names
+                .contains(&name.to_ascii_lowercase())
+            {
+                continue;
+            }
             match temporary.persist_noclobber(root.join(&name)) {
                 Ok(_) => return Ok(name),
                 Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -142,18 +158,7 @@ impl ReportWriter {
 fn recorded_path(root: &Path, relative: &str) -> Result<PathBuf> {
     let mut path = root.to_owned();
     for component in relative.split('/') {
-        ensure!(
-            !component.is_empty()
-                && !component.contains('\\')
-                && matches!(
-                    Path::new(component)
-                        .components()
-                        .collect::<Vec<_>>()
-                        .as_slice(),
-                    [Component::Normal(_)]
-                ),
-            "invalid relative path {relative:?}"
-        );
+        crate::tree::validate_component(component)?;
         path.push(component);
         let meta = fs::symlink_metadata(&path)?;
         ensure!(!meta.is_symlink(), "unexpected symbolic link");
