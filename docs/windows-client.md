@@ -465,3 +465,5 @@ two public backup fixtures, retries an incorrect key, and restores an older
 snapshot. It hashes each recovered file and checks that a same-name retry
 preserves an existing file. The result and screenshots are saved in the output
 directory.
+
+For a two-member striped pool, also supply `-StripeDirectory` (containing `left.img` and `right.img`), `-StripeDataset` (such as `pool/files`), and `-StripeExpectedSha256` (the SHA-256 of `across.bin` in its newest restore point). The check opens both members in the system file dialog, checks the missing-member message, restores from the original session and verifies both source images remain unchanged.

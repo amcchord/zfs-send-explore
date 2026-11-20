@@ -55,6 +55,8 @@
          <EnvironmentVariable key="ZFSE_GUI_APP" value="$(ZFSE_GUI_APP)" isEnabled="YES"/>
          <EnvironmentVariable key="ZFSE_GUI_FIXTURES" value="$(ZFSE_GUI_FIXTURES)" isEnabled="YES"/>
          <EnvironmentVariable key="ZFSE_GUI_EVIDENCE" value="$(ZFSE_GUI_EVIDENCE)" isEnabled="YES"/>
+         <EnvironmentVariable key="ZFSE_GUI_STRIPE_DIRECTORY" value="$(ZFSE_GUI_STRIPE_DIRECTORY)" isEnabled="YES"/>
+         <EnvironmentVariable key="ZFSE_GUI_STRIPE_DATASET" value="$(ZFSE_GUI_STRIPE_DATASET)" isEnabled="YES"/>
       </EnvironmentVariables>
    </TestAction>
    <LaunchAction

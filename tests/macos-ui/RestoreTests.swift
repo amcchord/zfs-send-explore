@@ -88,6 +88,47 @@ final class RestoreTests: XCTestCase {
         capture("same-name-refused")
     }
 
+    func testStripeRestore() throws {
+        let env = ProcessInfo.processInfo.environment
+        let directory = URL(fileURLWithPath: try XCTUnwrap(env["ZFSE_GUI_STRIPE_DIRECTORY"]))
+        let dataset = try XCTUnwrap(env["ZFSE_GUI_STRIPE_DATASET"])
+        let left = directory.appendingPathComponent("left.img")
+
+        app.typeKey("o", modifierFlags: .command)
+        XCTAssertTrue(app.buttons["CancelButton"].waitForExistence(timeout: 10))
+        goTo(left)
+        let right = element(app.descendants(matching: .any), containing: "right.img")
+        XCTAssertTrue(right.waitForExistence(timeout: 10))
+        XCUIElement.perform(withKeyModifiers: .command) { right.click() }
+        capture("stripe-members")
+        click(app.buttons["OKButton"])
+        let button = app.buttons[dataset]
+        if button.exists {
+            click(button)
+        } else {
+            // Some macOS releases expose SwiftUI list buttons as table rows.
+            // The button sits at the leading edge of the row.
+            let row = element(app.tableRows, containing: dataset)
+            XCTAssertTrue(row.waitForExistence(timeout: 15))
+            row.coordinate(withNormalizedOffset: CGVector(dx: 0.06, dy: 0.5)).click()
+        }
+        let across = element(app.outlines.staticTexts, containing: "across.bin")
+        click(across)
+        capture("stripe-browser")
+
+        app.typeKey("o", modifierFlags: .command)
+        XCTAssertTrue(app.buttons["CancelButton"].waitForExistence(timeout: 10))
+        goTo(left)
+        click(app.buttons["OKButton"])
+        XCTAssertTrue(element(app.staticTexts, containing: "Open all members").waitForExistence(timeout: 15))
+        capture("stripe-incomplete")
+        click(app.buttons["OK"])
+        click(across)
+        restore(to: evidence.appendingPathComponent("restored"))
+        XCTAssertTrue(app.buttons["Show in Finder"].waitForExistence(timeout: 60))
+        capture("stripe-restored")
+    }
+
     func testOlderSnapshot() throws {
         open("multi-snapshot.zfs")
         let labels = app.outlines.staticTexts
