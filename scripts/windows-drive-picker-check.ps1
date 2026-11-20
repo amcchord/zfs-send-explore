@@ -50,9 +50,21 @@ function Row-Checked([IntPtr]$List, [int]$Index) {
     $state = [PackageUI]::SendMessage($List, 0x102c, [IntPtr]$Index, [IntPtr]0xf000).ToInt32()
     ($state -band 0xf000) -eq 0x2000
 }
-function Open-Picker {
+function Open-Picker([switch]$FromWelcome) {
     [PackageUI]::SetForegroundWindow($Main) | Out-Null
-    Send-PickerKeys $Main '^d'
+    if ($FromWelcome) {
+        if (![PackageUI]::IsWindowVisible([PackageUI]::GetDlgItem($Main, 141))) {
+            throw 'Browse connected drives is missing from the welcome screen'
+        }
+        foreach ($id in @(101, 103)) {
+            if ([PackageUI]::IsWindowVisible([PackageUI]::GetDlgItem($Main, $id))) {
+                throw 'A toolbar button duplicates a welcome action'
+            }
+        }
+        Click-Button $Main 141
+    } else {
+        Send-PickerKeys $Main '^d'
+    }
     Wait-For 'the connected drive checklist' { Visible '#32770' 'Connected drives' }
 }
 function Dismiss-Picker([IntPtr]$Window) {
@@ -120,7 +132,7 @@ function Test-PickerRestore {
 
 function Test-ConnectedDrivePicker {
     $attached = New-Object 'System.Collections.Generic.List[string]'
-    $picker = Open-Picker
+    $picker = Open-Picker -FromWelcome
     $list = [PackageUI]::GetDlgItem($picker,2101)
     $showSystem = [PackageUI]::GetDlgItem($picker,2102)
     $refresh = [PackageUI]::GetDlgItem($picker,2103)

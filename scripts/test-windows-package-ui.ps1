@@ -47,7 +47,7 @@ public static class PackageUI {
     public delegate bool EnumCallback(IntPtr w, IntPtr data);
     [DllImport("user32.dll")] static extern bool EnumWindows(EnumCallback callback, IntPtr data);
     [DllImport("user32.dll")] static extern int GetWindowThreadProcessId(IntPtr w, out int pid);
-    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr w);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr w);
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr w, StringBuilder b, int len);
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr w, StringBuilder b, int len);
     [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr w, int id);
