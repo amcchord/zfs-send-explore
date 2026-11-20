@@ -75,7 +75,7 @@ jobs:
           name: macos-gui-results-${{ matrix.arch }}
           path: |
             ${{ runner.temp }}/package-gui/*.sha256
-            ${{ runner.temp }}/package-gui/*.png
+            ${{ runner.temp }}/package-gui/verification.txt
             ${{ runner.temp }}/package-gui/*.log
             ${{ runner.temp }}/package-gui/restored
             ${{ runner.temp }}/package-gui/occupied
