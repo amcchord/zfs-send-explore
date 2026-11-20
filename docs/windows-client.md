@@ -33,14 +33,11 @@ dialogs, Windows open/save dialogs, Segoe UI sized for each monitor's DPI, and
 Explorer-style file icons. Long scans and restores run on background workers so
 the window keeps responding.
 
-When nothing is open, the window shows three large choices and a summary of the
-steps:
+The welcome page offers three ways to open a backup.
 
-![The ZFS Explore welcome page on Windows](screenshots/windows/welcome.png)
-
+- **Browse connected drives** (Ctrl+D) — check the attached drive holding the backup, or all member drives from one pool.
 - **Open a backup file** (Ctrl+O) — a ZFS send file, a Slide or ZFS pool image,
   or a RAW, QCOW2 or VMDK disk image. The format is detected automatically.
-- **Open a connected drive** (Ctrl+D) — a drive from a Slide or Datto device.
 - **Open from a path** — type or paste a location, including `\\.\PhysicalDriveN`.
 
 Once a backup is open:
@@ -48,7 +45,7 @@ Once a backup is open:
 ![A send file open with its newest restore point selected](screenshots/windows/source-browser.png)
 
 1. **Header** — the backup's name and what it is ("Slide backup · 12 restore
-   points"), with **Close**, **Open drive…** and **Open backup…**.
+   points"), with **Close**, **Connected drives…** and **Open backup…**.
 2. **Restore point** — the newest restore point that holds files is selected
    once a computer or dataset has been chosen. Each entry shows its date, the backup it belongs to and how it
    was captured ("full copy", "changes only", "live files, not a snapshot").
@@ -198,19 +195,21 @@ Use an exported pool member, a detached drive, or a stable image. Do not browse 
 For a physical drive:
 
 1. Attach the disk without initializing, formatting, or assigning it a Windows filesystem.
-2. Choose **Open drive…** (Ctrl+D). Each drive is listed with its disk number,
-   model, size and type; the computer's own Windows disk is labelled and asks
-   for a second confirmation. Choose **Refresh the list** after connecting a drive.
-   Review the selected drive, then choose **Open read-only**. For a striped pool,
-   choose **Add another member** until every disk is listed, then choose **Open
-   read-only**. The app verifies the selected drives are still present before
-   opening them. For a device that reports neither an ID nor a serial number,
-   use offline images to assemble multiple members.
-3. Choose the drive. It opens read-only.
+2. Choose **Browse connected drives** on the welcome screen, or **Connected drives…**
+   in the header (Ctrl+D). The list shows disk numbers, models, capacity, connection
+   and the last six serial characters when available. Windows-reported ZFS
+   partitions are identified. The Windows system disk is hidden until you check
+   **Show Windows system disk**.
+3. Check one disk, or every member of a striped pool, and choose **Open read-only**.
+   No disk is checked initially. Use the arrow keys to move, Space to check or
+   uncheck, Tab to reach other controls, and Escape to cancel. The list updates
+   when drives change. **Refresh** also rescans. Check again if a drive was
+   removed, replaced, or could not be identified. A device without a unique ID
+   can be opened on its own. Use offline member images for a multi-disk pool
+   when Windows cannot identify each member. Opening the Windows disk or a
+   disk with unknown system status requires confirmation.
 4. If Windows reports that access was denied, close ZFS Explore, right-click it,
    choose **Run as administrator**, and open the drive again.
-
-![The connected-drive chooser](screenshots/windows/drive-picker.png)
 
 For an independent cross-check, PowerShell reports the same disk numbers:
 
@@ -244,7 +243,7 @@ RAIDZ/dRAID, stripes of mirrors, encrypted big-endian pools, special/dedup alloc
 
 ![A Slide backup with the guidance bar pointing to its disk image](screenshots/windows/slide-backup.png)
 
-1. Connect the Slide Box drive and choose **Open drive…**, or open a Slide pool
+1. Connect the Slide Box drive and choose **Connected drives…**, or open a Slide pool
    image with **Open backup…**.
 2. The newest restore point of the protected computer is selected.
 3. In **Unlock this restore point**, paste Slide's 64-character key or choose its
@@ -263,7 +262,7 @@ different recovery source.
 
 ## Recover a Datto Reverse RoundTrip drive
 
-1. Connect the drive and choose **Open drive…**. If it is LUKS-protected, the
+1. Connect the drive and choose **Connected drives…**. If it is LUKS-protected, the
    **Unlock the Datto drive** dialog asks for its passphrase (or passphrase
    file) and the drive opens automatically afterwards.
 2. The app detects GPT or MBR, unlocks the LUKS payload internally, and labels a

@@ -20,14 +20,37 @@ import Foundation
         precondition(zfs.path == "/dev/disk99s2")
         precondition(slice("disk99", "", whole: true, media: 1).id != slice("disk99", "", whole: true, media: 2).id, "Reused BSD names must not keep a prior selection")
         let second = AttachedDrive(disk: slice("disk100", "", whole: true, media: 3), name: "Second", bus: "USB", partitions: [])
-        let pair: Set<String> = [drive.disk.id, second.disk.id]
-        precondition(AttachedDrive.resolve(pair, in: [drive, second])?.map { $0.1.path } == ["/dev/disk99", "/dev/disk100"])
-        precondition(AttachedDrive.resolve(pair, in: [drive]) == nil, "Missing members must clear the entire selection")
+        var selection = DriveSelection()
+        precondition(selection.available(in: [drive, second]).isEmpty, "Showing drives must not select one")
+        selection.targets[drive.id] = [drive.disk]
+        selection.targets[second.id] = [second.disk]
+        precondition(selection.available(in: [second, drive]).map { $0.1.id } == [second.disk.id, drive.disk.id])
+        precondition(selection.unavailable(in: [drive]) == [second.disk])
         let replacement = AttachedDrive(disk: slice("disk100", "", whole: true, media: 4), name: "Second", bus: "USB", partitions: [])
-        precondition(AttachedDrive.resolve(pair, in: [drive, replacement]) == nil)
-        precondition(AttachedDrive.resolve([second.disk.id], in: [second])?.count == 1)
+        precondition(selection.unavailable(in: [drive, replacement]) == [second.disk])
+        selection.removeUnavailable(in: [drive, replacement])
+        precondition(selection.targets.count == 1 && selection.targets[drive.id] == [drive.disk])
+        precondition(!drive.hasZFSPartition && !replacement.hasZFSPartition)
+        drive.partitions.append(zfs)
+        precondition(drive.hasZFSPartition)
+        selection.targets[drive.id] = [zfs]
+        precondition(selection.available(in: [drive]).map { $0.1 } == [zfs])
+        drive.partitions.removeLast()
+        precondition(selection.available(in: [drive]).isEmpty && selection.unavailable(in: [drive]) == [zfs],
+                     "A vanished partition must not fall back to the whole disk")
+        let mountedZFS = slice("disk99s2", zfs.content, mount: "/Volumes/Pool")
+        drive.partitions = [linux, mountedZFS]
+        precondition(drive.hasZFSPartition && mountedZFS.kind == .mounted)
+        let pair = DriveSelection.changing([drive.disk, linux], slice: mountedZFS, checked: true)
+        precondition(pair == [linux, mountedZFS])
+        selection.targets[drive.id] = pair
+        precondition(selection.count == 2 && selection.available(in: [drive]).count == 2)
+        drive.partitions.removeLast()
+        selection.removeUnavailable(in: [drive])
+        precondition(selection.targets[drive.id] == [linux], "Keep the surviving partition on the same disk")
+        precondition(DriveSelection.changing(pair, slice: drive.disk, checked: true) == [drive.disk])
         let actual = AttachedDrive.scan()
         for d in actual { print("\(d.disk.path) \(d.title) \(d.partitions.map(\.path))") }
-        print("PASS: ZFS/Linux selection, mounted/system fallback, device identity and live discovery")
+        print("PASS: explicit selection, partition choices, ZFS hints, hot-plug identities and live discovery")
     }
 }

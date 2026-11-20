@@ -190,7 +190,7 @@ final class Engine: @unchecked Sendable {
     @Published var showPath = false
     @Published var showDrives = false
     @Published var drives: [AttachedDrive] = []
-    @Published var driveSelection = Set<String>()
+    @Published var driveSelection = DriveSelection()
     @Published var showPreferences = false
     @Published var sourcePath = ""
     /// Name of the drive chosen in the picker, shown instead of its device node.
@@ -289,22 +289,20 @@ final class Engine: @unchecked Sendable {
         }
     }
     func chooseDrive() {
+        driveSelection = DriveSelection()
         refreshDrives()
-        driveSelection = Set(drives.first.map { [$0.suggested.id] } ?? [])
         showDrives = true
     }
     func refreshDrives() {
-        drives = AttachedDrive.scan()
-        if !driveSelection.isEmpty, AttachedDrive.resolve(driveSelection, in: drives) == nil {
-            driveSelection.removeAll()
-        }
+        let current = AttachedDrive.scan()
+        if current != drives { drives = current }
     }
     func openDrive() {
-        let selection = driveSelection
         refreshDrives()
-        guard let selected = AttachedDrive.resolve(selection, in: drives) else { return }
+        let selected = driveSelection.available(in: drives)
+        guard !selected.isEmpty, selected.count == driveSelection.count else { return }
         let (drive, slice) = selected[0]
-        let title = slice.whole ? drive.name : "\(drive.name) · \(slice.typeLabel)"
+        let title = slice.whole ? "\(drive.name) · \(slice.bsdName)" : "\(drive.name) · \(slice.typeLabel) · \(slice.bsdName)"
         showDrives = false
         open(selected.map { URL(fileURLWithPath: $0.1.path) },
              drive: selected.count == 1 ? (slice.path, title) : nil)
@@ -424,6 +422,15 @@ struct ContentView: View {
                 } label: { Label("Open", systemImage: "folder.badge.plus").labelStyle(.titleAndIcon) }
                 .disabled(model.busy)
                 .help("Open a backup file or a connected backup drive")
+            }
+            if model.isOpen {
+                ToolbarItem(placement: .primaryAction) {
+                    Button { model.chooseDrive() } label: {
+                        Label("Connected Drives", systemImage: "externaldrive").labelStyle(.titleAndIcon)
+                    }
+                    .disabled(model.busy)
+                    .help("Choose connected backup drives (⇧⌘D)")
+                }
             }
             ToolbarItem(placement: .primaryAction) {
                 Button { model.restore() } label: { Label("Restore…", systemImage: "square.and.arrow.down").labelStyle(.titleAndIcon) }
@@ -723,39 +730,20 @@ struct WelcomeView: View {
                 Spacer(minLength: 30)
                 Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 96, height: 96)
                 VStack(spacing: 10) {
-                    Text("Get your files back").font(.system(size: 34, weight: .bold))
-                    Text("Open a backup, pick the date you want, and save copies of the files you need.\nZFS Explore only reads your backup. It never changes it.")
+                    Text("Open your backup").font(.system(size: 34, weight: .bold))
+                    Text("Browse restore points and save copies of your files. Your backup opens read-only.")
                         .multilineTextAlignment(.center).foregroundStyle(.secondary).lineSpacing(3)
                 }
                 HStack(spacing: 16) {
-                    ChoiceCard(icon: "doc.badge.clock", title: "Open a backup file", detail: "A ZFS send file, a Slide or ZFS pool image, or a RAW, QCOW2 or VMDK disk", shortcut: "⌘O", prominent: true) { model.chooseSource() }
-                    ChoiceCard(icon: "externaldrive.connected.to.line.below", title: "Open a connected drive", detail: "A USB drive from a Slide or Datto device, even when Finder can’t show it", shortcut: "⇧⌘D", prominent: false) { model.chooseDrive() }
+                    ChoiceCard(icon: "externaldrive", title: "Connected drives", detail: "Choose an attached backup drive, including Slide or Datto drives that Finder can’t show.", shortcut: "⇧⌘D", prominent: true) { model.chooseDrive() }
+                    ChoiceCard(icon: "doc.badge.clock", title: "Open a backup file", detail: "Browse a ZFS send file, a pool image or a virtual disk.", shortcut: "⌘O", prominent: false) { model.chooseSource() }
                 }.frame(maxWidth: 680)
                 HStack(spacing: 6) {
                     Button("Open from a path…") { model.showPath = true }.buttonStyle(.link)
                     Text("·").foregroundStyle(.tertiary)
                     Text("or drag a backup file into this window").foregroundStyle(.secondary)
                 }.font(.callout)
-                Spacer(minLength: 20)
-                HStack(spacing: 28) {
-                    HowItWorksStep(number: 1, title: "Open your backup")
-                    Image(systemName: "chevron.right").foregroundStyle(.tertiary)
-                    HowItWorksStep(number: 2, title: "Pick a restore point")
-                    Image(systemName: "chevron.right").foregroundStyle(.tertiary)
-                    HowItWorksStep(number: 3, title: "Restore your files")
-                }.padding(.bottom, 26)
             }.frame(maxWidth: .infinity).padding(.horizontal, 40)
-        }
-    }
-}
-
-struct HowItWorksStep: View {
-    let number: Int; let title: String
-    var body: some View {
-        HStack(spacing: 8) {
-            Text("\(number)").font(.caption.bold()).foregroundStyle(.teal)
-                .frame(width: 22, height: 22).background(.teal.opacity(0.14), in: Circle())
-            Text(title).font(.callout).foregroundStyle(.secondary)
         }
     }
 }
@@ -1115,71 +1103,145 @@ struct OpenPathSheet: View {
     }
 }
 
-/// Attached drives from DiskArbitration, so drives macOS cannot mount (and
-/// Finder never shows) can still be chosen. The selected slice opens read-only.
 struct DrivePicker: View {
     @ObservedObject var model: Recovery
     private let refresh = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
+
     var body: some View {
+        let count = model.driveSelection.count
+        let unit = model.driveSelection.targets.count == count ? "Drives" : "Members"
+        let unavailable = model.driveSelection.unavailable(in: model.drives)
         VStack(alignment: .leading, spacing: 16) {
-            Label("Open a connected drive", systemImage: "externaldrive.connected.to.line.below").font(.title2.bold())
-            Text("Choose your backup drive or its suggested partition. For a striped pool, check one member on each drive.")
-                .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            List {
-                ForEach(model.drives) { drive in
-                    Section(drive.title) {
-                        ForEach([drive.disk] + drive.partitions) { slice in
-                            Toggle(isOn: Binding(
-                                get: { model.driveSelection.contains(slice.id) },
-                                set: { checked in
-                                    if checked { model.driveSelection.insert(slice.id) }
-                                    else { model.driveSelection.remove(slice.id) }
-                                })) {
-                                    row(slice, suggested: slice.id == drive.suggested.id)
-                                }
-                                .toggleStyle(.checkbox)
-                                .accessibilityLabel("\(drive.name), \(slice.path)")
+            Text("Connected drives").font(.title2.bold())
+            Text("Select a backup drive. For a striped pool, select each member drive.")
+                .foregroundStyle(.secondary)
+            if model.drives.isEmpty {
+                VStack(spacing: 9) {
+                    Image(systemName: "externaldrive.badge.plus")
+                        .font(.system(size: 30)).foregroundStyle(.secondary).accessibilityHidden(true)
+                    Text("No external drives found").font(.headline)
+                    Text("Connect the backup drive and check its power and cable. It will appear here automatically.")
+                        .multilineTextAlignment(.center).foregroundStyle(.secondary).frame(maxWidth: 330)
+                }.frame(maxWidth: .infinity, minHeight: 218)
+            } else {
+                ScrollView {
+                    VStack(spacing: 0) {
+                        ForEach(model.drives) { drive in
+                            DriveRow(drive: drive, selection: $model.driveSelection)
+                            if drive.id != model.drives.last?.id { Divider().padding(.leading, 44) }
                         }
                     }
                 }
+                .frame(height: 218)
+                .background(.background, in: RoundedRectangle(cornerRadius: 8))
+                .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.quaternary))
             }
-            .frame(height: 260)
-            .overlay {
-                if model.drives.isEmpty {
-                    VStack(spacing: 8) {
-                        ProgressView().controlSize(.small)
-                        Text("Waiting for a backup drive…").font(.headline)
-                        Text("Connect the drive. It appears here within a few seconds.").font(.caption).foregroundStyle(.secondary)
-                    }
-                }
+            if !unavailable.isEmpty {
+                HStack(alignment: .firstTextBaseline) {
+                    let names = unavailable.map(\.bsdName).joined(separator: ", ")
+                    Label("Selection unavailable: \(names)", systemImage: "exclamationmark.triangle")
+                    Spacer()
+                    Button("Remove unavailable") { model.driveSelection.removeUnavailable(in: model.drives) }
+                }.font(.callout)
             }
-            Label("If needed, macOS asks for an administrator password to read the drive. ZFS Explore opens it read-only and never mounts or changes it.", systemImage: "lock.shield")
-                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Label("Drives open read-only. macOS may ask for an administrator password.",
+                  systemImage: "lock.shield").foregroundStyle(.secondary).font(.callout)
             HStack {
                 Button("Refresh") { model.refreshDrives() }
                 Spacer()
                 Button("Cancel") { model.showDrives = false }.keyboardShortcut(.cancelAction)
-                Button(model.driveSelection.count > 1 ? "Open \(model.driveSelection.count) Members" : "Open Drive") { model.openDrive() }
-                    .keyboardShortcut(.defaultAction).disabled(model.driveSelection.isEmpty)
+                Button(count > 1 ? "Open \(count) \(unit)" : "Open Drive") { model.openDrive() }
+                    .keyboardShortcut(.defaultAction).disabled(count == 0 || !unavailable.isEmpty)
             }
         }
-        .padding(26).frame(width: 580)
+        .padding(24).frame(width: 568)
         .onReceive(refresh) { _ in model.refreshDrives() }
     }
-    func row(_ slice: DriveSlice, suggested: Bool) -> some View {
-        HStack(spacing: 10) {
-            Image(systemName: slice.whole ? "externaldrive" : slice.kind == .zfs || slice.kind == .linux ? "square.stack.3d.up" : "square.dashed")
-                .frame(width: 18).foregroundStyle(slice.kind == .mounted || slice.kind == .system ? .secondary : Color.teal)
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 6) {
-                    Text(slice.whole ? "Whole disk" : slice.typeLabel).fontWeight(suggested ? .semibold : .regular)
-                    Text("\(slice.sizeLabel) · \(slice.path)").font(.caption).foregroundStyle(.secondary)
-                    if suggested { Text("Suggested").font(.caption2.bold()).foregroundStyle(.white).padding(.horizontal, 6).padding(.vertical, 2).background(Color.teal, in: Capsule()) }
-                }
-                Text(slice.hint).font(.caption).foregroundStyle(.secondary)
-            }
-        }.padding(.vertical, 3)
+}
+
+private struct DriveRow: View {
+    let drive: AttachedDrive
+    @Binding var selection: DriveSelection
+    @State private var expanded = false
+    @State private var preferred: [DriveSlice]?
+
+    private var sources: [DriveSlice] {
+        if let chosen = selection.targets[drive.id] { return chosen }
+        if let preferred {
+            let ids = Set(preferred.map(\.id))
+            return drive.slices.filter { ids.contains($0.id) }
+        }
+        return [drive.suggested]
     }
+
+    private func updateSources(_ slices: [DriveSlice]) {
+        preferred = slices
+        if selection.targets[drive.id] != nil {
+            selection.targets[drive.id] = slices.isEmpty ? nil : slices
+        }
+    }
+
+    var body: some View {
+        let chosen = selection.targets[drive.id]
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Toggle(isOn: Binding(get: { chosen != nil }, set: { checked in
+                    selection.targets[drive.id] = checked ? (sources.isEmpty ? [drive.suggested] : sources) : nil
+                })) {
+                    HStack(spacing: 11) {
+                        Image(systemName: "externaldrive").font(.title2).foregroundStyle(.teal)
+                            .accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(drive.name).font(.headline)
+                            HStack(spacing: 5) {
+                                Text(drive.disk.bsdName)
+                                if drive.bus != "Disk image" { Text("·"); Text(drive.bus) }
+                                if drive.hasZFSPartition { Text("·"); Text("Likely ZFS").foregroundStyle(.primary) }
+                            }.font(.callout).foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 8)
+                        Text(drive.disk.sizeLabel).monospacedDigit().foregroundStyle(.secondary)
+                    }.contentShape(Rectangle())
+                }
+                .toggleStyle(.checkbox)
+                .accessibilityLabel("\(drive.name), \(drive.disk.bsdName), \(drive.disk.sizeLabel)\(drive.hasZFSPartition ? ", likely ZFS" : "")")
+                if !drive.partitions.isEmpty {
+                    Button { expanded.toggle() } label: {
+                        Image(systemName: expanded ? "chevron.up" : "chevron.down").frame(width: 18, height: 22)
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel("\(expanded ? "Hide" : "Show") partitions on \(drive.disk.bsdName)")
+                    .help(expanded ? "Hide partitions" : "Show partitions")
+                }
+            }
+            if expanded, !drive.partitions.isEmpty {
+                VStack(alignment: .leading, spacing: 7) {
+                    if drive.partitions.count == 1 {
+                        Picker("Read from", selection: Binding(get: { sources.first?.id ?? drive.suggested.id }, set: { id in
+                            if let slice = drive.slices.first(where: { $0.id == id }) { updateSources([slice]) }
+                        })) {
+                            ForEach(drive.slices) { slice in Text(sourceLabel(slice)).tag(slice.id) }
+                        }.accessibilityLabel("Read from \(drive.disk.bsdName)")
+                    } else {
+                        Text("Read the whole disk or choose member partitions.").font(.caption).foregroundStyle(.secondary)
+                        ForEach(drive.slices) { slice in
+                            Toggle(sourceLabel(slice), isOn: Binding(get: { sources.contains(where: { $0.id == slice.id }) }, set: { value in
+                                updateSources(DriveSelection.changing(sources, slice: slice, checked: value))
+                            })).toggleStyle(.checkbox)
+                        }
+                    }
+                }.padding(.leading, 27)
+            }
+        }.padding(.horizontal, 14).padding(.vertical, 12)
+    }
+
+    private func sourceLabel(_ slice: DriveSlice) -> String {
+        let label = slice.whole ? "Whole disk" : "\(slice.typeLabel) · \(slice.sizeLabel)"
+        let location = slice.mountPath.map { " · mounted at \($0)" } ?? ""
+        let hint = slice.id == drive.suggested.id ? " (suggested)" : ""
+        return "\(label) · \(slice.bsdName)\(location)\(hint)"
+    }
+
 }
 
 struct TimeZonePreferences: View {

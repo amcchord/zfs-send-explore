@@ -11,7 +11,8 @@ param(
     [int]$MaximumDpi = 192,
     [string]$StripeDirectory,
     [string]$StripeDataset,
-    [string]$StripeExpectedSha256
+    [string]$StripeExpectedSha256,
+    [ValidateSet('Empty','Browse','Restore')][string]$DrivePickerTest
 )
 
 $ErrorActionPreference = 'Stop'
@@ -46,7 +47,7 @@ public static class PackageUI {
     public delegate bool EnumCallback(IntPtr w, IntPtr data);
     [DllImport("user32.dll")] static extern bool EnumWindows(EnumCallback callback, IntPtr data);
     [DllImport("user32.dll")] static extern int GetWindowThreadProcessId(IntPtr w, out int pid);
-    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr w);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr w);
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr w, StringBuilder b, int len);
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr w, StringBuilder b, int len);
     [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr w, int id);
@@ -237,7 +238,8 @@ function Enter-FixtureKey([IntPtr]$Dialog, [string]$Value) {
 $DpiContext = [PackageUI]::SetThreadDpiAwarenessContext([IntPtr](-4))
 try {
     if ($Report.package -ne $ExpectedPackageSha256) { throw 'Package digest differs from the supplied archive hash' }
-    $sources = @('encrypted-raw-s1.zfs', 'multi-snapshot.zfs')
+    $sources = @()
+    if (!$DrivePickerTest) { $sources = @('encrypted-raw-s1.zfs', 'multi-snapshot.zfs') }
     $sourceHashes = @($sources | ForEach-Object { (Get-FileHash -LiteralPath (Join-Path $FixtureDirectory $_)).Hash })
     $Report.fixtures = [ordered]@{}
     for ($i = 0; $i -lt $sources.Count; $i++) { $Report.fixtures[$sources[$i]] = $sourceHashes[$i] }
@@ -253,6 +255,12 @@ try {
     Save-Window $Main '01-welcome'
     if ($Report.dpi -lt $MinimumDpi -or $Report.dpi -gt $MaximumDpi) { throw 'Display scale outside required range' }
 
+    if ($DrivePickerTest) {
+        . (Join-Path $PSScriptRoot 'windows-drive-picker-check.ps1')
+        $Report.success = $true
+        Step "Passed connected-drive picker $DrivePickerTest checks"
+        return
+    }
     if ($StripeDirectory -or $StripeDataset -or $StripeExpectedSha256) { Test-Stripe }
 
     Open-Backup 'encrypted-raw-s1.zfs' '02-open-backup'
